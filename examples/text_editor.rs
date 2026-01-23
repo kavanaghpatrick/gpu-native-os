@@ -143,6 +143,7 @@ impl TextEditorDemo {
             Key::Named(NamedKey::Backspace) => editor.delete_back(),
             Key::Named(NamedKey::Delete) => editor.delete_forward(),
             Key::Named(NamedKey::Enter) => editor.newline(),
+            Key::Named(NamedKey::Space) => editor.insert_char(' '),
             Key::Character(ref c) => {
                 // Insert printable characters
                 for ch in c.chars() {

@@ -632,21 +632,20 @@ kernel void text_editor_kernel(
             }}
 
             // Generate character quad with embedded font rendering
-            // We'll render a filled quad and use the fragment shader to sample the font
             float x0 = x;
             float y0 = y;
             float x1 = x + CHAR_WIDTH;
             float y1 = y + CHAR_HEIGHT;
 
-            // Encode character in UV (we'll decode in fragment shader)
-            float char_u = float(ch);
+            // Encode: uv.x = char_code + local_u (0-0.99), uv.y = local_v (0-1)
+            float char_base = float(ch);
 
-            vertices[vidx++] = TextVertex{{float2(x0, y0), float2(char_u, 0), COLOR_TEXT}};
-            vertices[vidx++] = TextVertex{{float2(x1, y0), float2(char_u, 1), COLOR_TEXT}};
-            vertices[vidx++] = TextVertex{{float2(x0, y1), float2(char_u, 2), COLOR_TEXT}};
-            vertices[vidx++] = TextVertex{{float2(x1, y0), float2(char_u, 1), COLOR_TEXT}};
-            vertices[vidx++] = TextVertex{{float2(x1, y1), float2(char_u, 3), COLOR_TEXT}};
-            vertices[vidx++] = TextVertex{{float2(x0, y1), float2(char_u, 2), COLOR_TEXT}};
+            vertices[vidx++] = TextVertex{{float2(x0, y0), float2(char_base, 0.0), COLOR_TEXT}};
+            vertices[vidx++] = TextVertex{{float2(x1, y0), float2(char_base + 0.99, 0.0), COLOR_TEXT}};
+            vertices[vidx++] = TextVertex{{float2(x0, y1), float2(char_base, 0.99), COLOR_TEXT}};
+            vertices[vidx++] = TextVertex{{float2(x1, y0), float2(char_base + 0.99, 0.0), COLOR_TEXT}};
+            vertices[vidx++] = TextVertex{{float2(x1, y1), float2(char_base + 0.99, 0.99), COLOR_TEXT}};
+            vertices[vidx++] = TextVertex{{float2(x0, y1), float2(char_base, 0.99), COLOR_TEXT}};
 
             current_col++;
         }}
@@ -698,14 +697,15 @@ kernel void text_editor_kernel(
                 float dy0 = y;
                 float dy1 = y + CHAR_HEIGHT;
 
-                float char_u = float(48 + digit); // '0' = 48
+                // Encode: uv.x = char_code + local_u, uv.y = local_v
+                float char_base = float(48 + digit); // '0' = 48
 
-                vertices[vidx++] = TextVertex{{float2(dx0, dy0), float2(char_u, 0), COLOR_LINE_NUM}};
-                vertices[vidx++] = TextVertex{{float2(dx1, dy0), float2(char_u, 1), COLOR_LINE_NUM}};
-                vertices[vidx++] = TextVertex{{float2(dx0, dy1), float2(char_u, 2), COLOR_LINE_NUM}};
-                vertices[vidx++] = TextVertex{{float2(dx1, dy0), float2(char_u, 1), COLOR_LINE_NUM}};
-                vertices[vidx++] = TextVertex{{float2(dx1, dy1), float2(char_u, 3), COLOR_LINE_NUM}};
-                vertices[vidx++] = TextVertex{{float2(dx0, dy1), float2(char_u, 2), COLOR_LINE_NUM}};
+                vertices[vidx++] = TextVertex{{float2(dx0, dy0), float2(char_base, 0.0), COLOR_LINE_NUM}};
+                vertices[vidx++] = TextVertex{{float2(dx1, dy0), float2(char_base + 0.99, 0.0), COLOR_LINE_NUM}};
+                vertices[vidx++] = TextVertex{{float2(dx0, dy1), float2(char_base, 0.99), COLOR_LINE_NUM}};
+                vertices[vidx++] = TextVertex{{float2(dx1, dy0), float2(char_base + 0.99, 0.0), COLOR_LINE_NUM}};
+                vertices[vidx++] = TextVertex{{float2(dx1, dy1), float2(char_base + 0.99, 0.99), COLOR_LINE_NUM}};
+                vertices[vidx++] = TextVertex{{float2(dx0, dy1), float2(char_base, 0.99), COLOR_LINE_NUM}};
             }}
         }}
 
@@ -741,27 +741,34 @@ vertex VertexOut text_vertex(
 // ============================================================================
 
 fragment float4 text_fragment(VertexOut in [[stage_in]]) {{
-    // Check if this is a character quad (uv.x encodes character code)
-    uint char_code = uint(in.uv.x);
+    // Check if this is a character quad (uv.x encodes character code + local_u)
+    // uv.x = char_code + local_u (0-0.99)
+    // uv.y = local_v (0-0.99)
+    float char_code_f = floor(in.uv.x);
+    uint char_code = uint(char_code_f);
 
     if (char_code >= 32 && char_code <= 126) {{
-        // Render bitmap font character
-        // uv.y encodes corner: 0=TL, 1=TR, 2=BL, 3=BR
-        uint corner = uint(in.uv.y);
+        // Extract local position within character cell
+        float local_u = in.uv.x - char_code_f;  // 0 to 0.99
+        float local_v = in.uv.y;                 // 0 to 0.99
 
-        // Calculate position within character cell
-        float2 frag_pos = in.position.xy;
+        // Map to 5x7 pixel grid
+        uint px = uint(local_u * 5.0);
+        uint py = uint(local_v * 7.0);
 
-        // We need to figure out pixel position within the 5x7 glyph
-        // This is tricky without knowing exact quad bounds...
-        // For now, use a simple filled rectangle approach
+        // Clamp to valid range
+        px = min(px, 4u);
+        py = min(py, 6u);
 
-        // Actually let's just render solid colored text for MVP
-        // The font bitmap approach needs texture sampling
-        return in.color;
+        // Sample the bitmap font
+        if (get_font_pixel(char_code, px, py)) {{
+            return in.color;
+        }} else {{
+            discard_fragment();
+        }}
     }}
 
-    // Solid color (cursor, highlights)
+    // Solid color (cursor, highlights, backgrounds)
     return in.color;
 }}
 "#, header = APP_SHADER_HEADER)
