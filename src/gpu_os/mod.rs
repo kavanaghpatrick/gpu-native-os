@@ -9,3 +9,6 @@ pub mod widget;      // #15 - Widget System
 pub mod text;        // #16 - Text Rendering
 pub mod render;      // #17 - Hybrid Rendering
 pub mod vsync;       // #18 - VSync Execution
+
+// Demo modules
+pub mod game_of_life;  // Game of Life demo
