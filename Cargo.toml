@@ -2,6 +2,16 @@
 name = "rust-experiment"
 version = "0.1.0"
 edition = "2021"
+description = "GPU-Native OS: A single-threadgroup operating system running entirely on the GPU"
+authors = ["Patrick Kavanagh"]
+
+[lib]
+name = "rust_experiment"
+path = "src/lib.rs"
+
+[[example]]
+name = "gpu_os_demo"
+path = "examples/gpu_os_demo.rs"
 
 [dependencies]
 metal = "0.33"
@@ -9,3 +19,4 @@ cocoa = "0.26"
 core-graphics-types = "0.2"
 objc = "0.2"
 winit = "0.30"
+half = "2.4"
