@@ -11,4 +11,5 @@ pub mod render;      // #17 - Hybrid Rendering
 pub mod vsync;       // #18 - VSync Execution
 
 // Demo modules
-pub mod game_of_life;  // Game of Life demo
+pub mod game_of_life;   // Game of Life demo
+pub mod ball_physics;   // 1024-Ball Physics demo

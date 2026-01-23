@@ -17,6 +17,10 @@ path = "examples/gpu_os_demo.rs"
 name = "game_of_life"
 path = "examples/game_of_life.rs"
 
+[[example]]
+name = "ball_physics"
+path = "examples/ball_physics.rs"
+
 [dependencies]
 metal = "0.33"
 cocoa = "0.26"
