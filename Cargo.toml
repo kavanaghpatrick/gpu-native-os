@@ -21,6 +21,10 @@ path = "examples/game_of_life.rs"
 name = "ball_physics"
 path = "examples/ball_physics.rs"
 
+[[example]]
+name = "text_editor"
+path = "examples/text_editor.rs"
+
 [dependencies]
 metal = "0.33"
 cocoa = "0.26"

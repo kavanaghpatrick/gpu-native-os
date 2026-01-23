@@ -13,6 +13,9 @@ pub mod vsync;       // #18 - VSync Execution
 // Application framework
 pub mod app;         // GpuApp trait and GpuRuntime
 
+// Applications (use GpuApp framework)
+pub mod game_of_life;   // Game of Life app
+pub mod text_editor;    // Text Editor app
+
 // Demo modules (legacy - standalone implementations)
-pub mod game_of_life;   // Game of Life demo
 pub mod ball_physics;   // 1024-Ball Physics demo
