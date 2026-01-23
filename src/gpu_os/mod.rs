@@ -10,6 +10,9 @@ pub mod text;        // #16 - Text Rendering
 pub mod render;      // #17 - Hybrid Rendering
 pub mod vsync;       // #18 - VSync Execution
 
-// Demo modules
+// Application framework
+pub mod app;         // GpuApp trait and GpuRuntime
+
+// Demo modules (legacy - standalone implementations)
 pub mod game_of_life;   // Game of Life demo
 pub mod ball_physics;   // 1024-Ball Physics demo
