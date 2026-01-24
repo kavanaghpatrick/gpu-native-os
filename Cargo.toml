@@ -61,6 +61,22 @@ path = "examples/benchmark_visual.rs"
 name = "filesystem_browser"
 path = "examples/filesystem_browser.rs"
 
+[[example]]
+name = "sdf_text_demo"
+path = "examples/sdf_text_demo.rs"
+
+[[example]]
+name = "document_viewer"
+path = "examples/document_viewer.rs"
+
+[[example]]
+name = "document_pipeline_demo"
+path = "examples/document_pipeline_demo.rs"
+
+[[example]]
+name = "generate_sdf_atlas"
+path = "examples/generate_sdf_atlas.rs"
+
 [dependencies]
 metal = "0.33"
 cocoa = "0.26"
@@ -68,3 +84,5 @@ core-graphics-types = "0.2"
 objc = "0.2"
 winit = "0.30"
 half = "2.4"
+ureq = "2.9"
+ttf-parser = "0.25"  # TrueType/OpenType font parsing for SDF text

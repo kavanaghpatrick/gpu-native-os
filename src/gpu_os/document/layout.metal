@@ -250,8 +250,179 @@ kernel void compute_block_layout(
     boxes[gid] = box;
 }
 
-// Pass 3: Layout children sequentially (handles sibling positioning)
-// This must run on CPU or single-threaded for correctness
+// Helper: Layout one parent's children and update parent height
+void layout_parent_children(
+    device const Element* elements,
+    device const ComputedStyle* styles,
+    device LayoutBox* boxes,
+    uint parent_idx
+) {
+    Element elem = elements[parent_idx];
+    ComputedStyle style = styles[parent_idx];
+
+    if (style.display == DISPLAY_NONE) return;
+    if (elem.first_child < 0) return;
+
+    LayoutBox parent_box = boxes[parent_idx];
+    float child_y = 0;
+    float child_x = 0;
+
+    // Flex layout handling
+    bool is_flex = (style.display == DISPLAY_FLEX);
+    bool is_row = (style.flex_direction == FLEX_ROW);
+
+    // Collect children
+    int children[MAX_CHILDREN];
+    uint child_count = 0;
+    float total_size = 0;
+    float total_flex_grow = 0;
+
+    int child_idx = elem.first_child;
+    while (child_idx >= 0 && child_count < MAX_CHILDREN) {
+        children[child_count] = child_idx;
+        LayoutBox child_box = boxes[child_idx];
+        ComputedStyle child_style = styles[child_idx];
+
+        if (is_flex) {
+            if (is_row) {
+                total_size += child_box.width + child_style.margin[1] + child_style.margin[3];
+            } else {
+                total_size += child_box.height + child_style.margin[0] + child_style.margin[2];
+            }
+            total_flex_grow += child_style.flex_grow;
+        }
+
+        child_count++;
+        child_idx = elements[child_idx].next_sibling;
+    }
+
+    // Calculate flex distribution
+    float available = is_row ? parent_box.content_width : parent_box.content_height;
+    float remaining = available - total_size;
+    float gap = 0;
+    float start_offset = 0;
+
+    if (is_flex && child_count > 0) {
+        switch (style.justify_content) {
+            case JUSTIFY_CENTER:
+                start_offset = remaining / 2;
+                break;
+            case JUSTIFY_END:
+                start_offset = remaining;
+                break;
+            case JUSTIFY_SPACE_BETWEEN:
+                if (child_count > 1) gap = remaining / float(child_count - 1);
+                break;
+            case JUSTIFY_SPACE_AROUND:
+                gap = remaining / float(child_count);
+                start_offset = gap / 2;
+                break;
+            default:
+                break;
+        }
+    }
+
+    // Position each child
+    if (is_row) {
+        child_x = start_offset;
+    } else {
+        child_y = start_offset;
+    }
+
+    for (uint c = 0; c < child_count; c++) {
+        int idx = children[c];
+        LayoutBox child_box = boxes[idx];
+        ComputedStyle child_style = styles[idx];
+
+        if (is_flex) {
+            if (is_row) {
+                child_box.x = child_x + child_style.margin[3];
+                switch (style.align_items) {
+                    case ALIGN_CENTER:
+                        child_box.y = (parent_box.content_height - child_box.height) / 2;
+                        break;
+                    case ALIGN_END:
+                        child_box.y = parent_box.content_height - child_box.height - child_style.margin[2];
+                        break;
+                    case ALIGN_STRETCH:
+                        child_box.height = parent_box.content_height - child_style.margin[0] - child_style.margin[2];
+                        child_box.y = child_style.margin[0];
+                        break;
+                    default:
+                        child_box.y = child_style.margin[0];
+                        break;
+                }
+                if (total_flex_grow > 0 && child_style.flex_grow > 0 && remaining > 0) {
+                    child_box.width += remaining * (child_style.flex_grow / total_flex_grow);
+                }
+                child_x += child_box.width + child_style.margin[1] + child_style.margin[3] + gap;
+            } else {
+                child_box.y = child_y + child_style.margin[0];
+                switch (style.align_items) {
+                    case ALIGN_CENTER:
+                        child_box.x = (parent_box.content_width - child_box.width) / 2;
+                        break;
+                    case ALIGN_END:
+                        child_box.x = parent_box.content_width - child_box.width - child_style.margin[1];
+                        break;
+                    case ALIGN_STRETCH:
+                        child_box.width = parent_box.content_width - child_style.margin[1] - child_style.margin[3];
+                        child_box.x = child_style.margin[3];
+                        break;
+                    default:
+                        child_box.x = child_style.margin[3];
+                        break;
+                }
+                if (total_flex_grow > 0 && child_style.flex_grow > 0 && remaining > 0) {
+                    child_box.height += remaining * (child_style.flex_grow / total_flex_grow);
+                }
+                child_y += child_box.height + child_style.margin[0] + child_style.margin[2] + gap;
+            }
+        } else {
+            // Block layout: stack vertically
+            child_box.x = child_style.margin[3];
+            child_box.y = child_y + child_style.margin[0];
+            child_y += child_box.height + child_style.margin[0] + child_style.margin[2];
+        }
+
+        // Update content box
+        child_box.content_x = child_box.x + child_style.border_width[3] + child_style.padding[3];
+        child_box.content_y = child_box.y + child_style.border_width[0] + child_style.padding[0];
+        child_box.content_width = child_box.width -
+            child_style.padding[1] - child_style.padding[3] -
+            child_style.border_width[1] - child_style.border_width[3];
+        child_box.content_height = child_box.height -
+            child_style.padding[0] - child_style.padding[2] -
+            child_style.border_width[0] - child_style.border_width[2];
+
+        boxes[idx] = child_box;
+    }
+
+    // Update parent height to contain children (if auto)
+    ComputedStyle parent_style = styles[parent_idx];
+    if (parent_style.height <= 0 && child_count > 0) {
+        float content_height;
+        if (is_flex && is_row) {
+            content_height = 0;
+            for (uint c = 0; c < child_count; c++) {
+                LayoutBox child_box = boxes[children[c]];
+                ComputedStyle child_style = styles[children[c]];
+                float h = child_box.height + child_style.margin[0] + child_style.margin[2];
+                if (h > content_height) content_height = h;
+            }
+        } else {
+            content_height = child_y;
+        }
+        parent_box.content_height = content_height;
+        parent_box.height = content_height +
+            parent_style.padding[0] + parent_style.padding[2] +
+            parent_style.border_width[0] + parent_style.border_width[2];
+        boxes[parent_idx] = parent_box;
+    }
+}
+
+// Pass 3: Layout children using post-order traversal (children before parents)
+// This ensures child heights are computed before parent positions children
 kernel void layout_children_sequential(
     device const Element* elements [[buffer(0)]],
     device const ComputedStyle* styles [[buffer(1)]],
@@ -260,185 +431,57 @@ kernel void layout_children_sequential(
     constant Viewport& viewport [[buffer(4)]],
     uint gid [[thread_position_in_grid]]
 ) {
-    // Only thread 0 runs this
     if (gid != 0) return;
 
-    for (uint i = 0; i < element_count; i++) {
-        Element elem = elements[i];
-        ComputedStyle style = styles[i];
+    // Post-order traversal using explicit stack
+    // Stack contains (element_idx, visited_flag)
+    // visited_flag: 0 = first visit (push children), 1 = second visit (process)
+    int stack[256];
+    int visited[256];
+    int stack_top = 0;
 
-        if (style.display == DISPLAY_NONE) continue;
-        if (elem.first_child < 0) continue;
-
-        LayoutBox parent_box = boxes[i];
-        float child_y = 0;
-        float child_x = 0;
-
-        // Flex layout handling
-        bool is_flex = (style.display == DISPLAY_FLEX);
-        bool is_row = (style.flex_direction == FLEX_ROW);
-
-        // Collect children for flex layout
-        int children[MAX_CHILDREN];
-        uint child_count = 0;
-        float total_size = 0;
-        float total_flex_grow = 0;
-
-        int child_idx = elem.first_child;
-        while (child_idx >= 0 && child_count < MAX_CHILDREN) {
-            children[child_count] = child_idx;
-            LayoutBox child_box = boxes[child_idx];
-            ComputedStyle child_style = styles[child_idx];
-
-            if (is_flex) {
-                if (is_row) {
-                    total_size += child_box.width + child_style.margin[1] + child_style.margin[3];
-                } else {
-                    total_size += child_box.height + child_style.margin[0] + child_style.margin[2];
-                }
-                total_flex_grow += child_style.flex_grow;
-            }
-
-            child_count++;
-            child_idx = elements[child_idx].next_sibling;
+    // Start with root elements (those with parent == -1)
+    for (int i = int(element_count) - 1; i >= 0; i--) {
+        if (elements[i].parent < 0) {
+            stack[stack_top] = i;
+            visited[stack_top] = 0;
+            stack_top++;
         }
+    }
 
-        // Calculate flex distribution
-        float available = is_row ? parent_box.content_width : parent_box.content_height;
-        float remaining = available - total_size;
-        float gap = 0;
-        float start_offset = 0;
+    while (stack_top > 0) {
+        stack_top--;
+        int idx = stack[stack_top];
+        int is_visited = visited[stack_top];
 
-        if (is_flex && child_count > 0) {
-            switch (style.justify_content) {
-                case JUSTIFY_CENTER:
-                    start_offset = remaining / 2;
-                    break;
-                case JUSTIFY_END:
-                    start_offset = remaining;
-                    break;
-                case JUSTIFY_SPACE_BETWEEN:
-                    if (child_count > 1) gap = remaining / float(child_count - 1);
-                    break;
-                case JUSTIFY_SPACE_AROUND:
-                    gap = remaining / float(child_count);
-                    start_offset = gap / 2;
-                    break;
-                default: // JUSTIFY_START
-                    break;
-            }
-        }
-
-        // Position each child
-        if (is_row) {
-            child_x = start_offset;
+        if (is_visited) {
+            // Second visit: process this node (layout its children)
+            layout_parent_children(elements, styles, boxes, idx);
         } else {
-            child_y = start_offset;
-        }
+            // First visit: push back with visited flag, then push children
+            stack[stack_top] = idx;
+            visited[stack_top] = 1;
+            stack_top++;
 
-        for (uint c = 0; c < child_count; c++) {
-            int idx = children[c];
-            LayoutBox child_box = boxes[idx];
-            ComputedStyle child_style = styles[idx];
+            // Push children in reverse order so they're processed left-to-right
+            Element elem = elements[idx];
+            int children[MAX_CHILDREN];
+            int child_count = 0;
 
-            if (is_flex) {
-                if (is_row) {
-                    child_box.x = child_x + child_style.margin[3];
-
-                    // Align items (cross-axis)
-                    switch (style.align_items) {
-                        case ALIGN_CENTER:
-                            child_box.y = (parent_box.content_height - child_box.height) / 2;
-                            break;
-                        case ALIGN_END:
-                            child_box.y = parent_box.content_height - child_box.height - child_style.margin[2];
-                            break;
-                        case ALIGN_STRETCH:
-                            child_box.height = parent_box.content_height - child_style.margin[0] - child_style.margin[2];
-                            child_box.y = child_style.margin[0];
-                            break;
-                        default: // ALIGN_START
-                            child_box.y = child_style.margin[0];
-                            break;
-                    }
-
-                    // Distribute flex-grow
-                    if (total_flex_grow > 0 && child_style.flex_grow > 0 && remaining > 0) {
-                        float extra = remaining * (child_style.flex_grow / total_flex_grow);
-                        child_box.width += extra;
-                    }
-
-                    child_x += child_box.width + child_style.margin[1] + child_style.margin[3] + gap;
-                } else {
-                    child_box.y = child_y + child_style.margin[0];
-
-                    // Align items (cross-axis)
-                    switch (style.align_items) {
-                        case ALIGN_CENTER:
-                            child_box.x = (parent_box.content_width - child_box.width) / 2;
-                            break;
-                        case ALIGN_END:
-                            child_box.x = parent_box.content_width - child_box.width - child_style.margin[1];
-                            break;
-                        case ALIGN_STRETCH:
-                            child_box.width = parent_box.content_width - child_style.margin[1] - child_style.margin[3];
-                            child_box.x = child_style.margin[3];
-                            break;
-                        default: // ALIGN_START
-                            child_box.x = child_style.margin[3];
-                            break;
-                    }
-
-                    // Distribute flex-grow
-                    if (total_flex_grow > 0 && child_style.flex_grow > 0 && remaining > 0) {
-                        float extra = remaining * (child_style.flex_grow / total_flex_grow);
-                        child_box.height += extra;
-                    }
-
-                    child_y += child_box.height + child_style.margin[0] + child_style.margin[2] + gap;
-                }
-            } else {
-                // Block layout: stack vertically
-                child_box.x = child_style.margin[3];
-                child_box.y = child_y + child_style.margin[0];
-                child_y += child_box.height + child_style.margin[0] + child_style.margin[2];
+            int child_idx = elem.first_child;
+            while (child_idx >= 0 && child_count < MAX_CHILDREN) {
+                children[child_count++] = child_idx;
+                child_idx = elements[child_idx].next_sibling;
             }
 
-            // Update content box
-            child_box.content_x = child_box.x + child_style.border_width[3] + child_style.padding[3];
-            child_box.content_y = child_box.y + child_style.border_width[0] + child_style.padding[0];
-            child_box.content_width = child_box.width -
-                child_style.padding[1] - child_style.padding[3] -
-                child_style.border_width[1] - child_style.border_width[3];
-            child_box.content_height = child_box.height -
-                child_style.padding[0] - child_style.padding[2] -
-                child_style.border_width[0] - child_style.border_width[2];
-
-            boxes[idx] = child_box;
-        }
-
-        // Update parent height to contain children (if auto)
-        ComputedStyle parent_style = styles[i];
-        if (parent_style.height <= 0 && child_count > 0) {
-            float content_height;
-            if (is_flex && is_row) {
-                // Row flex: height is max child height
-                content_height = 0;
-                for (uint c = 0; c < child_count; c++) {
-                    LayoutBox child_box = boxes[children[c]];
-                    ComputedStyle child_style = styles[children[c]];
-                    float h = child_box.height + child_style.margin[0] + child_style.margin[2];
-                    if (h > content_height) content_height = h;
+            // Push in reverse order
+            for (int c = child_count - 1; c >= 0; c--) {
+                if (stack_top < 256) {
+                    stack[stack_top] = children[c];
+                    visited[stack_top] = 0;
+                    stack_top++;
                 }
-            } else {
-                // Column or block: height is sum
-                content_height = child_y;
             }
-            parent_box.content_height = content_height;
-            parent_box.height = content_height +
-                parent_style.padding[0] + parent_style.padding[2] +
-                parent_style.border_width[0] + parent_style.border_width[2];
-            boxes[i] = parent_box;
         }
     }
 }

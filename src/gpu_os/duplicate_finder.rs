@@ -19,8 +19,11 @@ use std::path::{Path, PathBuf};
 /// Hash chunk size (64KB for optimal GPU throughput)
 const HASH_CHUNK_SIZE: usize = 65536;
 
-/// Maximum files to process
-const MAX_FILES: usize = 100000;
+/// Maximum files to process per batch (larger = fewer GPU round-trips)
+const BATCH_SIZE: usize = 2048;
+
+/// Maximum total files to track
+const MAX_FILES: usize = 50000;
 
 /// Maximum duplicate groups
 const MAX_GROUPS: usize = 10000;
@@ -350,6 +353,105 @@ pub struct ScanResult {
     pub files_scanned: usize,
     pub duplicate_groups: usize,
     pub total_wasted_bytes: u64,
+    pub cache_hits: usize,
+    pub cache_misses: usize,
+}
+
+// ============================================================================
+// Hash Cache
+// ============================================================================
+
+/// Cached hash entry
+#[derive(Clone)]
+struct CacheEntry {
+    mtime: u64,
+    size: u64,
+    hash_low: u64,
+    hash_high: u64,
+}
+
+/// Persistent hash cache to avoid re-reading unchanged files
+struct HashCache {
+    entries: HashMap<PathBuf, CacheEntry>,
+    cache_path: PathBuf,
+    dirty: bool,
+}
+
+impl HashCache {
+    fn new() -> Self {
+        let cache_path = std::env::var("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(".duplicate_hash_cache");
+
+        let mut cache = Self {
+            entries: HashMap::new(),
+            cache_path,
+            dirty: false,
+        };
+        cache.load();
+        cache
+    }
+
+    fn load(&mut self) {
+        if let Ok(data) = fs::read_to_string(&self.cache_path) {
+            for line in data.lines() {
+                let parts: Vec<&str> = line.splitn(5, '\t').collect();
+                if parts.len() == 5 {
+                    if let (Ok(mtime), Ok(size), Ok(hash_low), Ok(hash_high)) = (
+                        parts[1].parse::<u64>(),
+                        parts[2].parse::<u64>(),
+                        parts[3].parse::<u64>(),
+                        parts[4].parse::<u64>(),
+                    ) {
+                        self.entries.insert(
+                            PathBuf::from(parts[0]),
+                            CacheEntry { mtime, size, hash_low, hash_high },
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn save(&self) {
+        if !self.dirty {
+            return;
+        }
+        let mut output = String::new();
+        for (path, entry) in &self.entries {
+            output.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\n",
+                path.display(),
+                entry.mtime,
+                entry.size,
+                entry.hash_low,
+                entry.hash_high
+            ));
+        }
+        let _ = fs::write(&self.cache_path, output);
+    }
+
+    fn get(&self, path: &Path, mtime: u64, size: u64) -> Option<(u64, u64)> {
+        self.entries.get(path).and_then(|e| {
+            if e.mtime == mtime && e.size == size {
+                Some((e.hash_low, e.hash_high))
+            } else {
+                None
+            }
+        })
+    }
+
+    fn insert(&mut self, path: PathBuf, mtime: u64, size: u64, hash_low: u64, hash_high: u64) {
+        self.entries.insert(path, CacheEntry { mtime, size, hash_low, hash_high });
+        self.dirty = true;
+    }
+}
+
+impl Drop for HashCache {
+    fn drop(&mut self) {
+        self.save();
+    }
 }
 
 // ============================================================================
@@ -378,6 +480,12 @@ pub struct GpuDuplicateFinder {
     max_files: usize,
     file_paths: Vec<PathBuf>,   // Paths indexed by FileInfo.path_index
     file_sizes: Vec<u64>,       // Sizes for each file
+    file_mtimes: Vec<u64>,      // Modification times for cache validation
+
+    // Cache
+    hash_cache: HashCache,
+    cache_hits: usize,
+    cache_misses: usize,
 }
 
 impl GpuDuplicateFinder {
@@ -393,10 +501,10 @@ impl GpuDuplicateFinder {
         let hash_pipeline = builder.create_compute_pipeline(&library, "hash_chunk_kernel")?;
         let group_pipeline = builder.create_compute_pipeline(&library, "group_duplicates_kernel")?;
 
-        // Allocate buffers
+        // Allocate buffers - use BATCH_SIZE for working buffers to keep memory small
         let files_buffer = builder.create_buffer(max_files * mem::size_of::<FileInfo>());
-        let chunk_buffer = builder.create_buffer(max_files * HASH_CHUNK_SIZE); // One chunk per file at a time
-        let jobs_buffer = builder.create_buffer(max_files * mem::size_of::<HashJob>());
+        let chunk_buffer = builder.create_buffer(BATCH_SIZE * HASH_CHUNK_SIZE); // Only batch-sized working buffer
+        let jobs_buffer = builder.create_buffer(BATCH_SIZE * mem::size_of::<HashJob>());
         let params_buffer = builder.create_buffer(mem::size_of::<HashParams>());
         let groups_buffer = builder.create_buffer(MAX_GROUPS * mem::size_of::<GpuDuplicateGroup>());
         let group_count_buffer = builder.create_buffer(mem::size_of::<u32>());
@@ -417,6 +525,10 @@ impl GpuDuplicateFinder {
             max_files,
             file_paths: Vec::with_capacity(max_files),
             file_sizes: Vec::with_capacity(max_files),
+            file_mtimes: Vec::with_capacity(max_files),
+            hash_cache: HashCache::new(),
+            cache_hits: 0,
+            cache_misses: 0,
         })
     }
 
@@ -424,36 +536,53 @@ impl GpuDuplicateFinder {
     pub fn scan_directory(&mut self, path: &Path) -> Result<ScanResult, io::Error> {
         self.file_paths.clear();
         self.file_sizes.clear();
+        self.file_mtimes.clear();
+        self.cache_hits = 0;
+        self.cache_misses = 0;
 
-        // Collect files with sizes
-        let mut size_map: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+        // Collect files with sizes and mtimes
+        let mut size_map: HashMap<u64, Vec<(PathBuf, u64)>> = HashMap::new();
 
         self.scan_recursive(path, &mut size_map)?;
 
         // Only keep files that have potential duplicates (same size)
-        for (size, paths) in size_map {
-            if paths.len() > 1 && size > 0 {
-                for p in paths {
+        for (size, files) in size_map {
+            if files.len() > 1 && size > 0 {
+                for (p, mtime) in files {
                     if self.file_paths.len() >= self.max_files {
                         break;
                     }
                     self.file_paths.push(p);
                     self.file_sizes.push(size);
+                    self.file_mtimes.push(mtime);
                 }
             }
         }
 
-        // Initialize GPU file info
+        // Initialize GPU file info, checking cache for existing hashes
         unsafe {
             let files_ptr = self.files_buffer.contents() as *mut FileInfo;
-            for (i, (path, size)) in self.file_paths.iter().zip(self.file_sizes.iter()).enumerate() {
+            for i in 0..self.file_paths.len() {
+                let path = &self.file_paths[i];
+                let size = self.file_sizes[i];
+                let mtime = self.file_mtimes[i];
+
+                // Check cache for existing hash
+                let (hash_low, hash_high, status) = if let Some((hl, hh)) = self.hash_cache.get(path, mtime, size) {
+                    self.cache_hits += 1;
+                    (hl, hh, 2) // Already complete
+                } else {
+                    self.cache_misses += 1;
+                    (0, 0, 0) // Needs hashing
+                };
+
                 *files_ptr.add(i) = FileInfo {
                     path_index: i as u32,
-                    file_size: *size,
+                    file_size: size,
                     size_group: 0,
-                    hash_low: 0,
-                    hash_high: 0,
-                    status: 0, // Pending
+                    hash_low,
+                    hash_high,
+                    status,
                     _padding: 0,
                 };
             }
@@ -463,10 +592,12 @@ impl GpuDuplicateFinder {
             files_scanned: self.file_paths.len(),
             duplicate_groups: 0,
             total_wasted_bytes: 0,
+            cache_hits: self.cache_hits,
+            cache_misses: self.cache_misses,
         })
     }
 
-    fn scan_recursive(&self, path: &Path, size_map: &mut HashMap<u64, Vec<PathBuf>>) -> Result<(), io::Error> {
+    fn scan_recursive(&self, path: &Path, size_map: &mut HashMap<u64, Vec<(PathBuf, u64)>>) -> Result<(), io::Error> {
         if !path.is_dir() {
             return Ok(());
         }
@@ -486,8 +617,13 @@ impl GpuDuplicateFinder {
             } else if entry_path.is_file() {
                 if let Ok(metadata) = entry.metadata() {
                     let size = metadata.len();
+                    let mtime = metadata.modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
                     if size > 0 && size < 100 * 1024 * 1024 {  // Skip empty and very large files
-                        size_map.entry(size).or_insert_with(Vec::new).push(entry_path);
+                        size_map.entry(size).or_insert_with(Vec::new).push((entry_path, mtime));
                     }
                 }
             }
@@ -496,52 +632,124 @@ impl GpuDuplicateFinder {
         Ok(())
     }
 
-    /// Compute hashes for all scanned files
+    /// Compute hashes for all scanned files (processes in batches to limit memory)
     pub fn compute_hashes(&mut self) -> Result<(), io::Error> {
         if self.file_paths.is_empty() {
             return Ok(());
         }
 
-        // For simplicity, hash first chunk of each file
-        // A full implementation would stream all chunks
-        let mut jobs: Vec<HashJob> = Vec::new();
-        let mut chunk_data: Vec<u8> = Vec::new();
+        // Find files that need hashing (not cached)
+        let files_to_hash: Vec<usize> = unsafe {
+            let files_ptr = self.files_buffer.contents() as *const FileInfo;
+            (0..self.file_paths.len())
+                .filter(|&i| (*files_ptr.add(i)).status == 0)
+                .collect()
+        };
 
-        for (i, path) in self.file_paths.iter().enumerate() {
-            if let Ok(content) = fs::read(path) {
-                let chunk_len = content.len().min(HASH_CHUNK_SIZE);
-                let chunk_start = chunk_data.len();
-
-                chunk_data.extend_from_slice(&content[..chunk_len]);
-                chunk_data.resize(chunk_start + HASH_CHUNK_SIZE, 0); // Pad to HASH_CHUNK_SIZE
-
-                jobs.push(HashJob {
-                    file_index: i as u32,
-                    chunk_index: 0,
-                    chunk_offset: 0,
-                    chunk_length: chunk_len as u32,
-                    is_last_chunk: if content.len() <= HASH_CHUNK_SIZE { 1 } else { 0 },
-                });
-            }
+        // Skip GPU work if all files were cached
+        if files_to_hash.is_empty() {
+            return Ok(());
         }
 
-        if jobs.is_empty() {
+        // Process files in batches to keep memory usage reasonable
+        for batch in files_to_hash.chunks(BATCH_SIZE) {
+            self.process_batch(batch)?;
+        }
+
+        // Update cache with new hashes
+        self.update_cache();
+
+        Ok(())
+    }
+
+    /// Update cache with newly computed hashes
+    fn update_cache(&mut self) {
+        unsafe {
+            let files_ptr = self.files_buffer.contents() as *const FileInfo;
+            for i in 0..self.file_paths.len() {
+                let file = *files_ptr.add(i);
+                if file.status == 2 {
+                    let path = self.file_paths[i].clone();
+                    let mtime = self.file_mtimes[i];
+                    let size = self.file_sizes[i];
+                    self.hash_cache.insert(path, mtime, size, file.hash_low, file.hash_high);
+                }
+            }
+        }
+    }
+
+    /// Process a batch of files using parallel I/O
+    fn process_batch(&mut self, file_indices: &[usize]) -> Result<(), io::Error> {
+        use std::io::Read;
+        use std::sync::Mutex;
+        use std::thread;
+
+        // Collect file read results in parallel
+        let results: Mutex<Vec<(usize, Vec<u8>, u32, bool)>> = Mutex::new(Vec::with_capacity(file_indices.len()));
+
+        // Parallel file reading using scoped threads
+        let paths: Vec<_> = file_indices
+            .iter()
+            .map(|&i| (i, &self.file_paths[i], self.file_sizes[i]))
+            .collect();
+
+        // Read files in parallel (8 threads)
+        let chunk_count = (paths.len() + 7) / 8;
+        thread::scope(|s| {
+            for chunk in paths.chunks(chunk_count.max(1)) {
+                let results_ref = &results;
+                s.spawn(move || {
+                    for &(file_idx, path, file_size) in chunk {
+                        if let Ok(mut file) = fs::File::open(path) {
+                            let mut buffer = vec![0u8; HASH_CHUNK_SIZE];
+                            if let Ok(n) = file.read(&mut buffer) {
+                                if n > 0 {
+                                    buffer.truncate(n);
+                                    let is_last = file_size <= HASH_CHUNK_SIZE as u64;
+                                    results_ref.lock().unwrap().push((file_idx, buffer, n as u32, is_last));
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut read_results = results.into_inner().unwrap();
+        if read_results.is_empty() {
             return Ok(());
+        }
+
+        // Sort by file index to maintain order (helps with cache locality)
+        read_results.sort_by_key(|(idx, _, _, _)| *idx);
+
+        // Pack data consecutively - shader uses gid * CHUNK_SIZE
+        let mut chunk_data: Vec<u8> = vec![0u8; read_results.len() * HASH_CHUNK_SIZE];
+        let mut jobs: Vec<HashJob> = Vec::with_capacity(read_results.len());
+
+        for (job_idx, (file_idx, data, bytes_read, is_last)) in read_results.into_iter().enumerate() {
+            let offset = job_idx * HASH_CHUNK_SIZE;
+            chunk_data[offset..offset + data.len()].copy_from_slice(&data);
+
+            jobs.push(HashJob {
+                file_index: file_idx as u32,
+                chunk_index: 0,
+                chunk_offset: 0, // Not used by shader
+                chunk_length: bytes_read,
+                is_last_chunk: if is_last { 1 } else { 0 },
+            });
         }
 
         // Copy to GPU buffers
         unsafe {
-            // Copy chunk data
             let chunk_ptr = self.chunk_buffer.contents() as *mut u8;
             std::ptr::copy_nonoverlapping(chunk_data.as_ptr(), chunk_ptr, chunk_data.len());
 
-            // Copy jobs
             let jobs_ptr = self.jobs_buffer.contents() as *mut HashJob;
             for (i, job) in jobs.iter().enumerate() {
                 *jobs_ptr.add(i) = *job;
             }
 
-            // Set params
             let params_ptr = self.params_buffer.contents() as *mut HashParams;
             *params_ptr = HashParams {
                 job_count: jobs.len() as u32,

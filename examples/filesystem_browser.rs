@@ -23,7 +23,7 @@ use std::path::Path;
 use std::time::Instant;
 
 const INDEX_FILE: &str = "/Users/patrickkavanagh/.filesystem_index.txt";
-const MAX_GPU_PATHS: usize = 3_000_000; // Support up to 3M paths on GPU
+const MAX_GPU_PATHS: usize = 500_000; // Reduced from 3M to prevent memory exhaustion (~128MB)
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, Modifiers, WindowEvent},

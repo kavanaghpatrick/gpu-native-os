@@ -700,13 +700,28 @@ constant uint32_t MAX_WORD_LEN = 32;
 struct SearchParams {
     uint32_t path_count;
     uint32_t word_count;
-    uint32_t _padding[2];
+    uint32_t max_results;
+    uint32_t _padding;
 };
 
 struct SearchWord {
     char chars[32];   // Word characters (lowercase)
     uint16_t len;
     uint16_t _padding;
+};
+
+// Compact search result - only matches written here
+struct SearchResult {
+    uint32_t path_index;
+    int32_t score;
+};
+
+// TextChar for direct GPU text rendering
+struct TextChar {
+    float x;
+    float y;
+    uint32_t char_code;
+    uint32_t color;
 };
 
 // Fuzzy match: all characters of needle appear in haystack in order
@@ -778,7 +793,8 @@ kernel void fuzzy_search_kernel(
     device const uint16_t* path_lengths [[buffer(1)]], // Length of each path
     constant SearchParams& params [[buffer(2)]],       // Search parameters
     constant SearchWord* words [[buffer(3)]],          // Query words (lowercase)
-    device int32_t* scores [[buffer(4)]],              // Output: match scores (-1 = no match)
+    device SearchResult* results [[buffer(4)]],        // Output: compact results (matches only)
+    device atomic_uint& result_count [[buffer(5)]],    // Atomic counter for results
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.path_count) return;
@@ -828,8 +844,7 @@ kernel void fuzzy_search_kernel(
         }
         // Word doesn't match at all - reject this path
         else {
-            scores[gid] = -1;
-            return;
+            return;  // No match, don't write anything
         }
     }
 
@@ -840,7 +855,69 @@ kernel void fuzzy_search_kernel(
     }
     score -= min(depth, 10);
 
-    scores[gid] = score;
+    // Atomically grab a slot in results buffer
+    uint idx = atomic_fetch_add_explicit(&result_count, 1, memory_order_relaxed);
+    if (idx < params.max_results) {
+        results[idx].path_index = gid;
+        results[idx].score = score;
+    }
+}
+
+// Sort results by score (simple bubble sort for small arrays, runs on single thread)
+kernel void sort_results_kernel(
+    device SearchResult* results [[buffer(0)]],
+    device const atomic_uint& result_count [[buffer(1)]],
+    constant uint& max_to_sort [[buffer(2)]]
+) {
+    uint count = min(atomic_load_explicit(&result_count, memory_order_relaxed), max_to_sort);
+
+    // Simple insertion sort (good enough for <1000 items on GPU)
+    for (uint i = 1; i < count; i++) {
+        SearchResult key = results[i];
+        int j = i - 1;
+        while (j >= 0 && results[j].score < key.score) {
+            results[j + 1] = results[j];
+            j--;
+        }
+        results[j + 1] = key;
+    }
+}
+
+// Generate TextChar array directly from search results
+kernel void generate_results_text_kernel(
+    device const char* paths [[buffer(0)]],              // All paths
+    device const uint16_t* path_lengths [[buffer(1)]],   // Path lengths
+    device const SearchResult* results [[buffer(2)]],    // Search results
+    device const atomic_uint& result_count [[buffer(3)]],// Number of results
+    device TextChar* text_chars [[buffer(4)]],           // Output text characters
+    device atomic_uint& char_count [[buffer(5)]],        // Output char count
+    constant float& start_y [[buffer(6)]],               // Y position to start rendering
+    constant float& line_height [[buffer(7)]],           // Line height
+    constant uint& max_display [[buffer(8)]],            // Max results to display
+    uint gid [[thread_position_in_grid]]
+) {
+    uint num_results = min(atomic_load_explicit(&result_count, memory_order_relaxed), max_display);
+    if (gid >= num_results) return;
+
+    SearchResult result = results[gid];
+    device const char* path = paths + (result.path_index * MAX_PATH_LEN);
+    uint16_t path_len = path_lengths[result.path_index];
+
+    // Calculate Y position for this line
+    float y = start_y + (float(gid) * line_height);
+    float x = 20.0;
+
+    // Write each character of the path
+    uint base_idx = atomic_fetch_add_explicit(&char_count, path_len, memory_order_relaxed);
+
+    uint32_t color = (gid == 0) ? 0x00FF00FF : 0xFFFFFFFF;  // Green for first, white for rest
+
+    for (uint16_t i = 0; i < path_len && (base_idx + i) < 20000; i++) {
+        text_chars[base_idx + i].x = x + (float(i) * 8.0);
+        text_chars[base_idx + i].y = y;
+        text_chars[base_idx + i].char_code = (uint32_t)path[i];
+        text_chars[base_idx + i].color = color;
+    }
 }
 "#;
 
@@ -1576,13 +1653,15 @@ impl GpuApp for GpuFilesystem {
 const GPU_MAX_PATH_LEN: usize = 256;
 const GPU_MAX_QUERY_WORDS: usize = 8;
 const GPU_MAX_WORD_LEN: usize = 32;
+const GPU_MAX_RESULTS: usize = 1000;  // Max matches to collect
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct SearchParams {
     path_count: u32,
     word_count: u32,
-    _padding: [u32; 2],
+    max_results: u32,
+    _padding: u32,
 }
 
 #[repr(C)]
@@ -1593,14 +1672,25 @@ struct SearchWord {
     _padding: u16,
 }
 
+/// Compact search result from GPU
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SearchResult {
+    path_index: u32,
+    score: i32,
+}
+
 /// GPU-accelerated fuzzy path search
 ///
 /// Searches millions of paths in parallel using Metal compute shaders.
 /// Each GPU thread checks one path against all query words.
+/// Results stay on GPU and can be rendered directly without CPU readback.
 pub struct GpuPathSearch {
     device: Device,
     command_queue: CommandQueue,
     search_pipeline: ComputePipelineState,
+    sort_pipeline: ComputePipelineState,
+    text_gen_pipeline: ComputePipelineState,
 
     // Path storage
     paths_buffer: Buffer,        // All paths (packed, 256 bytes each)
@@ -1610,13 +1700,22 @@ pub struct GpuPathSearch {
     params_buffer: Buffer,       // SearchParams
     words_buffer: Buffer,        // Query words
 
-    // Results
-    scores_buffer: Buffer,       // Match scores (i32, -1 = no match)
+    // Results (stay on GPU)
+    results_buffer: Buffer,      // Compact SearchResult array
+    result_count_buffer: Buffer, // Atomic counter
+
+    // Text output (for direct GPU rendering)
+    text_chars_buffer: Buffer,   // TextChar array for renderer
+    char_count_buffer: Buffer,   // Atomic counter for chars
+
+    // Constants for text generation
+    text_params_buffer: Buffer,  // start_y, line_height
+    max_sort_buffer: Buffer,     // max_to_sort (u32)
 
     // State
     max_paths: usize,
     current_path_count: usize,
-    paths: Vec<String>,          // Original paths for result lookup
+    paths: Vec<String>,          // Original paths for result lookup (only for legacy API)
 }
 
 impl GpuPathSearch {
@@ -1624,26 +1723,46 @@ impl GpuPathSearch {
         let builder = AppBuilder::new(device, "GpuPathSearch");
         let command_queue = device.new_command_queue();
 
-        // Compile shader
+        // Compile shaders
         let library = builder.compile_library(&get_filesystem_shader())?;
         let search_pipeline = builder.create_compute_pipeline(&library, "fuzzy_search_kernel")?;
+        let sort_pipeline = builder.create_compute_pipeline(&library, "sort_results_kernel")?;
+        let text_gen_pipeline = builder.create_compute_pipeline(&library, "generate_results_text_kernel")?;
 
-        // Allocate buffers
+        // Path storage
         let paths_buffer = builder.create_buffer(max_paths * GPU_MAX_PATH_LEN);
         let path_lengths_buffer = builder.create_buffer(max_paths * mem::size_of::<u16>());
+
+        // Query buffers
         let params_buffer = builder.create_buffer(mem::size_of::<SearchParams>());
         let words_buffer = builder.create_buffer(GPU_MAX_QUERY_WORDS * mem::size_of::<SearchWord>());
-        let scores_buffer = builder.create_buffer(max_paths * mem::size_of::<i32>());
+
+        // Results buffer (compact, max 1000 results)
+        let results_buffer = builder.create_buffer(GPU_MAX_RESULTS * mem::size_of::<SearchResult>());
+        let result_count_buffer = builder.create_buffer(mem::size_of::<u32>());
+
+        // Text output for direct GPU rendering
+        let text_chars_buffer = builder.create_buffer(20000 * 16); // 20K chars * 16 bytes each
+        let char_count_buffer = builder.create_buffer(mem::size_of::<u32>());
+        let text_params_buffer = builder.create_buffer(8); // start_y, line_height (f32 each)
+        let max_sort_buffer = builder.create_buffer(mem::size_of::<u32>()); // max_to_sort
 
         Ok(Self {
             device: device.clone(),
             command_queue,
             search_pipeline,
+            sort_pipeline,
+            text_gen_pipeline,
             paths_buffer,
             path_lengths_buffer,
             params_buffer,
             words_buffer,
-            scores_buffer,
+            results_buffer,
+            result_count_buffer,
+            text_chars_buffer,
+            char_count_buffer,
+            text_params_buffer,
+            max_sort_buffer,
             max_paths,
             current_path_count: 0,
             paths: Vec::with_capacity(max_paths),
@@ -1682,89 +1801,138 @@ impl GpuPathSearch {
         Ok(())
     }
 
-    /// Perform GPU fuzzy search
-    ///
-    /// Returns: Vec of (path_index, score) for matching paths, sorted by score descending
-    pub fn search(&self, query: &str, max_results: usize) -> Vec<(usize, i32)> {
+    /// Perform GPU fuzzy search and generate text for rendering
+    /// ALL computation stays on GPU. Returns result count.
+    pub fn search_and_render(&self, query: &str, start_y: f32, line_height: f32, max_display: usize) -> usize {
         if query.is_empty() || self.current_path_count == 0 {
-            return vec![];
+            unsafe { *(self.char_count_buffer.contents() as *mut u32) = 0; }
+            return 0;
         }
 
-        // Parse query into words (lowercase)
         let words: Vec<&str> = query.split_whitespace().collect();
         if words.is_empty() || words.len() > GPU_MAX_QUERY_WORDS {
-            return vec![];
+            unsafe { *(self.char_count_buffer.contents() as *mut u32) = 0; }
+            return 0;
         }
 
-        // Write search params
+        let max_results = GPU_MAX_RESULTS.min(max_display);
+
+        // Reset counters
+        unsafe {
+            *(self.result_count_buffer.contents() as *mut u32) = 0;
+            *(self.char_count_buffer.contents() as *mut u32) = 0;
+        }
+
+        // Write params
         unsafe {
             let params = self.params_buffer.contents() as *mut SearchParams;
             *params = SearchParams {
                 path_count: self.current_path_count as u32,
                 word_count: words.len() as u32,
-                _padding: [0; 2],
+                max_results: max_results as u32,
+                _padding: 0,
             };
 
-            // Write query words
             let words_ptr = self.words_buffer.contents() as *mut SearchWord;
             for (i, word) in words.iter().enumerate() {
                 let lower = word.to_lowercase();
                 let bytes = lower.as_bytes();
                 let len = bytes.len().min(GPU_MAX_WORD_LEN - 1);
-
-                let mut sw = SearchWord {
-                    chars: [0; 32],
-                    len: len as u16,
-                    _padding: 0,
-                };
+                let mut sw = SearchWord { chars: [0; 32], len: len as u16, _padding: 0 };
                 sw.chars[..len].copy_from_slice(&bytes[..len]);
                 *words_ptr.add(i) = sw;
             }
+
+            // Text params: [start_y, line_height]
+            let tp = self.text_params_buffer.contents() as *mut f32;
+            *tp = start_y;
+            *tp.add(1) = line_height;
+
+            // max_sort as u32
+            let ms = self.max_sort_buffer.contents() as *mut u32;
+            *ms = max_results.min(100) as u32; // Limit sort to 100 items max to prevent GPU hang
         }
 
-        // Dispatch GPU search
         let command_buffer = self.command_queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
 
-        encoder.set_compute_pipeline_state(&self.search_pipeline);
-        encoder.set_buffer(0, Some(&self.paths_buffer), 0);
-        encoder.set_buffer(1, Some(&self.path_lengths_buffer), 0);
-        encoder.set_buffer(2, Some(&self.params_buffer), 0);
-        encoder.set_buffer(3, Some(&self.words_buffer), 0);
-        encoder.set_buffer(4, Some(&self.scores_buffer), 0);
+        // Pass 1: Search
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.search_pipeline);
+            enc.set_buffer(0, Some(&self.paths_buffer), 0);
+            enc.set_buffer(1, Some(&self.path_lengths_buffer), 0);
+            enc.set_buffer(2, Some(&self.params_buffer), 0);
+            enc.set_buffer(3, Some(&self.words_buffer), 0);
+            enc.set_buffer(4, Some(&self.results_buffer), 0);
+            enc.set_buffer(5, Some(&self.result_count_buffer), 0);
+            let tpg = 256;
+            let tg = (self.current_path_count + tpg - 1) / tpg;
+            enc.dispatch_thread_groups(MTLSize::new(tg as u64, 1, 1), MTLSize::new(tpg as u64, 1, 1));
+            enc.end_encoding();
+        }
 
-        // Dispatch: one thread per path
-        let threads_per_group = 256;
-        let thread_groups = (self.current_path_count + threads_per_group - 1) / threads_per_group;
+        // Pass 2: Sort
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.sort_pipeline);
+            enc.set_buffer(0, Some(&self.results_buffer), 0);
+            enc.set_buffer(1, Some(&self.result_count_buffer), 0);
+            enc.set_buffer(2, Some(&self.max_sort_buffer), 0);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            enc.end_encoding();
+        }
 
-        encoder.dispatch_thread_groups(
-            MTLSize::new(thread_groups as u64, 1, 1),
-            MTLSize::new(threads_per_group as u64, 1, 1),
-        );
+        // Pass 3: Generate text
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.text_gen_pipeline);
+            enc.set_buffer(0, Some(&self.paths_buffer), 0);
+            enc.set_buffer(1, Some(&self.path_lengths_buffer), 0);
+            enc.set_buffer(2, Some(&self.results_buffer), 0);
+            enc.set_buffer(3, Some(&self.result_count_buffer), 0);
+            enc.set_buffer(4, Some(&self.text_chars_buffer), 0);
+            enc.set_buffer(5, Some(&self.char_count_buffer), 0);
+            enc.set_buffer(6, Some(&self.text_params_buffer), 0);  // start_y (f32)
+            enc.set_buffer(7, Some(&self.text_params_buffer), 4);  // line_height (f32)
+            enc.set_buffer(8, Some(&self.max_sort_buffer), 0);     // max_display (u32)
+            let dispatch_count = max_results.min(100) as u64;
+            enc.dispatch_thread_groups(MTLSize::new((dispatch_count + 255) / 256, 1, 1), MTLSize::new(256, 1, 1));
+            enc.end_encoding();
+        }
 
-        encoder.end_encoding();
         command_buffer.commit();
         command_buffer.wait_until_completed();
 
-        // Read results
-        let mut results: Vec<(usize, i32)> = Vec::new();
-        unsafe {
-            let scores = self.scores_buffer.contents() as *const i32;
+        unsafe { *(self.char_count_buffer.contents() as *const u32) as usize }
+    }
 
-            for i in 0..self.current_path_count {
-                let score = *scores.add(i);
-                if score >= 0 {
-                    results.push((i, score));
-                }
+    /// Get text chars buffer for direct GPU rendering
+    pub fn text_chars_buffer(&self) -> &Buffer {
+        &self.text_chars_buffer
+    }
+
+    /// Get char count
+    pub fn char_count(&self) -> usize {
+        unsafe { *(self.char_count_buffer.contents() as *const u32) as usize }
+    }
+
+    /// Legacy search API (for compatibility)
+    pub fn search(&self, query: &str, max_results: usize) -> Vec<(usize, i32)> {
+        if query.is_empty() || self.current_path_count == 0 {
+            return vec![];
+        }
+        let _ = self.search_and_render(query, 0.0, 20.0, max_results);
+
+        // Read compact results (just max_results items, not all paths)
+        let mut results = Vec::new();
+        unsafe {
+            let count = (*(self.result_count_buffer.contents() as *const u32) as usize).min(max_results);
+            let ptr = self.results_buffer.contents() as *const SearchResult;
+            for i in 0..count {
+                let r = *ptr.add(i);
+                results.push((r.path_index as usize, r.score));
             }
         }
-
-        // Sort by score (descending)
-        results.sort_by(|a, b| b.1.cmp(&a.1));
-
-        // Limit results
-        results.truncate(max_results);
-
         results
     }
 
@@ -1777,6 +1945,472 @@ impl GpuPathSearch {
     pub fn path_count(&self) -> usize {
         self.current_path_count
     }
+}
+
+// ============================================================================
+// GpuStreamingSearch - Memory-efficient streaming filesystem search
+// ============================================================================
+//
+// Instead of loading all paths into GPU memory (which can exceed 775MB for 3M paths),
+// this streams paths in chunks of 50K at a time, processing each chunk on GPU
+// and merging results incrementally.
+//
+// Memory usage: ~24MB fixed (vs 775MB+ for full index)
+// Supports: Unlimited filesystem size
+
+/// Streaming search constants
+pub const STREAM_CHUNK_SIZE: usize = 50_000;      // Paths per chunk
+pub const STREAM_MAX_PATH_LEN: usize = 256;       // Max path length
+pub const STREAM_CHUNK_BUFFER_SIZE: usize = STREAM_CHUNK_SIZE * STREAM_MAX_PATH_LEN; // ~12MB
+pub const STREAM_MAX_RESULTS: usize = 1000;       // Max results to keep
+
+/// Search result from streaming search
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct StreamSearchResult {
+    pub path_index: u32,    // Global index (chunk_offset + local_index)
+    pub score: i32,         // Match score
+}
+
+/// Parameters for streaming search kernel
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct StreamSearchParams {
+    chunk_size: u32,        // Number of paths in this chunk
+    chunk_offset: u32,      // Global offset for path indices
+    word_count: u32,        // Number of query words
+    min_score: i32,         // Minimum score threshold
+}
+
+/// GPU-accelerated streaming filesystem search
+///
+/// Uses chunked processing to search unlimited filesystems with fixed memory.
+pub struct GpuStreamingSearch {
+    device: Device,
+    command_queue: CommandQueue,
+    search_pipeline: ComputePipelineState,
+    sort_pipeline: ComputePipelineState,
+
+    // Double-buffered chunk storage (for potential async loading)
+    chunk_buffer_a: Buffer,      // ~12MB - paths for current chunk
+    chunk_buffer_b: Buffer,      // ~12MB - paths for next chunk (async load)
+    chunk_lengths_a: Buffer,     // Path lengths for chunk A
+    chunk_lengths_b: Buffer,     // Path lengths for chunk B
+    active_buffer: bool,         // Toggle between A/B
+
+    // Query buffers
+    params_buffer: Buffer,
+    words_buffer: Buffer,
+
+    // Chunk results (temporary per-chunk)
+    chunk_results_buffer: Buffer,
+    chunk_result_count: Buffer,
+
+    // Accumulated global results (best across all chunks)
+    global_results_buffer: Buffer,
+    global_result_count: Buffer,
+
+    // Statistics
+    total_paths_searched: usize,
+    chunks_processed: usize,
+}
+
+impl GpuStreamingSearch {
+    /// Create a new streaming search instance
+    pub fn new(device: &Device) -> Result<Self, String> {
+        let builder = AppBuilder::new(device, "GpuStreamingSearch");
+        let command_queue = device.new_command_queue();
+
+        // Compile shaders (reuse existing fuzzy_search_kernel)
+        let library = builder.compile_library(&get_filesystem_shader())?;
+        let search_pipeline = builder.create_compute_pipeline(&library, "fuzzy_search_kernel")?;
+        let sort_pipeline = builder.create_compute_pipeline(&library, "sort_results_kernel")?;
+
+        // Double-buffered chunk storage (~24MB total)
+        let chunk_buffer_a = builder.create_buffer(STREAM_CHUNK_BUFFER_SIZE);
+        let chunk_buffer_b = builder.create_buffer(STREAM_CHUNK_BUFFER_SIZE);
+        let chunk_lengths_a = builder.create_buffer(STREAM_CHUNK_SIZE * mem::size_of::<u16>());
+        let chunk_lengths_b = builder.create_buffer(STREAM_CHUNK_SIZE * mem::size_of::<u16>());
+
+        // Query buffers
+        let params_buffer = builder.create_buffer(mem::size_of::<SearchParams>());
+        let words_buffer = builder.create_buffer(GPU_MAX_QUERY_WORDS * mem::size_of::<SearchWord>());
+
+        // Results buffers
+        let chunk_results_buffer = builder.create_buffer(STREAM_MAX_RESULTS * mem::size_of::<StreamSearchResult>());
+        let chunk_result_count = builder.create_buffer(mem::size_of::<u32>());
+        let global_results_buffer = builder.create_buffer(STREAM_MAX_RESULTS * mem::size_of::<StreamSearchResult>());
+        let global_result_count = builder.create_buffer(mem::size_of::<u32>());
+
+        Ok(Self {
+            device: device.clone(),
+            command_queue,
+            search_pipeline,
+            sort_pipeline,
+            chunk_buffer_a,
+            chunk_buffer_b,
+            chunk_lengths_a,
+            chunk_lengths_b,
+            active_buffer: false,
+            params_buffer,
+            words_buffer,
+            chunk_results_buffer,
+            chunk_result_count,
+            global_results_buffer,
+            global_result_count,
+            total_paths_searched: 0,
+            chunks_processed: 0,
+        })
+    }
+
+    /// Upload a chunk of paths to GPU memory
+    fn upload_chunk(&self, paths: &[String], use_buffer_a: bool) {
+        let (path_buffer, len_buffer) = if use_buffer_a {
+            (&self.chunk_buffer_a, &self.chunk_lengths_a)
+        } else {
+            (&self.chunk_buffer_b, &self.chunk_lengths_b)
+        };
+
+        unsafe {
+            let path_ptr = path_buffer.contents() as *mut u8;
+            let len_ptr = len_buffer.contents() as *mut u16;
+
+            for (i, path) in paths.iter().enumerate() {
+                let bytes = path.as_bytes();
+                let len = bytes.len().min(STREAM_MAX_PATH_LEN - 1);
+
+                // Copy path
+                let dest = path_ptr.add(i * STREAM_MAX_PATH_LEN);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+                *dest.add(len) = 0; // Null-terminate
+
+                // Store length
+                *len_ptr.add(i) = len as u16;
+            }
+        }
+    }
+
+    /// Search a single chunk and accumulate results
+    fn search_chunk(&self, chunk_size: usize, chunk_offset: usize, query_words: &[(String, u16)], use_buffer_a: bool) {
+        let (path_buffer, len_buffer) = if use_buffer_a {
+            (&self.chunk_buffer_a, &self.chunk_lengths_a)
+        } else {
+            (&self.chunk_buffer_b, &self.chunk_lengths_b)
+        };
+
+        // Reset chunk result count
+        unsafe {
+            *(self.chunk_result_count.contents() as *mut u32) = 0;
+        }
+
+        // Set up search params (reuse SearchParams structure)
+        unsafe {
+            let params = self.params_buffer.contents() as *mut SearchParams;
+            (*params).path_count = chunk_size as u32;
+            (*params).word_count = query_words.len() as u32;
+        }
+
+        // Upload query words
+        unsafe {
+            let word_ptr = self.words_buffer.contents() as *mut SearchWord;
+            for (i, (word, len)) in query_words.iter().enumerate() {
+                let w = word_ptr.add(i);
+                let bytes = word.as_bytes();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*w).chars.as_mut_ptr() as *mut u8, *len as usize);
+                (*w).len = *len;
+            }
+        }
+
+        // Execute GPU search
+        let command_buffer = self.command_queue.new_command_buffer();
+        {
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.search_pipeline);
+            encoder.set_buffer(0, Some(path_buffer), 0);
+            encoder.set_buffer(1, Some(len_buffer), 0);
+            encoder.set_buffer(2, Some(&self.params_buffer), 0);
+            encoder.set_buffer(3, Some(&self.words_buffer), 0);
+            encoder.set_buffer(4, Some(&self.chunk_results_buffer), 0);
+            encoder.set_buffer(5, Some(&self.chunk_result_count), 0);
+
+            let threadgroups = ((chunk_size as u64 + 1023) / 1024).max(1);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(threadgroups, 1, 1),
+                MTLSize::new(1024, 1, 1),
+            );
+            encoder.end_encoding();
+        }
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
+
+    /// Merge chunk results into global results, keeping top N by score
+    fn merge_results(&self, chunk_offset: usize) {
+        unsafe {
+            let chunk_count = *(self.chunk_result_count.contents() as *const u32) as usize;
+            let global_count_ptr = self.global_result_count.contents() as *mut u32;
+            let mut global_count = *global_count_ptr as usize;
+
+            let chunk_ptr = self.chunk_results_buffer.contents() as *const StreamSearchResult;
+            let global_ptr = self.global_results_buffer.contents() as *mut StreamSearchResult;
+
+            // Add chunk results to global (adjusting indices by chunk_offset)
+            for i in 0..chunk_count.min(STREAM_MAX_RESULTS) {
+                let mut result = *chunk_ptr.add(i);
+                result.path_index += chunk_offset as u32;  // Adjust to global index
+
+                if global_count < STREAM_MAX_RESULTS {
+                    *global_ptr.add(global_count) = result;
+                    global_count += 1;
+                } else {
+                    // Find minimum score and replace if this is better
+                    let mut min_idx = 0;
+                    let mut min_score = (*global_ptr.add(0)).score;
+                    for j in 1..STREAM_MAX_RESULTS {
+                        let s = (*global_ptr.add(j)).score;
+                        if s < min_score {
+                            min_score = s;
+                            min_idx = j;
+                        }
+                    }
+                    if result.score > min_score {
+                        *global_ptr.add(min_idx) = result;
+                    }
+                }
+            }
+
+            *global_count_ptr = global_count as u32;
+        }
+    }
+
+    /// Sort global results by score (descending)
+    fn sort_results(&self) {
+        let count = unsafe { *(self.global_result_count.contents() as *const u32) as usize };
+        if count <= 1 {
+            return;
+        }
+
+        // Simple CPU insertion sort for now (results are small)
+        unsafe {
+            let ptr = self.global_results_buffer.contents() as *mut StreamSearchResult;
+            for i in 1..count {
+                let key = *ptr.add(i);
+                let mut j = i;
+                while j > 0 && (*ptr.add(j - 1)).score < key.score {
+                    *ptr.add(j) = *ptr.add(j - 1);
+                    j -= 1;
+                }
+                *ptr.add(j) = key;
+            }
+        }
+    }
+
+    /// Reset search state
+    pub fn reset(&mut self) {
+        unsafe {
+            *(self.global_result_count.contents() as *mut u32) = 0;
+        }
+        self.total_paths_searched = 0;
+        self.chunks_processed = 0;
+    }
+
+    /// Process a chunk of paths (call repeatedly with chunks from PathIterator)
+    pub fn process_chunk(&mut self, paths: &[String], chunk_offset: usize, query_words: &[(String, u16)]) {
+        if paths.is_empty() || query_words.is_empty() {
+            return;
+        }
+
+        // Upload paths
+        self.upload_chunk(paths, self.active_buffer);
+
+        // Search
+        self.search_chunk(paths.len(), chunk_offset, query_words, self.active_buffer);
+
+        // Merge results
+        self.merge_results(chunk_offset);
+
+        // Update stats
+        self.total_paths_searched += paths.len();
+        self.chunks_processed += 1;
+
+        // Toggle buffer for next chunk
+        self.active_buffer = !self.active_buffer;
+    }
+
+    /// Get final sorted results
+    pub fn get_results(&self) -> Vec<StreamSearchResult> {
+        let count = unsafe { *(self.global_result_count.contents() as *const u32) as usize };
+        let mut results = Vec::with_capacity(count);
+
+        unsafe {
+            let ptr = self.global_results_buffer.contents() as *const StreamSearchResult;
+            for i in 0..count {
+                results.push(*ptr.add(i));
+            }
+        }
+
+        // Sort by score descending
+        results.sort_by(|a, b| b.score.cmp(&a.score));
+        results
+    }
+
+    /// Get statistics
+    pub fn stats(&self) -> (usize, usize) {
+        (self.total_paths_searched, self.chunks_processed)
+    }
+}
+
+/// Disk-backed path iterator for streaming search
+///
+/// Reads paths from the filesystem index file in chunks, avoiding loading
+/// all paths into memory at once.
+pub struct PathIterator {
+    index_path: std::path::PathBuf,
+    reader: Option<std::io::BufReader<std::fs::File>>,
+    current_chunk: Vec<String>,
+    chunk_start: usize,
+    total_paths: usize,
+    paths_read: usize,
+}
+
+impl PathIterator {
+    /// Create iterator from index file
+    pub fn new(index_path: &std::path::Path) -> Result<Self, String> {
+        use std::io::BufRead;
+
+        let file = std::fs::File::open(index_path)
+            .map_err(|e| format!("Failed to open index: {}", e))?;
+        let mut reader = std::io::BufReader::new(file);
+
+        // Read header to get total count
+        let mut header = String::new();
+        reader.read_line(&mut header).ok();
+        let total_paths = header.trim()
+            .split_whitespace()
+            .last()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+
+        Ok(Self {
+            index_path: index_path.to_path_buf(),
+            reader: Some(reader),
+            current_chunk: Vec::with_capacity(STREAM_CHUNK_SIZE),
+            chunk_start: 0,
+            total_paths,
+            paths_read: 0,
+        })
+    }
+
+    /// Get next chunk of paths with its starting offset
+    /// Returns (chunk_paths, chunk_start_offset)
+    pub fn next_chunk_with_offset(&mut self) -> Option<(Vec<String>, usize)> {
+        use std::io::BufRead;
+
+        let reader = self.reader.as_mut()?;
+        self.current_chunk.clear();
+        let chunk_start = self.paths_read;
+
+        let mut line = String::new();
+        while self.current_chunk.len() < STREAM_CHUNK_SIZE {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    // Parse line: "id path" format
+                    if let Some(path) = line.trim().split_once(' ').map(|(_, p)| p.to_string()) {
+                        self.current_chunk.push(path);
+                        self.paths_read += 1;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if self.current_chunk.is_empty() {
+            None
+        } else {
+            Some((self.current_chunk.clone(), chunk_start))
+        }
+    }
+
+    /// Get next chunk of paths (legacy API, use next_chunk_with_offset for streaming search)
+    pub fn next_chunk(&mut self) -> Option<&[String]> {
+        use std::io::BufRead;
+
+        let reader = self.reader.as_mut()?;
+        self.current_chunk.clear();
+        self.chunk_start = self.paths_read;
+
+        let mut line = String::new();
+        while self.current_chunk.len() < STREAM_CHUNK_SIZE {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break, // EOF
+                Ok(_) => {
+                    // Parse line: "id path" format
+                    if let Some(path) = line.trim().split_once(' ').map(|(_, p)| p.to_string()) {
+                        self.current_chunk.push(path);
+                        self.paths_read += 1;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        if self.current_chunk.is_empty() {
+            None
+        } else {
+            Some(&self.current_chunk)
+        }
+    }
+
+    /// Reset to beginning
+    pub fn reset(&mut self) -> Result<(), String> {
+        use std::io::BufRead;
+
+        let file = std::fs::File::open(&self.index_path)
+            .map_err(|e| format!("Failed to reopen index: {}", e))?;
+        let mut reader = std::io::BufReader::new(file);
+
+        // Skip header
+        let mut header = String::new();
+        reader.read_line(&mut header).ok();
+
+        self.reader = Some(reader);
+        self.current_chunk.clear();
+        self.chunk_start = 0;
+        self.paths_read = 0;
+        Ok(())
+    }
+
+    /// Get total path count (from header)
+    pub fn total_paths(&self) -> usize {
+        self.total_paths
+    }
+
+    /// Get current position
+    pub fn paths_read(&self) -> usize {
+        self.paths_read
+    }
+
+    /// Get chunk start offset (for result index adjustment)
+    pub fn chunk_start(&self) -> usize {
+        self.chunk_start
+    }
+}
+
+/// Parse query into lowercase words
+pub fn parse_query_words(query: &str) -> Vec<(String, u16)> {
+    query
+        .split_whitespace()
+        .filter(|w| !w.is_empty())
+        .take(GPU_MAX_QUERY_WORDS)
+        .map(|w| {
+            let lower = w.to_lowercase();
+            let len = lower.len().min(GPU_MAX_WORD_LEN) as u16;
+            (lower, len)
+        })
+        .collect()
 }
 
 #[cfg(test)]
