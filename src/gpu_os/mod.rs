@@ -6,7 +6,8 @@ pub mod memory;      // #12 - Memory Architecture
 pub mod input;       // #13 - Input Pipeline
 pub mod layout;      // #14 - Layout Engine
 pub mod widget;      // #15 - Widget System
-pub mod text;        // #16 - Text Rendering
+pub mod text;        // #16 - Text Rendering (MSDF - partial)
+pub mod text_render; // Simple bitmap font text rendering
 pub mod render;      // #17 - Hybrid Rendering
 pub mod vsync;       // #18 - VSync Execution
 
