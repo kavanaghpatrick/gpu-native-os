@@ -308,3 +308,259 @@ pub fn create_aligned_vec(capacity: usize) -> Vec<u8> {
 pub fn align_to_page(size: usize) -> usize {
     (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
+
+// ============================================================================
+// WritableMmapBuffer: GPU-Direct File Writing via mmap
+// ============================================================================
+
+/// A writable memory-mapped file exposed as a Metal buffer.
+///
+/// GPU writes to this buffer are automatically persisted to disk via mmap.
+/// This enables true GPU-direct file editing without CPU involvement.
+///
+/// # How It Works
+/// 1. File is opened with read/write permissions
+/// 2. mmap with MAP_SHARED makes GPU writes visible to the file
+/// 3. Metal buffer points to mmap'd memory (unified memory on Apple Silicon)
+/// 4. GPU writes → mmap → kernel flushes to disk
+///
+/// # Example
+/// ```ignore
+/// let mut buffer = WritableMmapBuffer::open(&device, "data.bin")?;
+/// // GPU kernel modifies the buffer...
+/// buffer.sync(); // Ensure changes are flushed to disk
+/// ```
+pub struct WritableMmapBuffer {
+    mmap_ptr: *mut libc::c_void,
+    mmap_len: usize,
+    file_size: usize,
+    file: File,
+    buffer: Buffer,
+}
+
+unsafe impl Send for WritableMmapBuffer {}
+unsafe impl Sync for WritableMmapBuffer {}
+
+impl WritableMmapBuffer {
+    /// Open an existing file for GPU-direct read/write access.
+    pub fn open(device: &Device, path: impl AsRef<Path>) -> Result<Self, MmapError> {
+        use std::fs::OpenOptions;
+
+        let path = path.as_ref();
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(MmapError::IoError)?;
+
+        let file_size = file.metadata()
+            .map_err(MmapError::IoError)?
+            .len() as usize;
+
+        if file_size == 0 {
+            return Err(MmapError::EmptyFile);
+        }
+
+        let aligned_size = (file_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        // MAP_SHARED: changes are written back to file
+        // PROT_READ | PROT_WRITE: GPU can read and write
+        let mmap_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                aligned_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+
+        if mmap_ptr == libc::MAP_FAILED {
+            return Err(MmapError::MmapFailed(std::io::Error::last_os_error()));
+        }
+
+        // Create Metal buffer - GPU writes go directly to mmap'd file
+        let buffer = device.new_buffer_with_bytes_no_copy(
+            mmap_ptr,
+            aligned_size as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+
+        Ok(Self {
+            mmap_ptr,
+            mmap_len: aligned_size,
+            file_size,
+            file,
+            buffer,
+        })
+    }
+
+    /// Create a new file with the specified size for GPU-direct access.
+    pub fn create(device: &Device, path: impl AsRef<Path>, size: usize) -> Result<Self, MmapError> {
+        use std::fs::OpenOptions;
+
+        if size == 0 {
+            return Err(MmapError::EmptyFile);
+        }
+
+        let path = path.as_ref();
+        let aligned_size = (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        // Create file with specified size
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .map_err(MmapError::IoError)?;
+
+        // Extend file to required size
+        file.set_len(aligned_size as u64)
+            .map_err(MmapError::IoError)?;
+
+        let mmap_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                aligned_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+
+        if mmap_ptr == libc::MAP_FAILED {
+            return Err(MmapError::MmapFailed(std::io::Error::last_os_error()));
+        }
+
+        let buffer = device.new_buffer_with_bytes_no_copy(
+            mmap_ptr,
+            aligned_size as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+
+        Ok(Self {
+            mmap_ptr,
+            mmap_len: aligned_size,
+            file_size: size,
+            file,
+            buffer,
+        })
+    }
+
+    /// Get the Metal buffer for GPU access.
+    #[inline]
+    pub fn metal_buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
+    /// Get the file size.
+    #[inline]
+    pub fn file_size(&self) -> usize {
+        self.file_size
+    }
+
+    /// Sync changes to disk.
+    ///
+    /// GPU writes are automatically visible to the mmap, but the kernel
+    /// may not have flushed them to disk yet. Call this to ensure durability.
+    pub fn sync(&self) -> Result<(), MmapError> {
+        let result = unsafe {
+            libc::msync(self.mmap_ptr, self.mmap_len, libc::MS_SYNC)
+        };
+
+        if result != 0 {
+            return Err(MmapError::IoError(std::io::Error::last_os_error()));
+        }
+
+        Ok(())
+    }
+
+    /// Async sync - returns immediately, sync happens in background.
+    pub fn sync_async(&self) {
+        unsafe {
+            libc::msync(self.mmap_ptr, self.mmap_len, libc::MS_ASYNC);
+        }
+    }
+
+    /// Resize the file and remapping.
+    ///
+    /// Note: This invalidates any existing GPU references to the buffer.
+    pub fn resize(&mut self, device: &Device, new_size: usize) -> Result<(), MmapError> {
+        if new_size == 0 {
+            return Err(MmapError::EmptyFile);
+        }
+
+        // Sync before resize
+        self.sync()?;
+
+        // Unmap old region
+        unsafe {
+            libc::munmap(self.mmap_ptr, self.mmap_len);
+        }
+
+        let aligned_size = (new_size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+
+        // Resize file
+        self.file.set_len(aligned_size as u64)
+            .map_err(MmapError::IoError)?;
+
+        // Remap
+        let mmap_ptr = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                aligned_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                self.file.as_raw_fd(),
+                0,
+            )
+        };
+
+        if mmap_ptr == libc::MAP_FAILED {
+            return Err(MmapError::MmapFailed(std::io::Error::last_os_error()));
+        }
+
+        // Create new Metal buffer
+        self.buffer = device.new_buffer_with_bytes_no_copy(
+            mmap_ptr,
+            aligned_size as u64,
+            MTLResourceOptions::StorageModeShared,
+            None,
+        );
+
+        self.mmap_ptr = mmap_ptr;
+        self.mmap_len = aligned_size;
+        self.file_size = new_size;
+
+        Ok(())
+    }
+
+    /// Get raw pointer for CPU-side access.
+    #[inline]
+    pub fn as_ptr(&self) -> *const u8 {
+        self.mmap_ptr as *const u8
+    }
+
+    /// Get mutable raw pointer for CPU-side access.
+    #[inline]
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.mmap_ptr as *mut u8
+    }
+}
+
+impl Drop for WritableMmapBuffer {
+    fn drop(&mut self) {
+        // Sync changes before unmapping
+        let _ = self.sync();
+
+        unsafe {
+            libc::munmap(self.mmap_ptr, self.mmap_len);
+        }
+    }
+}

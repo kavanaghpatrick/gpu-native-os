@@ -1,9 +1,12 @@
 // GPU-Native OS Modules
 // Each module corresponds to a GitHub issue
 
-pub mod metal_types; // Metal-safe struct definitions with alignment guarantees
-pub mod mmap_buffer; // #82 - Zero-copy file access via mmap
-pub mod gpu_index;   // #77 - GPU-Resident Filesystem Index
+pub mod metal_types;    // Metal-safe struct definitions with alignment guarantees
+pub mod mmap_buffer;    // #82 - Zero-copy file access via mmap
+pub mod gpu_io;         // #112 - GPU-Direct Storage with MTLIOCommandQueue
+pub mod gpu_index;      // #77 - GPU-Resident Filesystem Index
+pub mod parallel_alloc; // #91 - GPU-Native Parallel Prefix Allocator
+pub mod profiler;       // GPU profiling and persistence boundary measurement
 pub mod kernel;      // #11 - Unified Worker Model
 pub mod memory;      // #12 - Memory Architecture
 pub mod input;       // #13 - Input Pipeline
