@@ -1,6 +1,7 @@
 // GPU-Native OS Modules
 // Each module corresponds to a GitHub issue
 
+pub mod metal_types; // Metal-safe struct definitions with alignment guarantees
 pub mod kernel;      // #11 - Unified Worker Model
 pub mod memory;      // #12 - Memory Architecture
 pub mod input;       // #13 - Input Pipeline
@@ -14,6 +15,7 @@ pub mod vsync;       // #18 - VSync Execution
 
 // Application framework
 pub mod app;         // GpuApp trait and GpuRuntime
+pub mod gpu_string;  // #79 - GPU String Processing (tokenization, parsing)
 
 // Applications (use GpuApp framework)
 pub mod game_of_life;      // Game of Life app

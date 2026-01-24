@@ -712,6 +712,76 @@ struct SearchWord {
     uint16_t _padding;
 };
 
+// Tokenize result (for GPU tokenization)
+struct TokenizeResult {
+    atomic_uint word_count;
+    uint32_t _padding[3];
+};
+
+// ============================================================================
+// GPU Query Tokenizer (Issue #79 - Zero CPU String Processing)
+// ============================================================================
+//
+// Tokenizes a raw query string entirely on GPU.
+// Input: "Foo BAR  baz" (raw bytes from CPU - THE ONLY CPU WORK)
+// Output: SearchWord[0] = "foo", SearchWord[1] = "bar", SearchWord[2] = "baz"
+//
+// Each thread processes one character position. Threads at word boundaries
+// atomically claim a word slot and copy the word with lowercase conversion.
+
+inline bool is_whitespace_char(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+inline char to_lowercase_char(char c) {
+    if (c >= 'A' && c <= 'Z') {
+        return c + 32;
+    }
+    return c;
+}
+
+kernel void tokenize_query_kernel(
+    device const char* query [[buffer(0)]],          // Raw query bytes
+    device SearchWord* words [[buffer(1)]],          // Output: tokenized words
+    device TokenizeResult* result [[buffer(2)]],     // Output: word count
+    constant uint32_t& query_len [[buffer(3)]],      // Query length
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= query_len) return;
+
+    char c = query[tid];
+    char prev = (tid > 0) ? query[tid - 1] : ' ';
+
+    bool c_is_space = is_whitespace_char(c);
+    bool prev_is_space = is_whitespace_char(prev) || tid == 0;
+
+    // Word starts where non-space follows space
+    if (!c_is_space && prev_is_space) {
+        // Claim a word slot atomically
+        uint word_idx = atomic_fetch_add_explicit(&result->word_count, 1, memory_order_relaxed);
+
+        if (word_idx >= MAX_QUERY_WORDS) {
+            // Too many words - decrement and bail
+            atomic_fetch_sub_explicit(&result->word_count, 1, memory_order_relaxed);
+            return;
+        }
+
+        // Find word end and copy with lowercase conversion
+        uint word_len = 0;
+        for (uint i = tid; i < query_len && word_len < MAX_WORD_LEN - 1; i++) {
+            char ch = query[i];
+            if (is_whitespace_char(ch)) break;
+
+            words[word_idx].chars[word_len++] = to_lowercase_char(ch);
+        }
+
+        // Null-terminate
+        words[word_idx].chars[word_len] = 0;
+        words[word_idx].len = word_len;
+        words[word_idx]._padding = 0;
+    }
+}
+
 // Compact search result - only matches written here
 struct SearchResult {
     uint32_t path_index;
@@ -728,7 +798,7 @@ struct TextChar {
 
 // Fuzzy match: all characters of needle appear in haystack in order
 bool fuzzy_match_gpu(device const char* haystack, uint16_t haystack_len,
-                     constant char* needle, uint16_t needle_len) {
+                     device const char* needle, uint16_t needle_len) {
     uint16_t h_idx = 0;
 
     for (uint16_t n_idx = 0; n_idx < needle_len; n_idx++) {
@@ -758,7 +828,7 @@ bool fuzzy_match_gpu(device const char* haystack, uint16_t haystack_len,
 
 // Check if haystack contains needle as substring (case-insensitive)
 bool contains_substring_gpu(device const char* haystack, uint16_t haystack_len,
-                           constant char* needle, uint16_t needle_len) {
+                           device const char* needle, uint16_t needle_len) {
     if (needle_len > haystack_len) return false;
 
     for (uint16_t i = 0; i <= haystack_len - needle_len; i++) {
@@ -794,12 +864,39 @@ kernel void fuzzy_search_kernel(
     device const char* paths [[buffer(0)]],           // All paths (packed, MAX_PATH_LEN each)
     device const uint16_t* path_lengths [[buffer(1)]], // Length of each path
     constant SearchParams& params [[buffer(2)]],       // Search parameters
-    constant SearchWord* words [[buffer(3)]],          // Query words (lowercase)
+    device const SearchWord* words [[buffer(3)]],      // Query words (lowercase) - device for GPU tokenization
     device SearchResult* results [[buffer(4)]],        // Output: compact results (matches only)
     device atomic_uint& result_count [[buffer(5)]],    // Atomic counter for results
+    device const TokenizeResult* tokenize_result [[buffer(6)]], // Optional: GPU tokenization result
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= params.path_count) return;
+
+    // Determine actual word count:
+    // - If tokenize_result is provided (GPU-native search), use its word_count
+    // - If tokenize_result->word_count == 0, it means CPU tokenization (use params.word_count)
+    // - Or it means GPU tokenization found no words (whitespace-only query)
+    uint32_t word_count = params.word_count;
+    if (tokenize_result != nullptr) {
+        // Read word count from GPU tokenization result
+        uint32_t gpu_count = atomic_load_explicit(
+            (device atomic_uint*)&tokenize_result->word_count,
+            memory_order_relaxed
+        );
+        // GPU-native search sets params.word_count = MAX_QUERY_WORDS as sentinel
+        // If gpu_count > 0, use it; if gpu_count == 0 and params.word_count == MAX_QUERY_WORDS,
+        // this is a GPU-native search with 0 words (whitespace-only query)
+        if (gpu_count > 0 && gpu_count <= MAX_QUERY_WORDS) {
+            word_count = gpu_count;
+        } else if (params.word_count == MAX_QUERY_WORDS && gpu_count == 0) {
+            // GPU-native search with 0 words found - no match possible
+            word_count = 0;
+        }
+        // else: CPU tokenization with valid word_count in params
+    }
+
+    // Skip if no words to search
+    if (word_count == 0) return;
 
     // Get this thread's path
     device const char* path = paths + (gid * MAX_PATH_LEN);
@@ -813,8 +910,8 @@ kernel void fuzzy_search_kernel(
     // Check if ALL words match (fuzzy)
     int32_t score = 0;
 
-    for (uint32_t w = 0; w < params.word_count; w++) {
-        constant char* word = words[w].chars;
+    for (uint32_t w = 0; w < word_count; w++) {
+        device const char* word = words[w].chars;
         uint16_t word_len = words[w].len;
 
         // Check for exact substring in filename (best match)
@@ -1649,6 +1746,7 @@ const GPU_MAX_PATH_LEN: usize = 256;
 const GPU_MAX_QUERY_WORDS: usize = 8;
 const GPU_MAX_WORD_LEN: usize = 32;
 const GPU_MAX_RESULTS: usize = 1000;  // Max matches to collect
+const GPU_MAX_QUERY_LEN: usize = 256; // Max query length (Issue #79)
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1673,6 +1771,14 @@ struct SearchWord {
 struct SearchResult {
     path_index: u32,
     score: i32,
+}
+
+/// GPU tokenization result (Issue #79)
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+struct TokenizeResult {
+    word_count: u32,
+    _padding: [u32; 3],
 }
 
 // ============================================================================
@@ -1762,6 +1868,7 @@ pub struct GpuPathSearch {
     search_pipeline: ComputePipelineState,
     sort_pipeline: ComputePipelineState,
     text_gen_pipeline: ComputePipelineState,
+    tokenize_pipeline: ComputePipelineState, // Issue #79: GPU tokenization
 
     // Path storage
     paths_buffer: Buffer,        // All paths (packed, 256 bytes each)
@@ -1770,6 +1877,10 @@ pub struct GpuPathSearch {
     // Query
     params_buffer: Buffer,       // SearchParams
     words_buffer: Buffer,        // Query words
+
+    // GPU-native query processing (Issue #79)
+    raw_query_buffer: Buffer,       // Raw query bytes (only CPU memcpy)
+    tokenize_result_buffer: Buffer, // TokenizeResult (word count)
 
     // Results (stay on GPU)
     results_buffer: Buffer,      // Compact SearchResult array
@@ -1805,6 +1916,7 @@ impl GpuPathSearch {
         let search_pipeline = builder.create_compute_pipeline(&library, "fuzzy_search_kernel")?;
         let sort_pipeline = builder.create_compute_pipeline(&library, "sort_results_kernel")?;
         let text_gen_pipeline = builder.create_compute_pipeline(&library, "generate_results_text_kernel")?;
+        let tokenize_pipeline = builder.create_compute_pipeline(&library, "tokenize_query_kernel")?;
 
         // Path storage
         let paths_buffer = builder.create_buffer(max_paths * GPU_MAX_PATH_LEN);
@@ -1813,6 +1925,10 @@ impl GpuPathSearch {
         // Query buffers
         let params_buffer = builder.create_buffer(mem::size_of::<SearchParams>());
         let words_buffer = builder.create_buffer(GPU_MAX_QUERY_WORDS * mem::size_of::<SearchWord>());
+
+        // GPU-native query processing (Issue #79)
+        let raw_query_buffer = builder.create_buffer(GPU_MAX_QUERY_LEN);
+        let tokenize_result_buffer = builder.create_buffer(mem::size_of::<TokenizeResult>());
 
         // Results buffer (compact, max 1000 results)
         let results_buffer = builder.create_buffer(GPU_MAX_RESULTS * mem::size_of::<SearchResult>());
@@ -1838,10 +1954,13 @@ impl GpuPathSearch {
             search_pipeline,
             sort_pipeline,
             text_gen_pipeline,
+            tokenize_pipeline,
             paths_buffer,
             path_lengths_buffer,
             params_buffer,
             words_buffer,
+            raw_query_buffer,
+            tokenize_result_buffer,
             results_buffer,
             result_count_buffer,
             text_chars_buffer,
@@ -1940,6 +2059,11 @@ impl GpuPathSearch {
             // max_sort as u32
             let ms = self.max_sort_buffer.contents() as *mut u32;
             *ms = max_results.min(100) as u32; // Limit sort to 100 items max to prevent GPU hang
+
+            // For CPU-tokenized search, reset tokenize_result.word_count to 0
+            // so the kernel uses params.word_count instead
+            let tokenize_result = self.tokenize_result_buffer.contents() as *mut TokenizeResult;
+            (*tokenize_result).word_count = 0;
         }
 
         let command_buffer = self.command_queue.new_command_buffer();
@@ -1954,6 +2078,7 @@ impl GpuPathSearch {
             enc.set_buffer(3, Some(&self.words_buffer), 0);
             enc.set_buffer(4, Some(&self.results_buffer), 0);
             enc.set_buffer(5, Some(&self.result_count_buffer), 0);
+            enc.set_buffer(6, Some(&self.tokenize_result_buffer), 0); // word_count=0 for CPU tokenization
             let tpg = 256;
             let tg = (self.current_path_count + tpg - 1) / tpg;
             enc.dispatch_thread_groups(MTLSize::new(tg as u64, 1, 1), MTLSize::new(tpg as u64, 1, 1));
@@ -2127,6 +2252,13 @@ impl GpuPathSearch {
             *ms = max_results.min(100) as u32;
         }
 
+        // For CPU-tokenized search, reset tokenize_result.word_count to 0
+        // so the kernel uses params.word_count instead
+        unsafe {
+            let tokenize_result = self.tokenize_result_buffer.contents() as *mut TokenizeResult;
+            (*tokenize_result).word_count = 0;
+        }
+
         let command_buffer = self.command_queue.new_command_buffer();
 
         // Pass 1: Search
@@ -2139,6 +2271,7 @@ impl GpuPathSearch {
             enc.set_buffer(3, Some(&self.words_buffer), 0);
             enc.set_buffer(4, Some(&self.results_buffer), 0);
             enc.set_buffer(5, Some(&self.result_count_buffer), 0);
+            enc.set_buffer(6, Some(&self.tokenize_result_buffer), 0); // word_count=0 for CPU tokenization
             let tpg = 256;
             let tg = (self.current_path_count + tpg - 1) / tpg;
             enc.dispatch_thread_groups(MTLSize::new(tg as u64, 1, 1), MTLSize::new(tpg as u64, 1, 1));
@@ -2179,6 +2312,177 @@ impl GpuPathSearch {
     /// Check if a specific search is complete
     pub fn is_search_complete(&self, signal_value: u64) -> bool {
         self.shared_event.signaled_value() >= signal_value
+    }
+
+    // ========================================================================
+    // GPU-Native Search API (Issue #79)
+    // ========================================================================
+    //
+    // THE GPU IS THE COMPUTER. CPU does ONE memcpy, GPU does EVERYTHING ELSE:
+    // - Query tokenization (split whitespace, lowercase)
+    // - Fuzzy search
+    // - Result sorting
+    // - Text generation
+    //
+    // CPU involvement: ZERO string processing.
+
+    /// Perform a fully GPU-native search.
+    ///
+    /// CPU work: ONE memcpy of raw query bytes. That's it.
+    /// GPU work: Tokenization, search, sort, text generation.
+    ///
+    /// Returns a SearchHandle for async result retrieval.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // CPU just passes raw bytes - NO tokenization, NO lowercasing
+    /// let handle = search.search_gpu_native("Foo BAR baz", 100);
+    ///
+    /// // GPU does everything:
+    /// // 1. Tokenize: "Foo BAR baz" → ["foo", "bar", "baz"]
+    /// // 2. Search: fuzzy match against 3M paths
+    /// // 3. Sort: order by score
+    /// // 4. Return: ready for rendering
+    ///
+    /// let results = handle.wait_and_get_results();
+    /// ```
+    pub fn search_gpu_native(&self, query: &str, max_results: usize) -> SearchHandle {
+        let signal_value = self.next_signal_value.fetch_add(1, Ordering::SeqCst);
+
+        // Handle empty/invalid queries
+        if query.is_empty() || self.current_path_count == 0 {
+            unsafe {
+                *(self.result_count_buffer.contents() as *mut u32) = 0;
+            }
+            self.shared_event.set_signaled_value(signal_value);
+            return SearchHandle {
+                shared_event: self.shared_event.clone(),
+                signal_value,
+                results_buffer: self.results_buffer.clone(),
+                result_count_buffer: self.result_count_buffer.clone(),
+                max_results,
+            };
+        }
+
+        let bytes = query.as_bytes();
+        let query_len = bytes.len().min(GPU_MAX_QUERY_LEN);
+        let max_results = max_results.min(GPU_MAX_RESULTS);
+
+        // =================================================================
+        // THE ONLY CPU WORK: Copy raw query bytes to GPU
+        // =================================================================
+        unsafe {
+            // Copy raw query (NO tokenization, NO lowercasing - GPU will do it)
+            let query_ptr = self.raw_query_buffer.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), query_ptr, query_len);
+            // Zero the rest
+            std::ptr::write_bytes(query_ptr.add(query_len), 0, GPU_MAX_QUERY_LEN - query_len);
+
+            // Reset tokenize result counter
+            let tokenize_result = self.tokenize_result_buffer.contents() as *mut TokenizeResult;
+            (*tokenize_result).word_count = 0;
+
+            // Reset search result counter
+            *(self.result_count_buffer.contents() as *mut u32) = 0;
+
+            // Set max_sort
+            let ms = self.max_sort_buffer.contents() as *mut u32;
+            *ms = max_results.min(100) as u32;
+        }
+
+        let command_buffer = self.command_queue.new_command_buffer();
+
+        // =================================================================
+        // Pass 0: GPU Tokenization (Issue #79)
+        // =================================================================
+        // Input: "Foo BAR  baz" (raw bytes)
+        // Output: SearchWord[0] = "foo", SearchWord[1] = "bar", SearchWord[2] = "baz"
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.tokenize_pipeline);
+            enc.set_buffer(0, Some(&self.raw_query_buffer), 0);
+            enc.set_buffer(1, Some(&self.words_buffer), 0);
+            enc.set_buffer(2, Some(&self.tokenize_result_buffer), 0);
+            enc.set_bytes(3, mem::size_of::<u32>() as u64, &(query_len as u32) as *const _ as *const _);
+
+            // One thread per character
+            let threads = query_len as u64;
+            let threadgroup_size = threads.min(256);
+            enc.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(threadgroup_size, 1, 1));
+            enc.end_encoding();
+        }
+
+        // Write params AFTER tokenization completes
+        // Note: We need to know word_count for SearchParams, but tokenization runs on GPU.
+        // Solution: SearchParams.word_count is set to MAX_QUERY_WORDS (8), and the search
+        // kernel checks TokenizeResult.word_count for the actual count.
+        //
+        // Actually, let's use a simpler approach: we encode params with word_count=8,
+        // and the search kernel uses min(params.word_count, actual_tokenized_count).
+        //
+        // Even simpler: pass tokenize_result_buffer to search kernel!
+        unsafe {
+            let params = self.params_buffer.contents() as *mut SearchParams;
+            *params = SearchParams {
+                path_count: self.current_path_count as u32,
+                word_count: GPU_MAX_QUERY_WORDS as u32, // GPU will use actual count from TokenizeResult
+                max_results: max_results as u32,
+                _padding: 0,
+            };
+        }
+
+        // =================================================================
+        // Pass 1: GPU Search (uses GPU-tokenized word count)
+        // =================================================================
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.search_pipeline);
+            enc.set_buffer(0, Some(&self.paths_buffer), 0);
+            enc.set_buffer(1, Some(&self.path_lengths_buffer), 0);
+            enc.set_buffer(2, Some(&self.params_buffer), 0);
+            enc.set_buffer(3, Some(&self.words_buffer), 0);
+            enc.set_buffer(4, Some(&self.results_buffer), 0);
+            enc.set_buffer(5, Some(&self.result_count_buffer), 0);
+            enc.set_buffer(6, Some(&self.tokenize_result_buffer), 0); // GPU tokenization word count
+
+            let tpg = 256;
+            let tg = (self.current_path_count + tpg - 1) / tpg;
+            enc.dispatch_thread_groups(MTLSize::new(tg as u64, 1, 1), MTLSize::new(tpg as u64, 1, 1));
+            enc.end_encoding();
+        }
+
+        // =================================================================
+        // Pass 2: GPU Sort
+        // =================================================================
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.sort_pipeline);
+            enc.set_buffer(0, Some(&self.results_buffer), 0);
+            enc.set_buffer(1, Some(&self.result_count_buffer), 0);
+            enc.set_buffer(2, Some(&self.max_sort_buffer), 0);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            enc.end_encoding();
+        }
+
+        // Signal completion
+        command_buffer.encode_signal_event(&self.shared_event, signal_value);
+        command_buffer.commit();
+
+        SearchHandle {
+            shared_event: self.shared_event.clone(),
+            signal_value,
+            results_buffer: self.results_buffer.clone(),
+            result_count_buffer: self.result_count_buffer.clone(),
+            max_results,
+        }
+    }
+
+    /// Synchronous GPU-native search (blocking).
+    ///
+    /// CPU work: ONE memcpy. GPU does all string processing.
+    pub fn search_gpu_native_blocking(&self, query: &str, max_results: usize) -> Vec<(usize, i32)> {
+        let handle = self.search_gpu_native(query, max_results);
+        handle.wait_and_get_results()
     }
 }
 
