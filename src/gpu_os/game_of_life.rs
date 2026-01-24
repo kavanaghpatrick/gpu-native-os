@@ -3,7 +3,7 @@
 // 32x32 grid = 1024 cells = 1024 threads (1:1 mapping)
 // Now uses the GpuApp framework for OS integration.
 
-use super::app::{GpuApp, AppBuilder, APP_SHADER_HEADER};
+use super::app::{GpuApp, AppBuilder, PipelineMode, APP_SHADER_HEADER};
 use super::memory::{FrameState, InputEvent, InputEventType};
 use super::vsync::FrameTiming;
 use metal::*;
@@ -575,6 +575,10 @@ impl GpuApp for GameOfLife {
 
     fn clear_color(&self) -> MTLClearColor {
         MTLClearColor::new(0.05, 0.05, 0.08, 1.0)
+    }
+
+    fn pipeline_mode(&self) -> PipelineMode {
+        PipelineMode::HighThroughput  // Cellular automaton benefits from frame overlap
     }
 }
 

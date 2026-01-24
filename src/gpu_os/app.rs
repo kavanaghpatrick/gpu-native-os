@@ -9,6 +9,40 @@ use super::input::InputHandler;
 use super::vsync::FrameTiming;
 use metal::*;
 use std::time::Instant;
+use std::sync::{Arc, Mutex};
+
+// ============================================================================
+// Pipeline Mode - Latency vs Throughput Tradeoff
+// ============================================================================
+
+/// Controls frame pipelining behavior
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PipelineMode {
+    /// Minimize input→display latency (best for text editors, interactive UI)
+    /// Waits for previous frame to complete before starting next
+    LowLatency,
+
+    /// Maximize throughput (best for simulations, animations, games)
+    /// Allows multiple frames in flight simultaneously
+    HighThroughput,
+}
+
+impl Default for PipelineMode {
+    fn default() -> Self {
+        PipelineMode::LowLatency
+    }
+}
+
+/// GPU timing information from completed frame
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpuTiming {
+    /// Frame number that completed
+    pub frame_number: u64,
+    /// Actual GPU execution time in milliseconds
+    pub gpu_time_ms: f64,
+    /// Time from submission to completion in milliseconds
+    pub total_time_ms: f64,
+}
 
 // ============================================================================
 // Buffer Slot Convention
@@ -72,6 +106,23 @@ pub trait GpuApp {
     fn clear_color(&self) -> MTLClearColor {
         MTLClearColor::new(0.05, 0.05, 0.08, 1.0)
     }
+
+    /// Pipeline mode: LowLatency (interactive) or HighThroughput (simulations)
+    /// Default: LowLatency for best interactive response
+    fn pipeline_mode(&self) -> PipelineMode {
+        PipelineMode::LowLatency
+    }
+
+    /// Called when GPU actually finishes a frame (async, may be out of order)
+    /// Use this for accurate GPU profiling, not post_frame() which fires at submission
+    fn on_gpu_complete(&mut self, _timing: GpuTiming) {}
+
+    /// For double-buffered simulations: which buffer set to use this frame
+    /// Apps with ping-pong buffers can use frame_number % 2 to alternate
+    /// Default: always use primary buffers (no double-buffering)
+    fn buffer_set_for_frame(&self, _frame_number: u64) -> usize {
+        0
+    }
 }
 
 // ============================================================================
@@ -89,6 +140,10 @@ pub struct GpuRuntime {
     last_frame: Instant,
     frame_count: u64,
     delta_time: f32,
+
+    // Pipeline tracking
+    previous_command_buffer: Option<CommandBuffer>,
+    gpu_timing_queue: Arc<Mutex<Vec<GpuTiming>>>,
 }
 
 impl GpuRuntime {
@@ -101,6 +156,8 @@ impl GpuRuntime {
         Self {
             device,
             command_queue,
+            previous_command_buffer: None,
+            gpu_timing_queue: Arc::new(Mutex::new(Vec::new())),
             memory,
             input,
             last_frame: Instant::now(),
@@ -141,6 +198,18 @@ impl GpuRuntime {
 
     /// Run a single frame for an application
     pub fn run_frame<A: GpuApp>(&mut self, app: &mut A, drawable: &MetalDrawableRef) {
+        // ═══════════════════════════════════════════════════════════════════
+        // PIPELINE MODE: Wait for previous frame if LowLatency mode
+        // ═══════════════════════════════════════════════════════════════════
+        // LowLatency: Wait for GPU to finish previous frame before starting next
+        //             This minimizes input→display latency (best for text editors)
+        // HighThroughput: Let frames overlap for maximum FPS (best for simulations)
+        if app.pipeline_mode() == PipelineMode::LowLatency {
+            if let Some(ref prev_buffer) = self.previous_command_buffer {
+                prev_buffer.wait_until_completed();
+            }
+        }
+
         // Update timing
         let now = Instant::now();
         self.delta_time = now.duration_since(self.last_frame).as_secs_f32();
@@ -223,10 +292,13 @@ impl GpuRuntime {
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
 
+        // Store for potential waiting next frame (LowLatency mode)
+        self.previous_command_buffer = Some(command_buffer.to_owned());
+
         // Update frame count
         self.frame_count += 1;
 
-        // Notify app of frame completion
+        // Notify app of frame completion (submission, not GPU completion)
         let timing = FrameTiming {
             total_ms: self.delta_time as f64 * 1000.0,
             ..Default::default()

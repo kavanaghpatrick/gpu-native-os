@@ -25,6 +25,38 @@ path = "examples/ball_physics.rs"
 name = "text_editor"
 path = "examples/text_editor.rs"
 
+[[example]]
+name = "particles"
+path = "examples/particles.rs"
+
+[[example]]
+name = "boids"
+path = "examples/boids.rs"
+
+[[example]]
+name = "waves"
+path = "examples/waves.rs"
+
+[[example]]
+name = "mandelbrot"
+path = "examples/mandelbrot.rs"
+
+[[example]]
+name = "metaballs"
+path = "examples/metaballs.rs"
+
+[[example]]
+name = "benchmark_sort"
+path = "examples/benchmark_sort.rs"
+
+[[example]]
+name = "benchmark_hittest"
+path = "examples/benchmark_hittest.rs"
+
+[[example]]
+name = "benchmark_visual"
+path = "examples/benchmark_visual.rs"
+
 [dependencies]
 metal = "0.33"
 cocoa = "0.26"

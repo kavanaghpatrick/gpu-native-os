@@ -14,8 +14,14 @@ pub mod vsync;       // #18 - VSync Execution
 pub mod app;         // GpuApp trait and GpuRuntime
 
 // Applications (use GpuApp framework)
-pub mod game_of_life;   // Game of Life app
-pub mod text_editor;    // Text Editor app
+pub mod game_of_life;      // Game of Life app
+pub mod text_editor;       // Text Editor app
+pub mod particles;         // Particle System app
+pub mod boids;             // Boids Flocking Simulation
+pub mod mandelbrot;        // Mandelbrot Fractal Viewer
+pub mod metaballs;         // Metaballs Organic Blob Demo
+pub mod waves;             // Wave Simulation app
+pub mod benchmark_visual;  // GPU vs CPU Benchmark Demo
 
 // Demo modules (legacy - standalone implementations)
 pub mod ball_physics;   // 1024-Ball Physics demo
