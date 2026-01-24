@@ -254,8 +254,10 @@ kernel void compute_intrinsic_sizes(
 
     // Text nodes: intrinsic size based on content
     if (elem.element_type == ELEM_TEXT) {
-        float tw = text_width(elem.text_length, style.font_size);
-        float th = text_height(style.font_size, style.line_height);
+        float font_size = style.font_size > 0 ? style.font_size : 16.0;
+        float line_height = style.line_height > 0 ? style.line_height : 1.2;
+        float tw = text_width(elem.text_length, font_size);
+        float th = text_height(font_size, line_height);
         box.content_width = tw;
         box.content_height = th;
         box.width = tw;
@@ -517,8 +519,148 @@ void layout_parent_children(
     }
 }
 
-// Pass 3: Layout children using post-order traversal (children before parents)
-// This ensures child heights are computed before parent positions children
+// =============================================================================
+// LEVEL-PARALLEL LAYOUT (Issue #89)
+// All 1024 threads participate in every pass - no single-thread bottlenecks
+// =============================================================================
+
+// Pass 3a: Compute tree depth for each element (ALL THREADS)
+kernel void layout_compute_depths(
+    device const Element* elements [[buffer(0)]],
+    device uint* depths [[buffer(1)]],
+    device atomic_uint* max_depth [[buffer(2)]],
+    constant uint& element_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+
+    // Walk up to root counting depth
+    uint d = 0;
+    int parent = elements[gid].parent;
+    while (parent >= 0 && d < 256) {
+        d++;
+        parent = elements[parent].parent;
+    }
+    depths[gid] = d;
+    atomic_fetch_max_explicit(max_depth, d, memory_order_relaxed);
+}
+
+// Pass 3b: Sum child heights for elements at specific level (LEVEL-PARALLEL, bottom-up)
+kernel void layout_sum_heights(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device LayoutBox* boxes [[buffer(2)]],
+    device const uint* depths [[buffer(3)]],
+    constant uint& current_level [[buffer(4)]],
+    constant uint& element_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;  // Only process this level
+
+    Element elem = elements[gid];
+    ComputedStyle style = styles[gid];
+
+    // Skip text nodes - they already have intrinsic heights from pass 1
+    if (elem.element_type == ELEM_TEXT) return;
+
+    // Skip hidden elements
+    if (style.display == DISPLAY_NONE) return;
+
+    // If explicit height, keep it
+    if (style.height > 0) return;
+
+    // Skip leaf elements that already have height (e.g., from intrinsic sizing)
+    if (elem.first_child < 0 && boxes[gid].height > 0) return;
+
+    // Sum heights of children (already computed in previous level passes)
+    float total_h = 0;
+    int child = elem.first_child;
+    while (child >= 0) {
+        ComputedStyle child_style = styles[child];
+        if (child_style.display != DISPLAY_NONE) {
+            total_h += boxes[child].height + child_style.margin[0] + child_style.margin[2];
+        }
+        child = elements[child].next_sibling;
+    }
+
+    // Add padding and border
+    float padding_v = style.padding[0] + style.padding[2];
+    float border_v = style.border_width[0] + style.border_width[2];
+
+    boxes[gid].height = total_h + padding_v + border_v;
+    boxes[gid].content_height = total_h;
+}
+
+// Pass 3c: Position siblings at specific level (LEVEL-PARALLEL, top-down)
+kernel void layout_position_siblings(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device LayoutBox* boxes [[buffer(2)]],
+    device const uint* depths [[buffer(3)]],
+    constant uint& current_level [[buffer(4)]],
+    constant uint& element_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;  // Only process this level
+
+    ComputedStyle style = styles[gid];
+
+    // Skip hidden elements
+    if (style.display == DISPLAY_NONE) return;
+
+    // Calculate Y by summing preceding siblings' heights
+    float y = style.margin[0];  // Start with own top margin
+
+    Element elem = elements[gid];
+    int parent = elem.parent;
+    if (parent >= 0) {
+        // Walk siblings from first_child to gid, accumulating heights
+        int sib = elements[parent].first_child;
+        while (sib >= 0 && sib != int(gid)) {
+            ComputedStyle sib_style = styles[sib];
+            if (sib_style.display != DISPLAY_NONE) {
+                y += boxes[sib].height + sib_style.margin[0] + sib_style.margin[2];
+            }
+            sib = elements[sib].next_sibling;
+        }
+    }
+
+    boxes[gid].y = y;
+    boxes[gid].x = style.margin[3];  // Left margin
+
+    // Update content box position (relative)
+    boxes[gid].content_x = boxes[gid].x + style.border_width[3] + style.padding[3];
+    boxes[gid].content_y = boxes[gid].y + style.border_width[0] + style.padding[0];
+}
+
+// Pass 3d: Finalize absolute positions (ALL THREADS, top-down by level)
+kernel void layout_finalize_level(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device LayoutBox* boxes [[buffer(2)]],
+    device const uint* depths [[buffer(3)]],
+    constant uint& current_level [[buffer(4)]],
+    constant uint& element_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;
+
+    Element elem = elements[gid];
+    ComputedStyle style = styles[gid];
+
+    if (elem.parent >= 0) {
+        LayoutBox parent_box = boxes[elem.parent];
+        boxes[gid].x += parent_box.content_x;
+        boxes[gid].y += parent_box.content_y;
+        boxes[gid].content_x += parent_box.content_x;
+        boxes[gid].content_y += parent_box.content_y;
+    }
+}
+
+// Legacy: Keep old sequential version for compatibility during transition
 kernel void layout_children_sequential(
     device const Element* elements [[buffer(0)]],
     device const ComputedStyle* styles [[buffer(1)]],
@@ -530,13 +672,10 @@ kernel void layout_children_sequential(
     if (gid != 0) return;
 
     // Post-order traversal using explicit stack
-    // Stack contains (element_idx, visited_flag)
-    // visited_flag: 0 = first visit (push children), 1 = second visit (process)
     int stack[256];
     int visited[256];
     int stack_top = 0;
 
-    // Start with root elements (those with parent == -1)
     for (int i = int(element_count) - 1; i >= 0; i--) {
         if (elements[i].parent < 0) {
             stack[stack_top] = i;
@@ -551,15 +690,12 @@ kernel void layout_children_sequential(
         int is_visited = visited[stack_top];
 
         if (is_visited) {
-            // Second visit: process this node (layout its children)
             layout_parent_children(elements, styles, boxes, idx);
         } else {
-            // First visit: push back with visited flag, then push children
             stack[stack_top] = idx;
             visited[stack_top] = 1;
             stack_top++;
 
-            // Push children in reverse order so they're processed left-to-right
             Element elem = elements[idx];
             int children[MAX_CHILDREN];
             int child_count = 0;
@@ -570,7 +706,6 @@ kernel void layout_children_sequential(
                 child_idx = elements[child_idx].next_sibling;
             }
 
-            // Push in reverse order
             for (int c = child_count - 1; c >= 0; c--) {
                 if (stack_top < 256) {
                     stack[stack_top] = children[c];
