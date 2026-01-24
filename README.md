@@ -8,39 +8,38 @@ This project explores a radical approach to application architecture: instead of
 
 All 1024 threads participate in every phase. The CPU's role is minimal: forward input events and submit command buffers.
 
-## GpuApp Framework
+## Architecture
 
-The `GpuApp` trait provides a standardized way to build GPU-native applications. Apps implement this trait and run on the `GpuRuntime`, which manages:
+### High-Level Design
 
-- **Input handling** — Keyboard/mouse events forwarded to GPU
-- **Memory management** — Unified CPU/GPU buffers
-- **Frame timing** — Delta time, frame counting
-- **Render pipeline** — Compute → Render → Present
-
-```rust
-pub trait GpuApp {
-    fn name(&self) -> &str;
-    fn compute_pipeline(&self) -> &ComputePipelineState;
-    fn render_pipeline(&self) -> &RenderPipelineState;
-    fn vertices_buffer(&self) -> &Buffer;
-    fn vertex_count(&self) -> usize;
-    fn app_buffers(&self) -> Vec<&Buffer>;
-    fn params_buffer(&self) -> &Buffer;
-    fn update_params(&mut self, frame_state: &FrameState, delta_time: f32);
-    fn handle_input(&mut self, event: &InputEvent);
-}
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         CPU (Rust Host)                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
+│  │ Buffer Setup│  │Command Queue│  │ Synchronization (wait)  │  │
+│  │ Query Prep  │  │ Dispatch    │  │ Result Readback         │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
+└────────────────────────────┬────────────────────────────────────┘
+                             │ Metal API
+┌────────────────────────────▼────────────────────────────────────┐
+│                      GPU (Metal Compute)                        │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
+│  │ Fuzzy Search│  │ Sorting     │  │ Text Generation         │  │
+│  │ 3M parallel │  │ (GPU sort)  │  │ (vertex generation)     │  │
+│  │ threads     │  │             │  │                         │  │
+│  └─────────────┘  └─────────────┘  └─────────────────────────┘  │
+│                                                                 │
+│  Unified Memory (MTLStorageModeShared) - Zero-copy on Apple Si  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### Buffer Slot Convention
+### Why GPU-Native?
 
-All apps follow a standardized buffer binding:
+**Apple Silicon unified memory** eliminates CPU↔GPU copies. App state lives in shared buffers accessible to both. The GPU reads input, processes state, and renders — all without round-trips.
 
-| Slot | Buffer | Purpose |
-|------|--------|---------|
-| 0 | FrameState | OS-provided: cursor, time, frame number |
-| 1 | InputQueue | OS-provided: keyboard/mouse events |
-| 2 | AppParams | App-specific per-frame parameters |
-| 3+ | App buffers | App-specific state |
+**Single threadgroup** means all 1024 threads share 32KB of fast threadgroup memory. They can synchronize with barriers and use SIMD operations for parallel reductions.
+
+**Branchless SIMD** keeps all threads executing the same instructions, avoiding warp divergence that kills GPU performance.
 
 ### Frame Execution
 
@@ -55,115 +54,257 @@ Each frame, `GpuRuntime` executes:
 6. Present drawable
 ```
 
-## Demo Applications
+---
 
-### Simulations
+## GPU vs CPU: What Runs Where
 
-| Demo | Description | Command |
-|------|-------------|---------|
-| **Waves** | 256x256 wave simulation with ripple effects | `cargo run --release --example waves` |
-| **Boids** | 1024-boid flocking (separation, alignment, cohesion) | `cargo run --release --example boids` |
-| **Particles** | 10K+ particle physics with mouse interaction | `cargo run --release --example particles` |
-| **Metaballs** | Organic blob animation with implicit surfaces | `cargo run --release --example metaballs` |
-| **Game of Life** | Conway's cellular automaton (32x32 grid) | `cargo run --release --example game_of_life` |
+Understanding what actually runs on the GPU vs CPU is crucial for this architecture.
 
-### Interactive Apps
+### General Pattern
 
-| Demo | Description | Command |
-|------|-------------|---------|
-| **Mandelbrot** | Fractal viewer with 10 preset locations | `cargo run --release --example mandelbrot` |
-| **Text Editor** | Full text editor with GPU-rendered font | `cargo run --release --example text_editor` |
+| GPU Work (Metal Compute) | CPU Work (Rust) |
+|--------------------------|-----------------|
+| Parallel data processing | Buffer allocation and setup |
+| Fuzzy string matching | Query tokenization |
+| Sorting and filtering | Command buffer creation |
+| Vertex generation | Metal API calls |
+| Pixel shading | Synchronous wait |
+| Atomic result accumulation | Result readback |
 
-### Mandelbrot Controls
-- **Scroll** - Zoom in/out at cursor
-- **Click + drag** - Pan
-- **1-9, 0** - Jump to preset locations (Seahorse Valley, Double Spiral, Mini Mandelbrot, etc.)
-- **R** - Reset view
+### Memory Model
 
-### Text Editor Controls
-- Type to insert, arrow keys to move, Backspace/Delete, Enter for newlines
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                        CPU (minimal)                         │
-├──────────────────────────────────────────────────────────────┤
-│  macOS events → InputHandler → [shared buffer]               │
-│  GpuRuntime.run_frame() → compute → render → present         │
-└──────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌──────────────────────────────────────────────────────────────┐
-│                   GPU (1024 threads, 1 threadgroup)          │
-├──────────────────────────────────────────────────────────────┤
-│  App Compute Kernel:                                         │
-│    Phase 1: Process pending edits/input                      │
-│    Phase 2: Update state (cells, document, physics)          │
-│    Phase 3: Generate vertex geometry                         │
-│                                                              │
-│  Render Pass:                                                │
-│    Vertex Shader → Fragment Shader → Pixels                  │
-└──────────────────────────────────────────────────────────────┘
+```rust
+desc.set_storage_mode(MTLStorageMode::Shared);
 ```
 
-## Why?
+On Apple Silicon (M1/M2/M3/M4):
+- CPU and GPU share the same physical memory
+- No DMA transfers needed
+- `buffer.contents()` returns a pointer both can use
+- Changes are immediately visible (with proper synchronization)
 
-**Apple Silicon unified memory** eliminates CPU↔GPU copies. App state lives in shared buffers accessible to both. The GPU reads input, processes state, and renders — all without round-trips.
+---
 
-**Single threadgroup** means all 1024 threads share 32KB of fast threadgroup memory. They can synchronize with barriers and use SIMD operations for parallel reductions.
+## Major Components
 
-**Branchless SIMD** keeps all threads executing the same instructions, avoiding warp divergence that kills GPU performance.
+### 1. GPU Filesystem Search (`filesystem.rs`)
 
-## Benchmarks
+The filesystem module implements GPU-accelerated fuzzy path search capable of searching 3+ million paths in real-time.
 
-Measured on Apple M4 Pro. The GPU-Native OS thesis: **"1024 threads doing UI logic together beats 1 CPU thread."**
+#### Streaming Search Architecture
 
-### Key Finding: GPU Wins on Architecture, Not Raw Speed
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Streaming Search Pipeline                    │
+└─────────────────────────────────────────────────────────────────┘
 
-| Scenario | Traditional (3 dispatches) | GPU-Native (1 dispatch) | Speedup |
-|----------|---------------------------|------------------------|---------|
-| 10 widgets | 313 μs | 99 μs | **3.2x GPU** |
-| 50 widgets | 270 μs | 99 μs | **2.7x GPU** |
-| 200 widgets | 284 μs | 89 μs | **3.2x GPU** |
-| 500 widgets | 319 μs | 121 μs | **2.6x GPU** |
-| 1000 widgets | 348 μs | 110 μs | **3.2x GPU** |
-
-The win comes from **eliminating CPU→GPU sync points**, not raw compute speed.
-
-### Frame Pipelining: 6.75x Throughput
-
-| Mode | 1000 Frames | FPS |
-|------|-------------|-----|
-| Serial (wait each frame) | 104.6 ms | 9,562 |
-| Pipelined (overlap frames) | 15.5 ms | 64,584 |
-| **Speedup** | | **6.75x** |
-
-### Raw GPU Dispatch Overhead
-
-GPU dispatch has ~80-150μs fixed overhead regardless of work size:
-
-| Operation | GPU (μs) | CPU (μs) | Notes |
-|-----------|----------|----------|-------|
-| Sort 1024 widgets | 117 | 12 | CPU wins raw compute |
-| HitTest 2048 widgets | 89 | 1.2 | CPU wins raw compute |
-
-**Conclusion:** GPU-Native wins on *architecture* (fewer sync points, frame pipelining), not raw compute. For real apps with rendering, the compute work is essentially free since the GPU is already busy.
-
-### Run Benchmarks
-
-```bash
-# Automated benchmark suite
-cargo run --release --example benchmark_auto -- --iterations 100
-
-# Visual real-time comparison
-cargo run --release --example benchmark_visual
-
-# Full frame pipeline comparison
-cargo run --release --example benchmark_realistic
+Disk Index → [50K chunk] → GPU Search → Merge → [50K chunk] → GPU → ...
+                ↓                          ↑
+         12MB buffer              Top results accumulated
 ```
 
-## Pipeline Modes
+#### GPU vs CPU Work Division
+
+| GPU Work (Metal Compute) | CPU Work (Rust) |
+|--------------------------|-----------------|
+| Fuzzy string matching | Query tokenization (`split_whitespace`) |
+| Case-insensitive comparison | Buffer setup and pointer writes |
+| Filename extraction (find last `/`) | Command buffer creation |
+| Path depth calculation | Dispatch thread groups |
+| Score calculation | Synchronous wait |
+| Atomic result slot allocation | Result count readback |
+| Insertion sort of results | |
+| Text character generation | |
+
+#### Thread Parallelism
+
+For 3 million paths:
+```
+paths = 3,000,000
+threads_per_group = 256
+thread_groups = ceil(3,000,000 / 256) = 11,719
+total_threads = 3,000,064 (one thread per path)
+```
+
+Each GPU thread independently:
+1. Loads its assigned path from `paths + (gid * 256)`
+2. Checks all query words against the filename
+3. Calculates fuzzy match score with bonuses/penalties
+4. Atomically appends to results if matched
+
+#### Streaming Mode (3M+ Paths)
+
+When the filesystem exceeds 500K paths, streaming mode activates:
+- Processes paths in 50K chunks (~12MB per chunk)
+- GPU searches each chunk and accumulates top results
+- Memory stays constant (~24MB) regardless of filesystem size
+- ~260ms per chunk for search execution
+
+#### Search Kernel Pipeline
+
+```
+Pass 1: fuzzy_search_kernel
+  - 11,719 threadgroups × 256 threads = 3M parallel searches
+  - Each thread scores one path against query words
+  - Atomic counter allocates result slots
+
+Pass 2: sort_results_kernel
+  - Single thread (serial sort)
+  - Insertion sort limited to 100 items
+
+Pass 3: generate_results_text_kernel
+  - 1 threadgroup for up to 256 results
+  - Generates TextChar array for direct rendering
+```
+
+---
+
+### 2. Text Rendering (`text_render.rs`)
+
+The bitmap font text renderer follows a **CPU-prepares, GPU-draws** pattern.
+
+#### Architecture
+
+```
+┌──────────────────┐     ┌────────────────────┐     ┌──────────────────┐
+│     CPU Work     │     │    GPU Memory      │     │    GPU Work      │
+├──────────────────┤     ├────────────────────┤     ├──────────────────┤
+│ Parse text       │────→│ chars_buffer       │────→│ Vertex shader:   │
+│ Build TextChar[] │     │ (TextChar array)   │     │  - Generate quads│
+│ Upload buffer    │     │                    │     │  - Compute UVs   │
+│                  │     │ uniforms_buffer    │     │  - Transform pos │
+│ Font generation: │     │ (screen size,scale)│     │                  │
+│ - 8x8 bitmaps    │────→│                    │────→│ Fragment shader: │
+│ - Texture upload │     │ font_texture       │     │  - Sample texture│
+│                  │     │ (128x48 R8)        │     │  - Alpha test    │
+└──────────────────┘     └────────────────────┘     └──────────────────┘
+```
+
+#### Key Insight: Procedural Vertices
+
+The CPU does NOT create vertex data. Instead:
+
+```rust
+struct TextChar {
+    x: f32,         // Screen position X
+    y: f32,         // Screen position Y
+    char_code: u32, // ASCII code
+    color: u32,     // RGBA packed color
+}
+```
+
+The GPU vertex shader generates 6 vertices per character procedurally:
+```metal
+uint char_idx = vid / 6;   // Which character
+uint vert_idx = vid % 6;   // Which vertex of the 6-vertex quad
+```
+
+This means a single draw call renders ALL text:
+```rust
+encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, (char_count * 6) as u64);
+```
+
+#### Font Texture
+
+- Size: 128x48 pixels (16 chars × 8px wide, 6 rows × 8px tall)
+- Format: R8Unorm (single-channel grayscale)
+- Storage: `MTLStorageModeShared` (unified memory)
+- Contains ASCII 32-127 (96 printable characters)
+
+---
+
+### 3. Metal Compute Details
+
+#### Command Buffer Lifecycle
+
+```rust
+// 1. Create command buffer (CPU)
+let command_buffer = command_queue.new_command_buffer();
+
+// 2. Create compute encoder and dispatch (CPU records, GPU executes later)
+let encoder = command_buffer.new_compute_command_encoder();
+encoder.set_compute_pipeline_state(&pipeline);
+encoder.set_buffer(0, Some(&buffer), 0);
+encoder.dispatch_thread_groups(grid_size, threadgroup_size);
+encoder.end_encoding();
+
+// 3. Submit to GPU (async - returns immediately)
+command_buffer.commit();
+
+// 4. Wait for completion (blocking - CPU waits for GPU)
+command_buffer.wait_until_completed();
+
+// 5. Read results (CPU)
+let results = buffer.contents() as *const ResultType;
+```
+
+#### Hidden CPU Operations per Search
+
+Each GPU search involves significant CPU-side Metal API overhead:
+
+| Operation | Count | Notes |
+|-----------|-------|-------|
+| Command buffer allocation | 1 | `new_command_buffer()` |
+| Compute encoder creation | 3 | One per pass |
+| Pipeline state bindings | 3 | `set_compute_pipeline_state()` |
+| Buffer bindings | ~16 | `set_buffer()` across passes |
+| Dispatch recordings | 3 | `dispatch_thread_groups()` |
+| Encoder finalizations | 3 | `end_encoding()` |
+| Commit | 1 | Submit to GPU |
+| Synchronous wait | 1 | **BLOCKING** |
+
+#### Atomic Operations in Metal
+
+GPU threads coordinate via atomics for result accumulation:
+
+```metal
+device atomic_uint& counter;
+
+// Thread-safe increment
+uint slot = atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
+if (slot < MAX_RESULTS) {
+    results[slot] = my_result;
+}
+```
+
+Note: Only `memory_order_relaxed` is fully supported across all Metal GPUs.
+
+---
+
+## GpuApp Framework
+
+The `GpuApp` trait provides a standardized way to build GPU-native applications:
+
+```rust
+pub trait GpuApp {
+    fn name(&self) -> &str;
+    fn compute_pipeline(&self) -> &ComputePipelineState;
+    fn render_pipeline(&self) -> &RenderPipelineState;
+    fn vertices_buffer(&self) -> &Buffer;
+    fn vertex_count(&self) -> usize;
+    fn app_buffers(&self) -> Vec<&Buffer>;
+    fn params_buffer(&self) -> &Buffer;
+    fn update_params(&mut self, frame_state: &FrameState, delta_time: f32);
+    fn handle_input(&mut self, event: &InputEvent);
+
+    // Optional text rendering
+    fn uses_text_rendering(&self) -> bool { false }
+    fn render_text(&mut self, text_renderer: &mut TextRenderer) {}
+}
+```
+
+### Buffer Slot Convention
+
+All apps follow standardized buffer binding:
+
+| Slot | Buffer | Purpose |
+|------|--------|---------|
+| 0 | FrameState | OS-provided: cursor, time, frame number |
+| 1 | InputQueue | OS-provided: keyboard/mouse events |
+| 2 | AppParams | App-specific per-frame parameters |
+| 3+ | App buffers | App-specific state |
+
+### Pipeline Modes
 
 Apps can choose their latency/throughput tradeoff:
 
@@ -180,11 +321,155 @@ fn pipeline_mode(&self) -> PipelineMode {
 | `LowLatency` | Wait for previous frame | Text editors, interactive UI |
 | `HighThroughput` | Allow frames to overlap | Simulations, animations, games |
 
-## Requirements
+---
 
-- macOS with Apple Silicon (M1/M2/M3/M4) or AMD GPU
-- Rust 1.70+
-- Xcode Command Line Tools (for Metal compiler)
+## Project Structure
+
+```
+src/
+├── lib.rs                    # Library entry point
+├── gpu_os/
+│   ├── mod.rs                # Module exports
+│   │
+│   │── Core Framework ────────────────────────────────────────
+│   ├── app.rs                # GpuApp trait and GpuRuntime
+│   ├── kernel.rs             # Unified Worker Model (compute kernel)
+│   ├── memory.rs             # Memory Architecture (GPU buffers)
+│   ├── input.rs              # Input Pipeline (HID to GPU)
+│   ├── render.rs             # Hybrid Rendering (compute + fragment)
+│   ├── vsync.rs              # VSync Execution (frame timing)
+│   │
+│   │── Text Rendering ────────────────────────────────────────
+│   ├── text_render.rs        # Bitmap font renderer (production)
+│   ├── text.rs               # MSDF text (experimental)
+│   ├── sdf_text/             # SDF text engine (experimental)
+│   │
+│   │── Layout & Widgets ──────────────────────────────────────
+│   ├── layout.rs             # Constraint-based layout engine
+│   ├── widget.rs             # Widget system (compressed state)
+│   │
+│   │── GPU Applications ──────────────────────────────────────
+│   ├── filesystem.rs         # GPU filesystem search (3M+ paths)
+│   ├── content_search.rs     # GPU content search
+│   ├── duplicate_finder.rs   # GPU duplicate file detection
+│   ├── document/             # GPU document viewer
+│   ├── vector/               # GPU vector rasterizer
+│   │
+│   │── Demos ─────────────────────────────────────────────────
+│   ├── game_of_life.rs       # Conway's Game of Life
+│   ├── particles.rs          # Particle system
+│   ├── boids.rs              # Flocking simulation
+│   ├── mandelbrot.rs         # Fractal viewer
+│   ├── metaballs.rs          # Organic blob rendering
+│   └── waves.rs              # Wave simulation
+
+examples/
+├── filesystem_browser.rs     # Interactive file browser (main demo)
+├── document_viewer.rs        # Document rendering demo
+├── benchmark_*.rs            # Performance benchmarks
+└── *.rs                      # Various demos
+
+tests/
+├── test_streaming_search.rs  # Streaming search tests
+└── test_issue_*.rs           # Per-feature integration tests
+```
+
+---
+
+## Demo Applications
+
+### Main Applications
+
+| Demo | Description | Command |
+|------|-------------|---------|
+| **Filesystem Browser** | GPU-accelerated file search (3M+ paths) | `cargo run --release --example filesystem_browser` |
+| **Document Viewer** | GPU document rendering | `cargo run --release --example document_viewer` |
+| **Text Editor** | Full text editor with GPU-rendered font | `cargo run --release --example text_editor` |
+
+### Simulations
+
+| Demo | Description | Command |
+|------|-------------|---------|
+| **Waves** | 256x256 wave simulation with ripple effects | `cargo run --release --example waves` |
+| **Boids** | 1024-boid flocking (separation, alignment, cohesion) | `cargo run --release --example boids` |
+| **Particles** | 10K+ particle physics with mouse interaction | `cargo run --release --example particles` |
+| **Metaballs** | Organic blob animation with implicit surfaces | `cargo run --release --example metaballs` |
+| **Game of Life** | Conway's cellular automaton (32x32 grid) | `cargo run --release --example game_of_life` |
+| **Mandelbrot** | Fractal viewer with 10 preset locations | `cargo run --release --example mandelbrot` |
+
+### Filesystem Browser Controls
+- **Type** - Fuzzy search across all files
+- **Up/Down** - Navigate results
+- **Enter** - Open selected file
+- **Escape** - Clear search
+
+### Mandelbrot Controls
+- **Scroll** - Zoom in/out at cursor
+- **Click + drag** - Pan
+- **1-9, 0** - Jump to preset locations
+- **R** - Reset view
+
+---
+
+## Performance
+
+### Benchmarks (Apple M4 Pro)
+
+The GPU-Native OS thesis: **"1024 threads doing UI logic together beats 1 CPU thread."**
+
+#### Key Finding: GPU Wins on Architecture, Not Raw Speed
+
+| Scenario | Traditional (3 dispatches) | GPU-Native (1 dispatch) | Speedup |
+|----------|---------------------------|------------------------|---------|
+| 10 widgets | 313 μs | 99 μs | **3.2x GPU** |
+| 50 widgets | 270 μs | 99 μs | **2.7x GPU** |
+| 200 widgets | 284 μs | 89 μs | **3.2x GPU** |
+| 500 widgets | 319 μs | 121 μs | **2.6x GPU** |
+| 1000 widgets | 348 μs | 110 μs | **3.2x GPU** |
+
+The win comes from **eliminating CPU→GPU sync points**, not raw compute speed.
+
+#### Frame Pipelining: 6.75x Throughput
+
+| Mode | 1000 Frames | FPS |
+|------|-------------|-----|
+| Serial (wait each frame) | 104.6 ms | 9,562 |
+| Pipelined (overlap frames) | 15.5 ms | 64,584 |
+| **Speedup** | | **6.75x** |
+
+#### Filesystem Search Performance
+
+| Metric | Value |
+|--------|-------|
+| Paths supported | 3,000,000+ (streaming) |
+| Memory usage | ~24MB fixed (chunked) |
+| Search latency | ~260ms per 50K chunk |
+| Threads per search | 1 per path (3M threads) |
+| Threadgroup size | 256 |
+
+#### Text Rendering Performance
+
+| Metric | Value |
+|--------|-------|
+| Draw calls | 1 (all text batched) |
+| Vertices per char | 6 (generated on GPU) |
+| CPU work | Build TextChar array only |
+| GPU work | Vertex generation + rasterization |
+
+### Run Benchmarks
+
+```bash
+# Automated benchmark suite
+cargo run --release --example benchmark_auto -- --iterations 100
+
+# Visual real-time comparison
+cargo run --release --example benchmark_visual
+
+# Full frame pipeline comparison
+cargo run --release --example benchmark_realistic
+```
+
+---
 
 ## Quick Start
 
@@ -192,92 +477,26 @@ fn pipeline_mode(&self) -> PipelineMode {
 # Build all examples
 cargo build --release
 
-# Run demos (pick your favorite)
-cargo run --release --example waves          # Beautiful ripple effects
-cargo run --release --example boids          # Mesmerizing flocking
-cargo run --release --example particles      # 10K particle physics
-cargo run --release --example mandelbrot     # Fractal exploration
-cargo run --release --example metaballs      # Organic blobs
-cargo run --release --example game_of_life   # Classic cellular automaton
-cargo run --release --example text_editor    # GPU-powered text editing
+# Run filesystem browser (main demo)
+cargo run --release --example filesystem_browser
 
-# Run benchmarks
-cargo run --release --example benchmark_auto
+# Run other demos
+cargo run --release --example waves
+cargo run --release --example boids
+cargo run --release --example mandelbrot
 
 # Run tests
 cargo test
+
+# Run benchmarks
+cargo run --release --example benchmark_auto
 ```
 
-## Project Structure
+## Requirements
 
-```
-src/
-├── lib.rs                    # Library entry
-└── gpu_os/
-    ├── mod.rs                # Module exports
-    ├── app.rs                # GpuApp trait + GpuRuntime + PipelineMode
-    ├── memory.rs             # GPU buffer allocation
-    ├── input.rs              # Input event handling
-    ├── vsync.rs              # Frame timing & sync
-    │
-    ├── # Apps
-    ├── waves.rs              # Wave simulation
-    ├── boids.rs              # Flocking simulation
-    ├── particles.rs          # Particle system
-    ├── mandelbrot.rs         # Fractal viewer
-    ├── metaballs.rs          # Organic blobs
-    ├── game_of_life.rs       # Cellular automaton
-    ├── text_editor.rs        # Text editor
-    └── benchmark_visual.rs   # Visual benchmark
-
-examples/
-├── waves.rs                  # Wave demo runner
-├── boids.rs                  # Boids demo runner
-├── particles.rs              # Particles demo runner
-├── mandelbrot.rs             # Mandelbrot demo runner
-├── metaballs.rs              # Metaballs demo runner
-├── game_of_life.rs           # Game of Life demo runner
-├── text_editor.rs            # Text Editor demo runner
-├── benchmark_visual.rs       # Visual benchmark
-├── benchmark_auto.rs         # Automated benchmarks
-├── benchmark_realistic.rs    # Pipeline comparison
-└── benchmark_frame.rs        # Frame throughput test
-```
-
-## Creating a New App
-
-1. Create `src/gpu_os/my_app.rs` implementing `GpuApp`
-2. Define your compute kernel using `APP_SHADER_HEADER`
-3. Create buffers for your app state
-4. Implement `update_params()` and `handle_input()`
-5. Create `examples/my_app.rs` to run it with `GpuRuntime`
-
-Example skeleton:
-
-```rust
-use super::app::{GpuApp, AppBuilder, APP_SHADER_HEADER};
-
-pub struct MyApp {
-    compute_pipeline: ComputePipelineState,
-    render_pipeline: RenderPipelineState,
-    // ... your buffers
-}
-
-impl GpuApp for MyApp {
-    fn name(&self) -> &str { "My App" }
-    // ... implement trait methods
-}
-```
-
-## Performance (M4 Pro)
-
-| Metric | Measured |
-|--------|----------|
-| Frame time | ~0.1-0.3 ms (compute only) |
-| GPU dispatch overhead | ~80-150 μs |
-| Simulations | 3,000-10,000+ FPS potential |
-| Input latency | 1 frame (LowLatency mode) |
-| Memory | Unified (zero copies) |
+- macOS with Apple Silicon (M1/M2/M3/M4) or AMD GPU
+- Rust 1.70+
+- Xcode Command Line Tools (for Metal compiler)
 
 ## License
 
