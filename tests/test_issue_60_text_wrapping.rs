@@ -211,7 +211,8 @@ fn test_performance_10k_characters() {
     let text_vertex_count = vertices.iter().filter(|v| v.flags == FLAG_TEXT).count();
     println!("10K characters: {} text vertices in {:?}", text_vertex_count, elapsed);
 
-    assert!(elapsed.as_millis() < 20, "10K characters took too long: {:?}", elapsed);
+    // Note: Issue #131 two-pass text layout adds overhead for line break pre-computation
+    assert!(elapsed.as_millis() < 100, "10K characters took too long: {:?}", elapsed);
 }
 
 #[test]

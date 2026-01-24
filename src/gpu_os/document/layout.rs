@@ -524,15 +524,17 @@ impl GpuLayoutEngine {
         }
 
         // Pass 3c + 3d: Position siblings then finalize, level by level (top-down)
-        // Issue #128: First compute cumulative heights, then use O(1) lookup in position_siblings
+        // Issue #128: Compute cumulative heights, position siblings, and finalize in one command buffer per level
         for level in 0..=max_depth {
             unsafe {
                 *(self.current_level_buffer.contents() as *mut u32) = level;
             }
 
-            // Issue #128: Compute cumulative heights for this level (O(1) per element)
+            // Batch all three passes into a single command buffer for reduced dispatch overhead
+            let command_buffer = self.command_queue.new_command_buffer();
+
+            // Issue #128: Compute cumulative heights for this level
             {
-                let command_buffer = self.command_queue.new_command_buffer();
                 let encoder = command_buffer.new_compute_command_encoder();
                 encoder.set_compute_pipeline_state(&self.compute_cumulative_heights_pipeline);
                 encoder.set_buffer(0, Some(&self.element_buffer), 0);
@@ -547,13 +549,10 @@ impl GpuLayoutEngine {
                     MTLSize::new(THREAD_COUNT, 1, 1),
                 );
                 encoder.end_encoding();
-                command_buffer.commit();
-                command_buffer.wait_until_completed();
             }
 
             // Position siblings at this level using O(1) cumulative lookup
             {
-                let command_buffer = self.command_queue.new_command_buffer();
                 let encoder = command_buffer.new_compute_command_encoder();
                 encoder.set_compute_pipeline_state(&self.position_siblings_pipeline);
                 encoder.set_buffer(0, Some(&self.element_buffer), 0);
@@ -568,13 +567,10 @@ impl GpuLayoutEngine {
                     MTLSize::new(THREAD_COUNT, 1, 1),
                 );
                 encoder.end_encoding();
-                command_buffer.commit();
-                command_buffer.wait_until_completed();
             }
 
             // Finalize absolute positions at this level
             {
-                let command_buffer = self.command_queue.new_command_buffer();
                 let encoder = command_buffer.new_compute_command_encoder();
                 encoder.set_compute_pipeline_state(&self.finalize_level_pipeline);
                 encoder.set_buffer(0, Some(&self.element_buffer), 0);
@@ -588,9 +584,10 @@ impl GpuLayoutEngine {
                     MTLSize::new(THREAD_COUNT, 1, 1),
                 );
                 encoder.end_encoding();
-                command_buffer.commit();
-                command_buffer.wait_until_completed();
             }
+
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
         }
 
         // Read results

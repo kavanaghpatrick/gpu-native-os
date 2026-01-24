@@ -715,7 +715,7 @@ kernel void layout_sum_heights(
 
 // =============================================================================
 // Issue #128: O(1) Sibling Cumulative Heights
-// Pre-compute cumulative Y offsets using prev_sibling for O(1) lookup
+// Pre-compute cumulative Y offsets for O(1) lookup in positioning pass
 // =============================================================================
 
 // Cumulative info struct: stores Y offset and margin info for collapsing
@@ -726,8 +726,10 @@ struct CumulativeInfo {
     float _padding;
 };
 
-// Pass 3b-2: Compute cumulative heights (LEVEL-PARALLEL, top-down)
-// This pass pre-computes Y offsets for O(1) lookup in positioning
+// Pass 3b-2: Compute cumulative heights (PARENT-PARALLEL)
+// Each thread processes one parent's children sequentially to compute cumulative heights.
+// This is parallel across parents (which is the common case) while being sequential
+// within sibling chains (which have data dependencies).
 kernel void compute_cumulative_heights(
     device const Element* elements [[buffer(0)]],
     device const ComputedStyle* styles [[buffer(1)]],
@@ -739,105 +741,74 @@ kernel void compute_cumulative_heights(
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= element_count) return;
-    if (depths[gid] != current_level) return;
 
-    Element elem = elements[gid];
-    ComputedStyle style = styles[gid];
-
-    // Skip hidden and out-of-flow elements
-    if (style.display == DISPLAY_NONE ||
-        style.position == POSITION_ABSOLUTE ||
-        style.position == POSITION_FIXED) {
+    // Only process elements at PARENT level (one level above current)
+    // Each thread handles one parent's children
+    if (current_level == 0) {
+        // For level 0, only process elements with parent == -1 (roots)
+        if (depths[gid] != 0) return;
+        // Roots have no siblings, just initialize
         cumulative[gid].y_offset = 0;
         cumulative[gid].prev_margin_bottom = 0;
         cumulative[gid].flags = 0;
         return;
     }
 
-    int parent = elem.parent;
+    // Check if this element is a parent of elements at current_level
+    // (i.e., this element is at current_level - 1)
+    if (depths[gid] != current_level - 1) return;
 
-    // Root element or no parent
-    if (parent < 0) {
-        cumulative[gid].y_offset = 0;
-        cumulative[gid].prev_margin_bottom = 0;
-        cumulative[gid].flags = 0;
-        return;
-    }
+    Element parent_elem = elements[gid];
+    int first_child = parent_elem.first_child;
 
-    // Check if we're the first child
-    int first_child = elements[parent].first_child;
-    if (gid == uint(first_child)) {
-        // First child: no preceding siblings
-        cumulative[gid].y_offset = 0;
-        cumulative[gid].prev_margin_bottom = 0;
-        cumulative[gid].flags = 0;
-        return;
-    }
+    if (first_child < 0) return;  // No children
 
-    // Use prev_sibling for O(1) lookup
-    int prev = elem.prev_sibling;
-    if (prev < 0) {
-        // No previous sibling (shouldn't happen if not first child, but be safe)
-        cumulative[gid].y_offset = 0;
-        cumulative[gid].prev_margin_bottom = 0;
-        cumulative[gid].flags = 0;
-        return;
-    }
+    // Process this parent's children sequentially
+    float y = 0;
+    float prev_margin_bottom = 0;
+    bool found_visible_sibling = false;
 
-    // Find the last visible preceding sibling (skip hidden/positioned elements)
-    // Walk backwards through prev_sibling chain until we find a visible one
-    int visible_prev = prev;
-    while (visible_prev >= 0) {
-        ComputedStyle prev_style = styles[visible_prev];
-        if (prev_style.display != DISPLAY_NONE &&
-            prev_style.position != POSITION_ABSOLUTE &&
-            prev_style.position != POSITION_FIXED) {
-            break;  // Found visible predecessor
+    int child = first_child;
+    while (child >= 0) {
+        ComputedStyle child_style = styles[child];
+
+        // Skip out-of-flow elements
+        if (child_style.display == DISPLAY_NONE ||
+            child_style.position == POSITION_ABSOLUTE ||
+            child_style.position == POSITION_FIXED) {
+            // Still need to set cumulative for this element
+            cumulative[child].y_offset = y;
+            cumulative[child].prev_margin_bottom = prev_margin_bottom;
+            cumulative[child].flags = found_visible_sibling ? 1u : 0u;
+            child = elements[child].next_sibling;
+            continue;
         }
-        visible_prev = elements[visible_prev].prev_sibling;
-    }
 
-    if (visible_prev < 0) {
-        // No visible preceding sibling
-        cumulative[gid].y_offset = 0;
-        cumulative[gid].prev_margin_bottom = 0;
-        cumulative[gid].flags = 0;
-        return;
-    }
+        // Store cumulative position for this child
+        cumulative[child].y_offset = y;
+        cumulative[child].prev_margin_bottom = prev_margin_bottom;
+        cumulative[child].flags = found_visible_sibling ? 1u : 0u;
 
-    // Get previous sibling's cumulative info
-    CumulativeInfo prev_info = cumulative[visible_prev];
-    ComputedStyle prev_style = styles[visible_prev];
-    float prev_height = boxes[visible_prev].height;
+        // Now accumulate this child's contribution for the NEXT sibling
+        float child_height = boxes[child].height;
+        float child_margin_top = child_style.margin[0];
+        float child_margin_bottom = child_style.margin[2];
 
-    // Calculate this element's cumulative Y offset
-    float y = prev_info.y_offset;
-    float prev_margin_top = prev_style.margin[0];
-    float prev_margin_bottom = prev_style.margin[2];
-
-    // Handle empty elements (height <= 0.1)
-    if (prev_height <= 0.1) {
-        // Empty element: just track the max margin for collapsing
-        float margin = max(prev_info.prev_margin_bottom, max(prev_margin_top, prev_margin_bottom));
-        cumulative[gid].y_offset = y;
-        cumulative[gid].prev_margin_bottom = margin;
-        cumulative[gid].flags = prev_info.flags;
-    } else {
-        // Non-empty previous sibling
-        bool had_visible_sibling = (prev_info.flags & 1) != 0;
-
-        if (!had_visible_sibling) {
-            // This was the first visible sibling
-            y += prev_margin_top;
+        // Handle empty elements
+        if (child_height <= 0.1) {
+            prev_margin_bottom = max(prev_margin_bottom, max(child_margin_top, child_margin_bottom));
         } else {
-            // Collapse previous margin with this sibling's top margin
-            y += max(prev_info.prev_margin_bottom, prev_margin_top);
+            if (!found_visible_sibling) {
+                y += child_margin_top;
+            } else {
+                y += max(prev_margin_bottom, child_margin_top);
+            }
+            y += child_height;
+            prev_margin_bottom = child_margin_bottom;
+            found_visible_sibling = true;
         }
-        y += prev_height;
 
-        cumulative[gid].y_offset = y;
-        cumulative[gid].prev_margin_bottom = prev_margin_bottom;
-        cumulative[gid].flags = 1;  // has_visible_sibling = true
+        child = elements[child].next_sibling;
     }
 }
 
