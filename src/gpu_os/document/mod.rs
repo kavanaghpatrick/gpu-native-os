@@ -14,15 +14,17 @@
 //! - Parser: Tokens → Element tree
 //! - Style: Elements × Selectors → Computed styles
 //! - Layout: Elements + Styles → Positions
-//! - Paint: Layout → Vertices (coming soon)
+//! - Paint: Layout → Vertices
 
 mod tokenizer;
 mod parser;
 mod style;
 mod layout;
+mod paint;
 
 pub use tokenizer::*;
 pub use parser::*;
 pub use style::*;
 // Re-export layout types but not the duplicated constants
 pub use layout::{LayoutBox, Viewport, GpuLayoutEngine};
+pub use paint::*;

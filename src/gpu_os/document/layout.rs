@@ -34,7 +34,8 @@ pub struct LayoutBox {
     pub scroll_width: f32,
     /// Scroll height (for overflow)
     pub scroll_height: f32,
-    _padding: [f32; 6],
+    /// Padding for GPU alignment
+    pub _padding: [f32; 6],
 }
 
 /// Viewport dimensions
@@ -43,7 +44,8 @@ pub struct LayoutBox {
 pub struct Viewport {
     pub width: f32,
     pub height: f32,
-    _padding: [f32; 2],
+    /// Padding for GPU alignment
+    pub _padding: [f32; 2],
 }
 
 impl Default for Viewport {
