@@ -4,9 +4,13 @@
 pub mod metal_types;    // Metal-safe struct definitions with alignment guarantees
 pub mod mmap_buffer;    // #82 - Zero-copy file access via mmap
 pub mod gpu_io;         // #112 - GPU-Direct Storage with MTLIOCommandQueue
+pub mod batch_io;       // #125 - GPU Batch I/O with MTLIOCommandQueue
 pub mod gpu_index;      // #77 - GPU-Resident Filesystem Index
-pub mod parallel_alloc; // #91 - GPU-Native Parallel Prefix Allocator
+pub mod parallel_alloc;   // #91 - GPU-Native Parallel Prefix Allocator
+pub mod parallel_compact; // #126 - GPU Parallel Compaction with Prefix Sum
+pub mod gpu_cache;        // #127 - GPU-Resident Persistent File Cache
 pub mod profiler;       // GPU profiling and persistence boundary measurement
+pub mod work_queue;     // GPU work queue for persistent kernel execution
 pub mod kernel;      // #11 - Unified Worker Model
 pub mod memory;      // #12 - Memory Architecture
 pub mod input;       // #13 - Input Pipeline

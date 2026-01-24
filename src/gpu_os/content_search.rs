@@ -60,12 +60,13 @@ struct SearchParams {
 #[derive(Copy, Clone, Debug)]
 struct GpuMatchResult {
     file_index: u32,
+    chunk_index: u32,     // Which chunk in the buffer (for context extraction)
     line_number: u32,
     column: u32,
     match_length: u32,
     context_start: u32,   // Offset in chunk where context starts
     context_len: u32,     // Length of context to extract
-    _padding: [u32; 2],
+    _padding: u32,
 }
 
 // ============================================================================
@@ -96,12 +97,13 @@ struct SearchParams {
 
 struct MatchResult {
     uint file_index;
+    uint chunk_index;
     uint line_number;
     uint column;
     uint match_length;
     uint context_start;
     uint context_len;
-    uint _padding[2];
+    uint _padding;
 };
 
 // Check if byte is a binary indicator (null byte, control chars except common ones)
@@ -213,6 +215,7 @@ kernel void content_search_kernel(
             if (idx < 10000) {  // MAX_MATCHES
                 MatchResult result;
                 result.file_index = meta.file_index;
+                result.chunk_index = gid;  // GPU thread ID = chunk index (for zero-copy context extraction)
                 result.line_number = count_lines(data, chunk_len, pos);
                 result.column = find_column(data, chunk_len, pos);
                 result.match_length = params.pattern_len;
@@ -231,8 +234,7 @@ kernel void content_search_kernel(
 
                 result.context_start = context_start;
                 result.context_len = min(context_end - context_start, (uint)MAX_CONTEXT);
-                result._padding[0] = 0;
-                result._padding[1] = 0;
+                result._padding = 0;
 
                 matches[idx] = result;
             }
@@ -441,6 +443,204 @@ impl GpuContentSearch {
         Ok(total_chunks)
     }
 
+    /// Load files from pre-mapped buffers (ZERO CPU COPIES!)
+    ///
+    /// Takes mmap buffers that are already GPU-accessible and copies them
+    /// to the chunks buffer using GPU blit (GPU-to-GPU, no CPU involvement).
+    ///
+    /// This is the GPU-native path: Disk → mmap → GPU blit → Search
+    /// vs the CPU path: Disk → CPU read → CPU Vec → GPU copy → Search
+    pub fn load_from_mmap(&mut self, buffers: &[(String, &super::mmap_buffer::MmapBuffer)]) -> Result<usize, String> {
+        self.file_paths.clear();
+        self.current_chunk_count = 0;
+        self.chunk_data.clear();
+
+        let mut total_chunks = 0;
+        let mut metadata_vec: Vec<ChunkMetadata> = Vec::new();
+        let mut gpu_offset = 0usize;
+
+        // Create command buffer for GPU blits
+        let command_buffer = self.command_queue.new_command_buffer();
+        let blit_encoder = command_buffer.new_blit_command_encoder();
+
+        for (path, mmap) in buffers.iter() {
+            if total_chunks >= self.max_chunks {
+                break;
+            }
+
+            let content_len = mmap.file_size();
+            if content_len == 0 || content_len > 10 * 1024 * 1024 {
+                continue;
+            }
+
+            // Store file path
+            self.file_paths.push(path.clone());
+            let actual_file_index = self.file_paths.len() - 1;
+
+            // Calculate chunks needed
+            let num_chunks = (content_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+            for chunk_index in 0..num_chunks {
+                if total_chunks >= self.max_chunks {
+                    break;
+                }
+
+                let offset_in_file = chunk_index * CHUNK_SIZE;
+                let chunk_len = (content_len - offset_in_file).min(CHUNK_SIZE);
+
+                // GPU blit from mmap buffer to chunks buffer
+                // Source: mmap buffer at offset_in_file
+                // Dest: chunks_buffer at gpu_offset
+                blit_encoder.copy_from_buffer(
+                    mmap.metal_buffer(),
+                    offset_in_file as u64,
+                    &self.chunks_buffer,
+                    gpu_offset as u64,
+                    chunk_len as u64,
+                );
+
+                // Create metadata
+                let mut flags = 1u32; // is_text
+                if chunk_index == 0 {
+                    flags |= 2; // is_first
+                }
+                if chunk_index == num_chunks - 1 {
+                    flags |= 4; // is_last
+                }
+
+                metadata_vec.push(ChunkMetadata {
+                    file_index: actual_file_index as u32,
+                    chunk_index: chunk_index as u32,
+                    offset_in_file: offset_in_file as u64,
+                    chunk_length: chunk_len as u32,
+                    flags,
+                });
+
+                gpu_offset += CHUNK_SIZE; // Padded chunks
+                total_chunks += 1;
+            }
+        }
+
+        blit_encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        self.current_chunk_count = total_chunks;
+
+        // Copy metadata to GPU (still needed, but small)
+        unsafe {
+            let meta_ptr = self.metadata_buffer.contents() as *mut ChunkMetadata;
+            for (i, meta) in metadata_vec.iter().enumerate() {
+                *meta_ptr.add(i) = *meta;
+            }
+        }
+
+        Ok(total_chunks)
+    }
+
+    /// Load files from GpuBatchLoader result (MTLIOCommandQueue - TRUE GPU-DIRECT I/O!)
+    ///
+    /// Takes a BatchLoadResult from GpuBatchLoader and copies to chunks buffer.
+    /// This uses MTLIOCommandQueue which loads files directly to GPU without page faults.
+    pub fn load_from_batch(&mut self, result: &super::batch_io::BatchLoadResult) -> Result<usize, String> {
+        self.file_paths.clear();
+        self.current_chunk_count = 0;
+        self.chunk_data.clear();
+
+        let mut total_chunks = 0;
+        let mut metadata_vec: Vec<ChunkMetadata> = Vec::new();
+        let mut gpu_offset = 0usize;
+
+        // Create command buffer for GPU blits
+        let command_buffer = self.command_queue.new_command_buffer();
+        let blit_encoder = command_buffer.new_blit_command_encoder();
+
+        for i in 0..result.file_count() {
+            if total_chunks >= self.max_chunks {
+                break;
+            }
+
+            let desc = match result.descriptor(i) {
+                Some(d) => d,
+                None => continue,
+            };
+
+            // Skip failed loads
+            if desc.status != 3 {
+                continue;
+            }
+
+            let content_len = desc.size as usize;
+            if content_len == 0 || content_len > 10 * 1024 * 1024 {
+                continue;
+            }
+
+            // Store file path
+            let path = result.file_paths.get(i)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.file_paths.push(path);
+            let actual_file_index = self.file_paths.len() - 1;
+
+            // Calculate chunks needed
+            let num_chunks = (content_len + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+            for chunk_index in 0..num_chunks {
+                if total_chunks >= self.max_chunks {
+                    break;
+                }
+
+                let offset_in_file = chunk_index * CHUNK_SIZE;
+                let chunk_len = (content_len - offset_in_file).min(CHUNK_SIZE);
+
+                // GPU blit from mega-buffer to chunks buffer
+                blit_encoder.copy_from_buffer(
+                    &result.mega_buffer,
+                    (desc.offset as usize + offset_in_file) as u64,
+                    &self.chunks_buffer,
+                    gpu_offset as u64,
+                    chunk_len as u64,
+                );
+
+                // Create metadata
+                let mut flags = 1u32; // is_text
+                if chunk_index == 0 {
+                    flags |= 2; // is_first
+                }
+                if chunk_index == num_chunks - 1 {
+                    flags |= 4; // is_last
+                }
+
+                metadata_vec.push(ChunkMetadata {
+                    file_index: actual_file_index as u32,
+                    chunk_index: chunk_index as u32,
+                    offset_in_file: offset_in_file as u64,
+                    chunk_length: chunk_len as u32,
+                    flags,
+                });
+
+                gpu_offset += CHUNK_SIZE; // Padded chunks
+                total_chunks += 1;
+            }
+        }
+
+        blit_encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        self.current_chunk_count = total_chunks;
+
+        // Copy metadata to GPU
+        unsafe {
+            let meta_ptr = self.metadata_buffer.contents() as *mut ChunkMetadata;
+            for (i, meta) in metadata_vec.iter().enumerate() {
+                *meta_ptr.add(i) = *meta;
+            }
+        }
+
+        Ok(total_chunks)
+    }
+
     /// Search for pattern in loaded files
     pub fn search(&self, pattern: &str, options: &SearchOptions) -> Vec<ContentMatch> {
         if pattern.is_empty() || self.current_chunk_count == 0 {
@@ -543,15 +743,37 @@ impl GpuContentSearch {
         results
     }
 
-    /// Extract context string from chunk data
+    /// Extract context string from GPU buffer (ZERO CPU FILE READ!)
+    ///
+    /// Reads directly from the chunks_buffer which already has the data.
+    /// The GPU shader provides chunk_index, context_start and context_len.
     fn extract_context(&self, match_result: &GpuMatchResult) -> String {
-        // Find the chunk for this match
-        // For now, return a placeholder - we'd need to track chunk-to-file mapping
-        // The GPU kernel stores context_start and context_len
+        let chunk_index = match_result.chunk_index as usize;
+        let context_start = match_result.context_start as usize;
+        let context_len = match_result.context_len as usize;
 
-        // Read context from the chunk data
-        // TODO: Implement proper context extraction using chunk metadata
-        format!("[match at line {} col {}]", match_result.line_number, match_result.column)
+        if context_len == 0 || context_len > 256 || chunk_index >= self.current_chunk_count {
+            return String::new();
+        }
+
+        // Read directly from GPU buffer - the GPU gave us exact coordinates!
+        unsafe {
+            let chunks_ptr = self.chunks_buffer.contents() as *const u8;
+            let chunk_base = chunk_index * CHUNK_SIZE;
+
+            // Bounds check
+            if context_start + context_len > CHUNK_SIZE {
+                return String::new();
+            }
+
+            let data = std::slice::from_raw_parts(
+                chunks_ptr.add(chunk_base + context_start),
+                context_len,
+            );
+
+            // Convert to UTF-8, replacing invalid sequences
+            String::from_utf8_lossy(data).trim_end().to_string()
+        }
     }
 
     /// Get number of loaded chunks
