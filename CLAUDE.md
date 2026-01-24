@@ -88,6 +88,76 @@ uint slot = atomic_fetch_add_explicit(&counter, 1, memory_order_relaxed);
 ### Persistent Data
 Keep data GPU-resident. Never round-trip to CPU unless absolutely necessary.
 
+## CRITICAL: O(1) Lookup Principle
+
+**This is the most important GPU optimization pattern. Violating it causes 10-100x slowdowns.**
+
+### The Problem with O(log n) and O(n) on GPU
+
+On CPU, O(log n) binary search is excellent. On GPU, it's catastrophic:
+
+```
+CPU (independent threads):
+  Thread 1: finds answer in 2 steps → done
+  Thread 2: finds answer in 5 steps → done
+  Thread 3: finds answer in 3 steps → done
+  Total: 10 steps
+
+GPU (SIMD lockstep - all 32 threads execute SAME instruction):
+  All 32 threads MUST wait for slowest thread
+  Thread 1: finds in 2 steps → waits 3 more
+  Thread 2: finds in 5 steps → done
+  Thread 3: finds in 3 steps → waits 2 more
+  Total: 32 × 5 = 160 steps (SIMD divergence)
+```
+
+### The Rule: Pre-compute → O(1) Lookup
+
+**Trade memory for constant-time access. Pre-compute on setup, O(1) lookup at runtime.**
+
+| Bad Pattern (runtime) | Good Pattern (pre-computed) | Speedup |
+|-----------------------|----------------------------|---------|
+| Walk parent chain O(depth) | Depth buffer lookup O(1) | 500x |
+| Walk sibling chain O(siblings) | Cumulative height buffer O(1) | 25x |
+| Linear scan O(n) | Hash table O(1) | 10,000x |
+| Count from start O(chars) | Line break buffer O(1) | 10x |
+| Binary search O(log n) | Chunked index O(1) | 25x |
+
+### Implementation Checklist
+
+Before writing any GPU kernel loop, ask:
+1. **Is there a loop?** → Can I pre-compute results into a buffer?
+2. **Is there a search?** → Can I use a hash table instead?
+3. **Is there tree traversal?** → Can I flatten into level-order buffer?
+4. **Is there conditional branching?** → Will all SIMD threads take same path?
+
+### Examples Applied in This Codebase
+
+```metal
+// BAD: O(depth) per element - SIMD divergence disaster
+while (parent >= 0) { depth++; parent = elements[parent].parent; }
+
+// GOOD: O(1) lookup from pre-computed buffer
+uint depth = depths[gid];
+```
+
+```metal
+// BAD: O(siblings) per element
+int sib = first_child;
+while (sib != gid) { y += heights[sib]; sib = next_sibling[sib]; }
+
+// GOOD: O(1) lookup
+float y = cumulative_heights[gid];
+```
+
+```metal
+// BAD: O(n) linear scan for directory lookup
+for (int i = 0; i < entry_count; i++) { if (entries[i].parent == dir) ... }
+
+// GOOD: O(1) hash table lookup
+uint slot = hash(parent_inode, name_hash) & mask;
+```
+
 ## Current CPU Dependencies (Technical Debt)
 
 These are the CPU operations we're actively working to eliminate:

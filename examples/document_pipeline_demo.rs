@@ -171,7 +171,7 @@ fn main() {
     println!("───────────────────────────────────────────────────────────────");
 
     let start = std::time::Instant::now();
-    let boxes = layout.compute_layout(&elements, &styles, viewport);
+    let boxes = layout.compute_layout(&elements, &styles, &text_buffer, viewport);
     let layout_time = start.elapsed();
 
     println!("  ✓ {} layout boxes in {:?}", boxes.len(), layout_time);

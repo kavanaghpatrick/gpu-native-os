@@ -37,10 +37,10 @@ struct Element {
     int parent;
     int first_child;
     int next_sibling;
+    int prev_sibling;    // Issue #128: Enable O(1) cumulative height lookup
     uint text_start;
     uint text_length;
     uint token_index;
-    uint _padding;
 };
 
 struct ComputedStyle {
@@ -185,20 +185,43 @@ float text_height_wrapped(
     if (text_length == 0) return 0.0;
     if (container_width <= 0) container_width = 10000.0;
 
+    // First pass: check if text is whitespace-only
+    bool has_visible_content = false;
+    for (uint i = 0; i < text_length; i++) {
+        uint c = text[text_start + i];
+        if (c != ' ' && c != '\t' && c != '\n' && c != '\r') {
+            has_visible_content = true;
+            break;
+        }
+    }
+
+    // Whitespace-only text nodes get zero height (collapse whitespace)
+    if (!has_visible_content) return 0.0;
+
     float line_height_px = font_size * line_height;
     uint line_count = 1;
     float current_width = 0.0;
+    bool line_has_content = false;
 
     for (uint i = 0; i < text_length; i++) {
         uint char_code = text[text_start + i];
 
-        // Newline forces new line
+        // Newline forces new line only if current line has content
         if (char_code == '\n') {
-            line_count++;
+            if (line_has_content) {
+                line_count++;
+                line_has_content = false;
+            }
             current_width = 0.0;
             continue;
         }
 
+        // Skip other whitespace at line start
+        if (!line_has_content && (char_code == ' ' || char_code == '\t')) {
+            continue;
+        }
+
+        line_has_content = true;
         float advance = glyph_advance(char_code, font_size);
         current_width += advance;
 
@@ -209,7 +232,12 @@ float text_height_wrapped(
         }
     }
 
-    return float(line_count) * line_height_px;
+    // Only count the last line if it has content
+    if (!line_has_content && line_count > 0) {
+        line_count--;
+    }
+
+    return max(float(line_count), 1.0) * line_height_px;
 }
 
 // Pass 1: Compute intrinsic sizes (bottom-up)
@@ -254,8 +282,10 @@ kernel void compute_intrinsic_sizes(
 
     // Text nodes: intrinsic size based on content
     if (elem.element_type == ELEM_TEXT) {
-        float tw = text_width(elem.text_length, style.font_size);
-        float th = text_height(style.font_size, style.line_height);
+        float font_size = style.font_size > 0 ? style.font_size : 16.0;
+        float line_height = style.line_height > 0 ? style.line_height : 1.2;
+        float tw = text_width(elem.text_length, font_size);
+        float th = text_height(font_size, line_height);
         box.content_width = tw;
         box.content_height = th;
         box.width = tw;
@@ -286,6 +316,7 @@ kernel void compute_block_layout(
     device LayoutBox* boxes [[buffer(2)]],
     constant uint& element_count [[buffer(3)]],
     constant Viewport& viewport [[buffer(4)]],
+    device const uint8_t* text [[buffer(5)]],  // Text buffer for wrapped height calculation
     uint gid [[thread_position_in_grid]]
 ) {
     if (gid >= element_count) return;
@@ -331,6 +362,9 @@ kernel void compute_block_layout(
         box.width = parent_content_width - margin_h;
         box.content_width = box.width - padding_h - border_h;
     }
+
+    // NOTE: Text height calculation moved to propagate_widths_and_text kernel
+    // which runs top-down by level AFTER depths are computed
 
     // Position: margin from parent edge
     box.x = style.margin[3];  // Left margin
@@ -517,8 +551,429 @@ void layout_parent_children(
     }
 }
 
-// Pass 3: Layout children using post-order traversal (children before parents)
-// This ensures child heights are computed before parent positions children
+// =============================================================================
+// LEVEL-PARALLEL LAYOUT (Issue #89)
+// All 1024 threads participate in every pass - no single-thread bottlenecks
+// =============================================================================
+
+// =============================================================================
+// O(1) DEPTH BUFFER (Issue #130)
+// Pre-compute depths using level-parallel algorithm instead of O(depth) walks
+// =============================================================================
+
+// Phase 1: Initialize depths - mark roots as depth 0, others as uncomputed
+kernel void init_depths(
+    device const Element* elements [[buffer(0)]],
+    device uint* depths [[buffer(1)]],
+    constant uint& element_count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+
+    if (elements[gid].parent < 0) {
+        depths[gid] = 0;  // Root node
+    } else {
+        depths[gid] = 0xFFFFFFFF;  // Not yet computed
+    }
+}
+
+// Phase 2: Propagate depths level by level
+// Each dispatch processes all elements whose parent is at current_level
+kernel void propagate_depths(
+    device const Element* elements [[buffer(0)]],
+    device uint* depths [[buffer(1)]],
+    constant uint& current_level [[buffer(2)]],
+    constant uint& element_count [[buffer(3)]],
+    device atomic_uint* changed [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != 0xFFFFFFFF) return;  // Already computed
+
+    int parent = elements[gid].parent;
+    if (parent < 0) return;
+
+    uint parent_depth = depths[parent];
+    if (parent_depth == current_level) {
+        // Parent is at current level, so we're at current_level + 1
+        depths[gid] = current_level + 1;
+        atomic_fetch_add_explicit(changed, 1, memory_order_relaxed);
+    }
+}
+
+// Legacy kernel: Compute tree depth for each element using O(depth) parent walk
+// Kept for fallback/compatibility - use init_depths + propagate_depths for O(1)
+kernel void layout_compute_depths(
+    device const Element* elements [[buffer(0)]],
+    device uint* depths [[buffer(1)]],
+    device atomic_uint* max_depth [[buffer(2)]],
+    constant uint& element_count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+
+    // Walk up to root counting depth
+    uint d = 0;
+    int parent = elements[gid].parent;
+    while (parent >= 0 && d < 256) {
+        d++;
+        parent = elements[parent].parent;
+    }
+    depths[gid] = d;
+    atomic_fetch_max_explicit(max_depth, d, memory_order_relaxed);
+}
+
+// Pass 3b: Sum child heights for elements at specific level (LEVEL-PARALLEL, bottom-up)
+kernel void layout_sum_heights(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device LayoutBox* boxes [[buffer(2)]],
+    device const uint* depths [[buffer(3)]],
+    constant uint& current_level [[buffer(4)]],
+    constant uint& element_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;  // Only process this level
+
+    Element elem = elements[gid];
+    ComputedStyle style = styles[gid];
+
+    // Skip text nodes - they already have intrinsic heights from pass 1
+    if (elem.element_type == ELEM_TEXT) return;
+
+    // Skip hidden elements
+    if (style.display == DISPLAY_NONE) return;
+
+    // If explicit height, keep it
+    if (style.height > 0) return;
+
+    // Skip leaf elements that already have height (e.g., from intrinsic sizing)
+    if (elem.first_child < 0 && boxes[gid].height > 0) return;
+
+    // Sum heights of children WITH MARGIN COLLAPSING (CSS spec)
+    // Adjacent vertical margins collapse into the larger one
+    float total_h = 0;
+    float prev_margin_bottom = 0;
+    bool is_first_child = true;
+
+    int child = elem.first_child;
+    while (child >= 0) {
+        ComputedStyle child_style = styles[child];
+
+        // FIX: Skip out-of-flow elements (absolute/fixed positioned)
+        // These don't contribute to parent's height calculation
+        if (child_style.display == DISPLAY_NONE ||
+            child_style.position == POSITION_ABSOLUTE ||
+            child_style.position == POSITION_FIXED) {
+            child = elements[child].next_sibling;
+            continue;
+        }
+
+        {
+            float child_height = boxes[child].height;
+            float child_margin_top = child_style.margin[0];
+            float child_margin_bottom = child_style.margin[2];
+
+            // Empty blocks: their margins collapse together
+            // (top and bottom margin become one collapsed margin)
+            if (child_height <= 0.1) {
+                // For empty element, just track the max margin for collapsing
+                prev_margin_bottom = max(prev_margin_bottom, max(child_margin_top, child_margin_bottom));
+            } else {
+                // MARGIN COLLAPSING: use max of adjacent margins, not sum
+                if (is_first_child) {
+                    // First child: its top margin might collapse with parent (handled elsewhere)
+                    // For now, just use its margin
+                    total_h += child_margin_top;
+                } else {
+                    // Collapse previous sibling's bottom margin with this one's top margin
+                    float collapsed_margin = max(prev_margin_bottom, child_margin_top);
+                    total_h += collapsed_margin;
+                }
+
+                total_h += child_height;
+                prev_margin_bottom = child_margin_bottom;
+                is_first_child = false;
+            }
+        }
+        child = elements[child].next_sibling;
+    }
+
+    // Add last child's bottom margin (if any children)
+    if (!is_first_child) {
+        total_h += prev_margin_bottom;
+    }
+
+    // Add padding and border
+    float padding_v = style.padding[0] + style.padding[2];
+    float border_v = style.border_width[0] + style.border_width[2];
+
+    boxes[gid].height = total_h + padding_v + border_v;
+    boxes[gid].content_height = total_h;
+}
+
+// =============================================================================
+// Issue #128: O(1) Sibling Cumulative Heights
+// Pre-compute cumulative Y offsets using prev_sibling for O(1) lookup
+// =============================================================================
+
+// Cumulative info struct: stores Y offset and margin info for collapsing
+struct CumulativeInfo {
+    float y_offset;           // Cumulative Y position (sum of preceding siblings' heights + margins)
+    float prev_margin_bottom; // Previous sibling's bottom margin (for margin collapsing)
+    uint flags;               // Bit 0: has_visible_sibling
+    float _padding;
+};
+
+// Pass 3b-2: Compute cumulative heights (LEVEL-PARALLEL, top-down)
+// This pass pre-computes Y offsets for O(1) lookup in positioning
+kernel void compute_cumulative_heights(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device const LayoutBox* boxes [[buffer(2)]],
+    device CumulativeInfo* cumulative [[buffer(3)]],
+    device const uint* depths [[buffer(4)]],
+    constant uint& current_level [[buffer(5)]],
+    constant uint& element_count [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;
+
+    Element elem = elements[gid];
+    ComputedStyle style = styles[gid];
+
+    // Skip hidden and out-of-flow elements
+    if (style.display == DISPLAY_NONE ||
+        style.position == POSITION_ABSOLUTE ||
+        style.position == POSITION_FIXED) {
+        cumulative[gid].y_offset = 0;
+        cumulative[gid].prev_margin_bottom = 0;
+        cumulative[gid].flags = 0;
+        return;
+    }
+
+    int parent = elem.parent;
+
+    // Root element or no parent
+    if (parent < 0) {
+        cumulative[gid].y_offset = 0;
+        cumulative[gid].prev_margin_bottom = 0;
+        cumulative[gid].flags = 0;
+        return;
+    }
+
+    // Check if we're the first child
+    int first_child = elements[parent].first_child;
+    if (gid == uint(first_child)) {
+        // First child: no preceding siblings
+        cumulative[gid].y_offset = 0;
+        cumulative[gid].prev_margin_bottom = 0;
+        cumulative[gid].flags = 0;
+        return;
+    }
+
+    // Use prev_sibling for O(1) lookup
+    int prev = elem.prev_sibling;
+    if (prev < 0) {
+        // No previous sibling (shouldn't happen if not first child, but be safe)
+        cumulative[gid].y_offset = 0;
+        cumulative[gid].prev_margin_bottom = 0;
+        cumulative[gid].flags = 0;
+        return;
+    }
+
+    // Find the last visible preceding sibling (skip hidden/positioned elements)
+    // Walk backwards through prev_sibling chain until we find a visible one
+    int visible_prev = prev;
+    while (visible_prev >= 0) {
+        ComputedStyle prev_style = styles[visible_prev];
+        if (prev_style.display != DISPLAY_NONE &&
+            prev_style.position != POSITION_ABSOLUTE &&
+            prev_style.position != POSITION_FIXED) {
+            break;  // Found visible predecessor
+        }
+        visible_prev = elements[visible_prev].prev_sibling;
+    }
+
+    if (visible_prev < 0) {
+        // No visible preceding sibling
+        cumulative[gid].y_offset = 0;
+        cumulative[gid].prev_margin_bottom = 0;
+        cumulative[gid].flags = 0;
+        return;
+    }
+
+    // Get previous sibling's cumulative info
+    CumulativeInfo prev_info = cumulative[visible_prev];
+    ComputedStyle prev_style = styles[visible_prev];
+    float prev_height = boxes[visible_prev].height;
+
+    // Calculate this element's cumulative Y offset
+    float y = prev_info.y_offset;
+    float prev_margin_top = prev_style.margin[0];
+    float prev_margin_bottom = prev_style.margin[2];
+
+    // Handle empty elements (height <= 0.1)
+    if (prev_height <= 0.1) {
+        // Empty element: just track the max margin for collapsing
+        float margin = max(prev_info.prev_margin_bottom, max(prev_margin_top, prev_margin_bottom));
+        cumulative[gid].y_offset = y;
+        cumulative[gid].prev_margin_bottom = margin;
+        cumulative[gid].flags = prev_info.flags;
+    } else {
+        // Non-empty previous sibling
+        bool had_visible_sibling = (prev_info.flags & 1) != 0;
+
+        if (!had_visible_sibling) {
+            // This was the first visible sibling
+            y += prev_margin_top;
+        } else {
+            // Collapse previous margin with this sibling's top margin
+            y += max(prev_info.prev_margin_bottom, prev_margin_top);
+        }
+        y += prev_height;
+
+        cumulative[gid].y_offset = y;
+        cumulative[gid].prev_margin_bottom = prev_margin_bottom;
+        cumulative[gid].flags = 1;  // has_visible_sibling = true
+    }
+}
+
+// Pass 3c: Position siblings at specific level (LEVEL-PARALLEL, top-down)
+// Issue #128: Now uses O(1) cumulative height lookup
+kernel void layout_position_siblings(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device LayoutBox* boxes [[buffer(2)]],
+    device const uint* depths [[buffer(3)]],
+    device const CumulativeInfo* cumulative [[buffer(4)]],  // Issue #128: O(1) lookup
+    constant uint& current_level [[buffer(5)]],
+    constant uint& element_count [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;  // Only process this level
+
+    ComputedStyle style = styles[gid];
+
+    // Skip hidden elements and out-of-flow elements
+    if (style.display == DISPLAY_NONE) return;
+    if (style.position == POSITION_ABSOLUTE || style.position == POSITION_FIXED) return;
+
+    // Issue #128: O(1) lookup using pre-computed cumulative heights
+    CumulativeInfo info = cumulative[gid];
+    float y = info.y_offset;
+
+    // Add this element's top margin with margin collapsing
+    float my_margin_top = style.margin[0];
+    bool found_visible_sibling = (info.flags & 1) != 0;
+
+    if (found_visible_sibling) {
+        y += max(info.prev_margin_bottom, my_margin_top);
+    } else {
+        y += my_margin_top;  // First visible child
+    }
+
+    boxes[gid].y = y;
+    boxes[gid].x = style.margin[3];  // Left margin
+
+    // Update content box position (relative)
+    boxes[gid].content_x = boxes[gid].x + style.border_width[3] + style.padding[3];
+    boxes[gid].content_y = boxes[gid].y + style.border_width[0] + style.padding[0];
+}
+
+// Pass 3d: Finalize absolute positions (ALL THREADS, top-down by level)
+kernel void layout_finalize_level(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device LayoutBox* boxes [[buffer(2)]],
+    device const uint* depths [[buffer(3)]],
+    constant uint& current_level [[buffer(4)]],
+    constant uint& element_count [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;
+
+    Element elem = elements[gid];
+    ComputedStyle style = styles[gid];
+
+    if (elem.parent >= 0) {
+        LayoutBox parent_box = boxes[elem.parent];
+        boxes[gid].x += parent_box.content_x;
+        boxes[gid].y += parent_box.content_y;
+        boxes[gid].content_x += parent_box.content_x;
+        boxes[gid].content_y += parent_box.content_y;
+    }
+}
+
+// Pass NEW: Propagate widths and calculate text heights (top-down by level)
+// This pass fixes the whitespace issue by calculating text heights AFTER parent widths are known
+kernel void propagate_widths_and_text(
+    device const Element* elements [[buffer(0)]],
+    device const ComputedStyle* styles [[buffer(1)]],
+    device LayoutBox* boxes [[buffer(2)]],
+    device const uint* depths [[buffer(3)]],
+    constant uint& current_level [[buffer(4)]],
+    constant uint& element_count [[buffer(5)]],
+    constant Viewport& viewport [[buffer(6)]],
+    device const uint8_t* text [[buffer(7)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+    if (depths[gid] != current_level) return;
+
+    Element elem = elements[gid];
+    ComputedStyle style = styles[gid];
+
+    // Skip hidden elements
+    if (style.display == DISPLAY_NONE) return;
+
+    // Get parent's content width (which is correct because parent was processed in previous level)
+    float parent_content_width = viewport.width;
+    if (elem.parent >= 0) {
+        parent_content_width = boxes[elem.parent].content_width;
+        if (parent_content_width <= 0) {
+            parent_content_width = viewport.width;
+        }
+    }
+
+    // For block elements without explicit width, set width from parent
+    if ((style.display == DISPLAY_BLOCK || elem.element_type == ELEM_TEXT) && style.width <= 0) {
+        float margin_h = style.margin[1] + style.margin[3];
+        float padding_h = style.padding[1] + style.padding[3];
+        float border_h = style.border_width[1] + style.border_width[3];
+
+        boxes[gid].width = parent_content_width - margin_h;
+        boxes[gid].content_width = boxes[gid].width - padding_h - border_h;
+    }
+
+    // TEXT ELEMENTS: Calculate wrapped height now that we have correct parent width
+    if (elem.element_type == ELEM_TEXT && elem.text_length > 0) {
+        float font_size = style.font_size > 0 ? style.font_size : 16.0;
+        float line_height_mult = style.line_height > 0 ? style.line_height : 1.2;
+
+        float container_width = parent_content_width > 0 ? parent_content_width : viewport.width;
+
+        float wrapped_height = text_height_wrapped(
+            text,
+            elem.text_start,
+            elem.text_length,
+            font_size,
+            line_height_mult,
+            container_width
+        );
+
+        boxes[gid].height = wrapped_height;
+        boxes[gid].content_height = wrapped_height;
+        boxes[gid].width = container_width;
+        boxes[gid].content_width = container_width;
+    }
+}
+
+// Legacy: Keep old sequential version for compatibility during transition
 kernel void layout_children_sequential(
     device const Element* elements [[buffer(0)]],
     device const ComputedStyle* styles [[buffer(1)]],
@@ -530,13 +985,10 @@ kernel void layout_children_sequential(
     if (gid != 0) return;
 
     // Post-order traversal using explicit stack
-    // Stack contains (element_idx, visited_flag)
-    // visited_flag: 0 = first visit (push children), 1 = second visit (process)
     int stack[256];
     int visited[256];
     int stack_top = 0;
 
-    // Start with root elements (those with parent == -1)
     for (int i = int(element_count) - 1; i >= 0; i--) {
         if (elements[i].parent < 0) {
             stack[stack_top] = i;
@@ -551,15 +1003,12 @@ kernel void layout_children_sequential(
         int is_visited = visited[stack_top];
 
         if (is_visited) {
-            // Second visit: process this node (layout its children)
             layout_parent_children(elements, styles, boxes, idx);
         } else {
-            // First visit: push back with visited flag, then push children
             stack[stack_top] = idx;
             visited[stack_top] = 1;
             stack_top++;
 
-            // Push children in reverse order so they're processed left-to-right
             Element elem = elements[idx];
             int children[MAX_CHILDREN];
             int child_count = 0;
@@ -570,7 +1019,6 @@ kernel void layout_children_sequential(
                 child_idx = elements[child_idx].next_sibling;
             }
 
-            // Push in reverse order
             for (int c = child_count - 1; c >= 0; c--) {
                 if (stack_top < 256) {
                     stack[stack_top] = children[c];

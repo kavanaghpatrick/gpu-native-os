@@ -30,7 +30,7 @@ fn process_html(html: &[u8], css: &str, viewport: Viewport) -> Vec<PaintVertex> 
     let (elements, text) = parser.parse(&tokens, html);
     let stylesheet = Stylesheet::parse(css);
     let styles = styler.resolve_styles(&elements, &tokens, html, &stylesheet);
-    let boxes = layout.compute_layout(&elements, &styles, viewport);
+    let boxes = layout.compute_layout(&elements, &styles, &text, viewport);
     paint.paint(&elements, &boxes, &styles, &text, viewport)
 }
 
@@ -198,7 +198,7 @@ fn test_performance_10k_characters() {
     let (elements, text_content) = parser.parse(&tokens, html_bytes);
     let stylesheet = Stylesheet::parse(css);
     let styles = styler.resolve_styles(&elements, &tokens, html_bytes, &stylesheet);
-    let boxes = layout.compute_layout(&elements, &styles, viewport);
+    let boxes = layout.compute_layout(&elements, &styles, &text_content, viewport);
 
     // Warmup
     let _ = paint.paint(&elements, &boxes, &styles, &text_content, viewport);

@@ -31,7 +31,7 @@ pub use tokenizer::*;
 pub use parser::*;
 pub use style::*;
 // Re-export layout types but not the duplicated constants
-pub use layout::{LayoutBox, Viewport, GpuLayoutEngine};
+pub use layout::{LayoutBox, Viewport, GpuLayoutEngine, CumulativeInfo};
 pub use paint::*;
 pub use image::*;
 pub use text::*;

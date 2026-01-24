@@ -1,0 +1,7 @@
+pattern,description,io_method,files,bytes,chunks,load_ms,search_ms,total_ms,matches,rg_ms,rg_matches,speedup,search_speedup,throughput_mbs
+"async fn","Rare (few matches)",cpu,221,6426650,1682,3.43,1.72,5.15,14,8.46,15,1.64,4.93,3827
+"async fn","Rare (few matches)",mmap,221,6426650,1682,3.07,1.56,4.64,14,6.89,15,1.49,4.41,4205
+"async fn","Rare (few matches)",gpu_direct,221,6426650,1682,5.64,1.53,7.17,14,8.76,15,1.22,5.72,4289
+"fn ","Common (many matches)",cpu,221,6426650,1682,3.01,18.24,21.25,2681,7.99,2692,0.38,0.44,360
+"fn ","Common (many matches)",mmap,221,6426650,1682,3.17,18.22,21.39,2681,9.04,2692,0.42,0.50,361
+"fn ","Common (many matches)",gpu_direct,221,6426650,1682,6.30,18.22,24.52,2681,9.17,2692,0.37,0.50,361

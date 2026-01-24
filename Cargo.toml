@@ -77,6 +77,91 @@ path = "examples/document_images.rs"
 name = "vector_demo"
 path = "examples/vector_demo.rs"
 
+[[example]]
+name = "webview_browser"
+path = "examples/webview_browser.rs"
+
+# Additional benchmarks
+[[example]]
+name = "benchmark_async_search"
+path = "examples/benchmark_async_search.rs"
+
+[[example]]
+name = "benchmark_auto"
+path = "examples/benchmark_auto.rs"
+
+[[example]]
+name = "benchmark_frame"
+path = "examples/benchmark_frame.rs"
+
+[[example]]
+name = "benchmark_gpu_string"
+path = "examples/benchmark_gpu_string.rs"
+
+[[example]]
+name = "benchmark_realistic"
+path = "examples/benchmark_realistic.rs"
+
+# File and filesystem utilities
+[[example]]
+name = "file_editor"
+path = "examples/file_editor.rs"
+
+[[example]]
+name = "filesystem_batch_demo"
+path = "examples/filesystem_batch_demo.rs"
+
+[[example]]
+name = "filesystem_benchmark"
+path = "examples/filesystem_benchmark.rs"
+
+[[example]]
+name = "filesystem_cache_demo"
+path = "examples/filesystem_cache_demo.rs"
+
+[[example]]
+name = "filesystem_cpu_comparison"
+path = "examples/filesystem_cpu_comparison.rs"
+
+[[example]]
+name = "filesystem_interactive"
+path = "examples/filesystem_interactive.rs"
+
+[[example]]
+name = "filesystem_path_lookup"
+path = "examples/filesystem_path_lookup.rs"
+
+[[example]]
+name = "filesystem_profile"
+path = "examples/filesystem_profile.rs"
+
+[[example]]
+name = "filesystem_real"
+path = "examples/filesystem_real.rs"
+
+[[example]]
+name = "filesystem_scan"
+path = "examples/filesystem_scan.rs"
+
+[[example]]
+name = "filesystem_search"
+path = "examples/filesystem_search.rs"
+
+[[example]]
+name = "filesystem_ui"
+path = "examples/filesystem_ui.rs"
+
+# Diagnostics
+[[example]]
+name = "render_diagnostic"
+path = "examples/render_diagnostic.rs"
+
+[[example]]
+name = "visual_qa"
+path = "examples/visual_qa.rs"
+
+# Note: servo_browser not registered - requires embedder_traits crate (incomplete)
+
 [dependencies]
 metal = { version = "0.33", features = ["dispatch"] }
 cocoa = "0.26"
@@ -89,6 +174,12 @@ ttf-parser = "0.25"  # TrueType/OpenType font parsing for SDF text
 dispatch = "0.2"     # GCD dispatch queues for SharedEvent callbacks
 block = "0.1"        # Objective-C blocks for Metal callbacks
 libc = "0.2"         # mmap syscalls for zero-copy buffers (#82)
+wry = "0.24"         # Cross-platform WebView (uses system WebKit on macOS)
+memchr = "2.7"       # SIMD-accelerated byte search for CPU fast path
 
 [dev-dependencies]
 tempfile = "3"       # Temporary files for tests
+
+[[example]]
+name = "gpu_ripgrep"
+path = "examples/gpu_ripgrep.rs"

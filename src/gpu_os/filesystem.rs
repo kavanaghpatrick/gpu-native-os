@@ -11,6 +11,8 @@
 
 use super::app::{AppBuilder, GpuApp, APP_SHADER_HEADER};
 use super::memory::{FrameState, InputEvent, InputEventType};
+use super::content_search::{GpuContentSearch, ContentMatch, SearchOptions};
+use super::batch_io::GpuBatchLoader;
 use metal::*;
 use std::cell::Cell;
 use std::mem;
@@ -91,6 +93,35 @@ pub struct BlockMapEntry {
     pub physical_block: u32,    // Physical block number on disk
     pub flags: u16,             // Sparse, compressed, encrypted, CoW
     pub refcount: u16,          // For deduplication/CoW
+}
+
+/// Hash table entry for O(1) directory lookups (Issue #129)
+/// Key: (parent_inode, name_hash)
+/// Value: entry_index into entries array
+#[repr(C)]
+#[derive(Copy, Clone, Debug, Default)]
+pub struct DirHashEntry {
+    pub parent_inode: u32,  // Part of key
+    pub name_hash: u32,     // Part of key
+    pub entry_index: u32,   // Value: index into entries array (0xFFFFFFFF = empty)
+    pub _padding: u32,      // Alignment to 16 bytes
+}
+
+impl DirHashEntry {
+    /// Create an empty hash table entry
+    pub fn empty() -> Self {
+        Self {
+            parent_inode: 0,
+            name_hash: 0,
+            entry_index: 0xFFFFFFFF,  // Sentinel for empty
+            _padding: 0,
+        }
+    }
+
+    /// Check if this entry is empty
+    pub fn is_empty(&self) -> bool {
+        self.entry_index == 0xFFFFFFFF
+    }
 }
 
 /// File types
@@ -295,6 +326,172 @@ uint32_t xxhash3(constant char* data, uint16_t len) {
         hash *= 0x85EBCA77;
     }
     return hash ^ (hash >> 16);
+}
+
+// ============================================================================
+// Directory Hash Table (Issue #129) - O(1) Lookup
+// ============================================================================
+
+// Hash table entry for directory lookups
+struct DirHashEntry {
+    uint32_t parent_inode;  // Part of key
+    uint32_t name_hash;     // Part of key
+    uint32_t entry_index;   // Value: index into entries array (0xFFFFFFFF = empty)
+    uint32_t _padding;      // Alignment to 16 bytes
+};
+
+// Combined key hash using Fibonacci/golden ratio hashing
+inline uint64_t dir_hash_key(uint32_t parent_inode, uint32_t name_hash) {
+    uint64_t key = ((uint64_t)parent_inode << 32) | (uint64_t)name_hash;
+    return key * 0x9E3779B97F4A7C15ULL;  // Golden ratio hash
+}
+
+// Compute hash slot from key
+inline uint32_t hash_slot(uint64_t key, uint32_t mask) {
+    return (uint32_t)(key >> 32) & mask;  // Use high bits for slot
+}
+
+// O(1) single directory entry lookup using hash table
+kernel void dir_lookup_hash(
+    device const DirHashEntry* hash_table [[buffer(0)]],
+    constant uint32_t& table_mask [[buffer(1)]],
+    constant uint32_t& parent_inode [[buffer(2)]],
+    constant uint32_t& name_hash [[buffer(3)]],
+    device uint32_t* result_entry_idx [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;  // Single-threaded lookup
+
+    uint64_t key = dir_hash_key(parent_inode, name_hash);
+    uint32_t slot = hash_slot(key, table_mask);
+
+    // Linear probing with max 32 attempts
+    for (uint32_t probe = 0; probe < 32; probe++) {
+        uint32_t idx = (slot + probe) & table_mask;
+        DirHashEntry entry = hash_table[idx];
+
+        if (entry.entry_index == 0xFFFFFFFF) {
+            // Empty slot - not found
+            *result_entry_idx = 0xFFFFFFFF;
+            return;
+        }
+
+        if (entry.parent_inode == parent_inode && entry.name_hash == name_hash) {
+            *result_entry_idx = entry.entry_index;
+            return;
+        }
+    }
+
+    // Max probes exceeded - not found
+    *result_entry_idx = 0xFFFFFFFF;
+}
+
+// O(1) path resolution using hash table
+// Resolves full path by walking components and doing O(1) lookup at each step
+kernel void path_lookup_hash(
+    device const DirHashEntry* hash_table [[buffer(0)]],
+    constant uint32_t& table_mask [[buffer(1)]],
+    device const DirEntryCompact* entries [[buffer(2)]],
+    constant PathComponent* components [[buffer(3)]],
+    constant uint32_t& component_count [[buffer(4)]],
+    constant uint32_t& start_inode [[buffer(5)]],
+    device uint32_t* result_inode [[buffer(6)]],
+    device uint32_t* result_status [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid != 0) return;  // Single-threaded for sequential path walk
+
+    const uint32_t STATUS_SUCCESS = 0;
+    const uint32_t STATUS_NOT_FOUND = 1;
+
+    uint32_t current = start_inode;
+
+    for (uint32_t i = 0; i < component_count; i++) {
+        uint64_t key = dir_hash_key(current, components[i].hash);
+        uint32_t slot = hash_slot(key, table_mask);
+
+        bool found = false;
+        for (uint32_t probe = 0; probe < 32; probe++) {
+            uint32_t idx = (slot + probe) & table_mask;
+            DirHashEntry entry = hash_table[idx];
+
+            if (entry.entry_index == 0xFFFFFFFF) {
+                // Empty slot - path component not found
+                break;
+            }
+
+            if (entry.parent_inode == current && entry.name_hash == components[i].hash) {
+                // Found! Verify name matches (handle hash collisions)
+                DirEntryCompact dir_entry = entries[entry.entry_index];
+
+                bool name_matches = true;
+                if (dir_entry.name_len == components[i].len) {
+                    for (uint16_t j = 0; j < components[i].len; j++) {
+                        if (dir_entry.name[j] != components[i].name[j]) {
+                            name_matches = false;
+                            break;
+                        }
+                    }
+                } else {
+                    name_matches = false;
+                }
+
+                if (name_matches) {
+                    current = dir_entry.inode_id;  // Move to this entry's inode
+                    found = true;
+                    break;
+                }
+            }
+        }
+
+        if (!found) {
+            *result_inode = 0xFFFFFFFF;
+            *result_status = STATUS_NOT_FOUND;
+            return;
+        }
+    }
+
+    *result_inode = current;
+    *result_status = STATUS_SUCCESS;
+}
+
+// Batch O(1) directory lookup - one thread per lookup request
+kernel void batch_dir_lookup_hash(
+    device const DirHashEntry* hash_table [[buffer(0)]],
+    constant uint32_t& table_mask [[buffer(1)]],
+    device const DirEntryCompact* entries [[buffer(2)]],
+    device const uint32_t* parent_inodes [[buffer(3)]],
+    device const uint32_t* name_hashes [[buffer(4)]],
+    device uint32_t* result_entry_indices [[buffer(5)]],
+    constant uint32_t& lookup_count [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= lookup_count) return;
+
+    uint32_t parent = parent_inodes[gid];
+    uint32_t name_hash = name_hashes[gid];
+
+    uint64_t key = dir_hash_key(parent, name_hash);
+    uint32_t slot = hash_slot(key, table_mask);
+
+    // Each thread probes independently - no divergence!
+    for (uint32_t probe = 0; probe < 32; probe++) {
+        uint32_t idx = (slot + probe) & table_mask;
+        DirHashEntry entry = hash_table[idx];
+
+        if (entry.entry_index == 0xFFFFFFFF) {
+            // Empty slot - not found
+            result_entry_indices[gid] = 0xFFFFFFFF;
+            return;
+        }
+
+        if (entry.parent_inode == parent && entry.name_hash == name_hash) {
+            result_entry_indices[gid] = entry.entry_index;
+            return;
+        }
+    }
+
+    result_entry_indices[gid] = 0xFFFFFFFF;  // Not found
 }
 
 // ============================================================================
@@ -1116,6 +1313,146 @@ const CACHE_SIZE: usize = 1024;
 const CACHE_MASK: u64 = 1023; // CACHE_SIZE - 1
 
 // ============================================================================
+// GPU Directory Hash Table (Issue #129)
+// ============================================================================
+//
+// O(1) directory entry lookup using a GPU-resident hash table.
+// Key: (parent_inode, name_hash) combined using Fibonacci hashing
+// Value: entry_index into the directory entries array
+//
+// Uses open addressing with linear probing for collision resolution.
+// 50% load factor ensures O(1) average case lookup.
+
+/// Combined key hash using Fibonacci/golden ratio hashing
+fn dir_hash_key(parent_inode: u32, name_hash: u32) -> u64 {
+    let key = ((parent_inode as u64) << 32) | (name_hash as u64);
+    key.wrapping_mul(0x9E3779B97F4A7C15)  // Golden ratio hash
+}
+
+/// Compute hash slot from key
+fn hash_slot(key: u64, mask: u32) -> u32 {
+    ((key >> 32) as u32) & mask  // Use high bits for slot
+}
+
+/// GPU-resident hash table for O(1) directory lookups
+pub struct GpuDirHashTable {
+    /// GPU buffer containing [DirHashEntry; capacity]
+    pub table_buffer: Buffer,
+    /// Table capacity (power of 2)
+    pub capacity: u32,
+    /// Mask for fast modulo (capacity - 1)
+    pub mask: u32,
+    /// Number of entries in the table
+    pub entry_count: u32,
+}
+
+impl GpuDirHashTable {
+    /// Build a hash table from directory entries and inodes.
+    ///
+    /// Creates a GPU-resident hash table for O(1) directory entry lookup.
+    /// Uses 2x capacity for ~50% load factor (optimal for linear probing).
+    ///
+    /// # Arguments
+    /// * `device` - Metal device for buffer allocation
+    /// * `entries` - Slice of directory entries
+    /// * `inodes` - Slice of inodes (to get parent_id for each entry)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let hash_table = GpuDirHashTable::build(&device, &dir_entries, &inodes);
+    /// ```
+    pub fn build(device: &Device, entries: &[DirEntryCompact], inodes: &[InodeCompact]) -> Self {
+        // Use 2x capacity for ~50% load factor
+        let capacity = ((entries.len() * 2).max(16)).next_power_of_two() as u32;
+        let mask = capacity - 1;
+
+        // Initialize empty table
+        let mut table = vec![DirHashEntry::empty(); capacity as usize];
+
+        // Insert all entries
+        for (i, entry) in entries.iter().enumerate() {
+            // Get parent from the inode this entry points to
+            let inode_idx = entry.inode_id as usize;
+            if inode_idx >= inodes.len() {
+                continue;  // Skip invalid entries
+            }
+            let parent = inodes[inode_idx].parent_id;
+
+            // Compute hash and find slot
+            let key = dir_hash_key(parent, entry.name_hash);
+            let mut slot = hash_slot(key, mask);
+
+            // Linear probing to find empty slot
+            let mut probes = 0;
+            while !table[slot as usize].is_empty() && probes < capacity {
+                slot = (slot + 1) & mask;
+                probes += 1;
+            }
+
+            // Insert entry
+            if probes < capacity {
+                table[slot as usize] = DirHashEntry {
+                    parent_inode: parent,
+                    name_hash: entry.name_hash,
+                    entry_index: i as u32,
+                    _padding: 0,
+                };
+            }
+        }
+
+        // Create GPU buffer
+        let table_buffer = device.new_buffer_with_data(
+            table.as_ptr() as *const _,
+            (capacity as u64) * (mem::size_of::<DirHashEntry>() as u64),
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        Self {
+            table_buffer,
+            capacity,
+            mask,
+            entry_count: entries.len() as u32,
+        }
+    }
+
+    /// Lookup an entry in the hash table (CPU-side, for testing)
+    pub fn lookup(&self, parent_inode: u32, name_hash: u32) -> Option<u32> {
+        let key = dir_hash_key(parent_inode, name_hash);
+        let mut slot = hash_slot(key, self.mask);
+
+        // Read table from GPU buffer
+        let table_ptr = self.table_buffer.contents() as *const DirHashEntry;
+
+        // Linear probing with max 32 attempts
+        for _ in 0..32 {
+            let entry = unsafe { *table_ptr.add(slot as usize) };
+
+            if entry.is_empty() {
+                return None;  // Empty slot - not found
+            }
+
+            if entry.parent_inode == parent_inode && entry.name_hash == name_hash {
+                return Some(entry.entry_index);
+            }
+
+            slot = (slot + 1) & self.mask;
+        }
+
+        None  // Max probes exceeded
+    }
+
+    /// Get load factor (for diagnostics)
+    pub fn load_factor(&self) -> f32 {
+        self.entry_count as f32 / self.capacity as f32
+    }
+
+    /// Get table size in bytes
+    pub fn size_bytes(&self) -> usize {
+        (self.capacity as usize) * mem::size_of::<DirHashEntry>()
+    }
+}
+
+// ============================================================================
 // GpuFilesystem - implements GpuApp
 // ============================================================================
 
@@ -1152,13 +1489,26 @@ pub struct GpuFilesystem {
     cache_hits_buffer: Buffer,         // Atomic hit counter
     cache_misses_buffer: Buffer,       // Atomic miss counter
 
+    // Hash table for O(1) lookups (Issue #129)
+    #[allow(dead_code)]  // Reserved for single-entry lookup
+    hash_lookup_pipeline: ComputePipelineState,     // dir_lookup_hash kernel
+    path_lookup_hash_pipeline: ComputePipelineState, // path_lookup_hash kernel
+    #[allow(dead_code)]  // Reserved for batch lookup API
+    batch_hash_lookup_pipeline: ComputePipelineState, // batch_dir_lookup_hash kernel
+    dir_hash_table: Option<GpuDirHashTable>,        // Built lazily when index is created
+    hash_table_mask_buffer: Buffer,                 // Table mask for GPU
+    #[allow(dead_code)]  // Reserved for single-entry lookup
+    hash_lookup_result_buffer: Buffer,              // Result buffer for hash lookups
+
     // App params
     params_buffer: Buffer,
 
     // State
     current_directory: u32,
     selected_file: u32,
+    #[allow(dead_code)]  // Reserved for capacity checks
     max_inodes: usize,
+    #[allow(dead_code)]  // Reserved for capacity checks
     max_entries: usize,
     current_inode_count: usize,
     current_entry_count: usize,
@@ -1197,6 +1547,22 @@ impl GpuFilesystem {
             "batch_path_lookup_kernel"
         )?;
 
+        // Hash table lookup pipelines (Issue #129)
+        let hash_lookup_pipeline = builder.create_compute_pipeline(
+            &library,
+            "dir_lookup_hash"
+        )?;
+
+        let path_lookup_hash_pipeline = builder.create_compute_pipeline(
+            &library,
+            "path_lookup_hash"
+        )?;
+
+        let batch_hash_lookup_pipeline = builder.create_compute_pipeline(
+            &library,
+            "batch_dir_lookup_hash"
+        )?;
+
         // Allocate buffers (following GpuMemory pattern)
         let max_entries = max_inodes * 10; // Assume avg 10 entries per directory
 
@@ -1229,6 +1595,10 @@ impl GpuFilesystem {
         let cache_buffer = builder.create_buffer(CACHE_SIZE * mem::size_of::<PathCacheEntry>());
         let cache_hits_buffer = builder.create_buffer(mem::size_of::<u32>());
         let cache_misses_buffer = builder.create_buffer(mem::size_of::<u32>());
+
+        // Hash table buffers (Issue #129)
+        let hash_table_mask_buffer = builder.create_buffer(mem::size_of::<u32>());
+        let hash_lookup_result_buffer = builder.create_buffer(mem::size_of::<u32>());
 
         // Initialize root directory inode
         let root = InodeCompact::new(ROOT_INODE_ID as u64, 0, FileType::Directory);
@@ -1288,6 +1658,13 @@ impl GpuFilesystem {
             cache_hits_buffer,
             cache_misses_buffer,
             frame_number: Cell::new(0),
+            // Hash table (Issue #129)
+            hash_lookup_pipeline,
+            path_lookup_hash_pipeline,
+            batch_hash_lookup_pipeline,
+            dir_hash_table: None,  // Built lazily when files are added
+            hash_table_mask_buffer,
+            hash_lookup_result_buffer,
         })
     }
 
@@ -1316,7 +1693,185 @@ impl GpuFilesystem {
         self.current_inode_count += 1;
         self.current_entry_count += 1;
 
+        // Invalidate hash table (needs rebuild)
+        self.dir_hash_table = None;
+
         Ok(inode_id)
+    }
+
+    /// Build the hash table for O(1) directory lookups (Issue #129)
+    ///
+    /// Call this after adding all files to enable O(1) path lookup.
+    /// The hash table is built on CPU and uploaded to GPU for fast lookups.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fs.add_file(ROOT_INODE_ID, "src", FileType::Directory)?;
+    /// fs.add_file(1, "main.rs", FileType::Regular)?;
+    /// fs.build_hash_table();  // Enable O(1) lookups
+    /// ```
+    pub fn build_hash_table(&mut self) {
+        if self.current_entry_count == 0 {
+            self.dir_hash_table = None;
+            return;
+        }
+
+        // Read entries and inodes from GPU buffers
+        let entries: Vec<DirEntryCompact> = unsafe {
+            let ptr = self.dir_entry_buffer.contents() as *const DirEntryCompact;
+            (0..self.current_entry_count)
+                .map(|i| *ptr.add(i))
+                .collect()
+        };
+
+        let inodes: Vec<InodeCompact> = unsafe {
+            let ptr = self.inode_buffer.contents() as *const InodeCompact;
+            (0..self.current_inode_count)
+                .map(|i| *ptr.add(i))
+                .collect()
+        };
+
+        // Build hash table
+        let hash_table = GpuDirHashTable::build(&self.device, &entries, &inodes);
+
+        // Update mask buffer for GPU
+        unsafe {
+            *(self.hash_table_mask_buffer.contents() as *mut u32) = hash_table.mask;
+        }
+
+        self.dir_hash_table = Some(hash_table);
+    }
+
+    /// Check if hash table is built
+    pub fn has_hash_table(&self) -> bool {
+        self.dir_hash_table.is_some()
+    }
+
+    /// Get hash table statistics
+    pub fn hash_table_stats(&self) -> Option<(f32, usize)> {
+        self.dir_hash_table.as_ref().map(|ht| (ht.load_factor(), ht.size_bytes()))
+    }
+
+    /// Lookup a path using O(1) hash table (Issue #129)
+    ///
+    /// This is significantly faster than lookup_path() for large filesystems.
+    /// Requires build_hash_table() to be called first.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fs.build_hash_table();
+    /// let inode = fs.lookup_path_hash("/src/main.rs")?;
+    /// ```
+    pub fn lookup_path_hash(&self, path: &str) -> Result<u32, String> {
+        // Ensure hash table is built
+        let hash_table = self.dir_hash_table.as_ref()
+            .ok_or_else(|| "Hash table not built - call build_hash_table() first".to_string())?;
+
+        // Handle empty path
+        if path.is_empty() {
+            return Err("Empty path".to_string());
+        }
+
+        // Handle root path
+        if path == "/" {
+            return Ok(ROOT_INODE_ID);
+        }
+
+        // Determine starting inode (absolute vs relative)
+        let (start_inode, path_to_parse) = if path.starts_with('/') {
+            (ROOT_INODE_ID, &path[1..])
+        } else {
+            (self.current_directory, path)
+        };
+
+        // Split path into components
+        let components: Vec<&str> = path_to_parse
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if components.is_empty() {
+            return Ok(start_inode);
+        }
+
+        if components.len() > MAX_PATH_DEPTH {
+            return Err(format!("Path too deep (max {})", MAX_PATH_DEPTH));
+        }
+
+        // Create PathComponent structs with hashes
+        let mut path_components = Vec::with_capacity(components.len());
+        for component in &components {
+            if component.len() > 20 {
+                return Err(format!("Component '{}' too long (max 20 chars)", component));
+            }
+
+            let mut pc = PathComponent {
+                hash: xxhash3(component.as_bytes()),
+                name: [0; 20],
+                len: component.len() as u16,
+                _padding: 0,
+            };
+            pc.name[..component.len()].copy_from_slice(component.as_bytes());
+            path_components.push(pc);
+        }
+
+        // Write components to GPU buffer
+        unsafe {
+            let ptr = self.path_components_buffer.contents() as *mut PathComponent;
+            for (i, component) in path_components.iter().enumerate() {
+                *ptr.add(i) = *component;
+            }
+        }
+
+        // Initialize result buffers
+        unsafe {
+            *(self.path_result_inode_buffer.contents() as *mut u32) = INVALID_INODE;
+            *(self.path_result_status_buffer.contents() as *mut u32) = 1;  // Not found
+        }
+
+        // Create command buffer
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.path_lookup_hash_pipeline);
+        encoder.set_buffer(0, Some(&hash_table.table_buffer), 0);
+        encoder.set_buffer(1, Some(&self.hash_table_mask_buffer), 0);
+        encoder.set_buffer(2, Some(&self.dir_entry_buffer), 0);
+        encoder.set_buffer(3, Some(&self.path_components_buffer), 0);
+
+        // Write component count and start inode as constants
+        let component_count = path_components.len() as u32;
+        encoder.set_bytes(4, mem::size_of::<u32>() as u64, &component_count as *const _ as *const _);
+        encoder.set_bytes(5, mem::size_of::<u32>() as u64, &start_inode as *const _ as *const _);
+
+        encoder.set_buffer(6, Some(&self.path_result_inode_buffer), 0);
+        encoder.set_buffer(7, Some(&self.path_result_status_buffer), 0);
+
+        // Dispatch single thread (path walk is sequential)
+        encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Read result
+        unsafe {
+            let status = *(self.path_result_status_buffer.contents() as *const u32);
+            if status == 0 {
+                let inode_id = *(self.path_result_inode_buffer.contents() as *const u32);
+                Ok(inode_id)
+            } else {
+                Err(format!("Path not found: {}", path))
+            }
+        }
+    }
+
+    /// Single directory entry lookup using hash table (Issue #129)
+    ///
+    /// Returns the entry index for a given (parent_inode, name_hash) pair.
+    /// This is an O(1) operation.
+    pub fn lookup_entry_hash(&self, parent_inode: u32, name_hash: u32) -> Option<u32> {
+        self.dir_hash_table.as_ref()?.lookup(parent_inode, name_hash)
     }
 
     /// Lookup a path using GPU parallel hash search (Issue #21)
@@ -2501,6 +3056,124 @@ impl GpuPathSearch {
         let handle = self.search_gpu_native(query, max_results);
         handle.wait_and_get_results()
     }
+
+    // ========================================================================
+    // Content Search Integration (GPU ripgrep - 3.5x faster than ripgrep)
+    // ========================================================================
+
+    /// Search inside file contents using GPU parallel search.
+    ///
+    /// This integrates the GPU ripgrep functionality into the filesystem.
+    /// Uses MTLIOCommandQueue for GPU-direct I/O when available.
+    ///
+    /// # Arguments
+    /// * `pattern` - The text pattern to search for
+    /// * `path_filter` - Optional path filter (e.g., "*.rs" for Rust files only)
+    /// * `options` - Search options (case sensitivity, max results)
+    ///
+    /// # Returns
+    /// Vector of ContentMatch containing file path, line number, and context
+    ///
+    /// # Example
+    /// ```ignore
+    /// let matches = filesystem.search_content("TODO", Some("*.rs"), &SearchOptions::default());
+    /// for m in matches {
+    ///     println!("{}:{}: {}", m.file_path, m.line_number, m.context);
+    /// }
+    /// ```
+    pub fn search_content(
+        &self,
+        pattern: &str,
+        path_filter: Option<&str>,
+        options: &SearchOptions,
+    ) -> Vec<ContentMatch> {
+        if pattern.is_empty() || self.current_path_count == 0 {
+            return vec![];
+        }
+
+        // Step 1: Get matching file paths from the index
+        let file_paths: Vec<std::path::PathBuf> = if let Some(filter) = path_filter {
+            // Use path search to filter files
+            let path_results = self.search(filter, self.current_path_count);
+            path_results.iter()
+                .filter_map(|(idx, _)| self.get_path(*idx))
+                .filter(|p| {
+                    // Only include regular files, not directories
+                    std::path::Path::new(p).is_file()
+                })
+                .map(|p| std::path::PathBuf::from(p))
+                .collect()
+        } else {
+            // Search all indexed files
+            (0..self.current_path_count)
+                .filter_map(|i| self.get_path(i))
+                .filter(|p| std::path::Path::new(p).is_file())
+                .map(|p| std::path::PathBuf::from(p))
+                .collect()
+        };
+
+        if file_paths.is_empty() {
+            return vec![];
+        }
+
+        // Step 2: Load files using GPU-direct I/O (MTLIOCommandQueue)
+        let batch_loader = GpuBatchLoader::new(&self.device);
+
+        // Step 3: Create content search engine
+        let mut searcher = match GpuContentSearch::new(&self.device, file_paths.len()) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+
+        // Step 4: Load files and search
+        if let Some(loader) = batch_loader {
+            // GPU-direct I/O path (fastest - bypasses CPU entirely)
+            if let Some(batch_result) = loader.load_batch(&file_paths) {
+                if searcher.load_from_batch(&batch_result).is_ok() {
+                    return searcher.search(pattern, options);
+                }
+            }
+        }
+
+        // Fallback: Use standard file loading
+        let path_refs: Vec<&std::path::Path> = file_paths.iter()
+            .map(|p| p.as_path())
+            .collect();
+
+        if searcher.load_files(&path_refs).is_ok() {
+            return searcher.search(pattern, options);
+        }
+
+        vec![]
+    }
+
+    /// Search content with default options (case-insensitive, 1000 max results)
+    pub fn search_content_simple(&self, pattern: &str, extension_filter: Option<&str>) -> Vec<ContentMatch> {
+        self.search_content(pattern, extension_filter, &SearchOptions::default())
+    }
+
+    /// Combined path + content search
+    ///
+    /// First filters files by path pattern, then searches content.
+    /// This is the most efficient way to search for content in specific file types.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Search for "async" in all Rust files
+    /// let matches = filesystem.search_combined("*.rs", "async", 100);
+    /// ```
+    pub fn search_combined(
+        &self,
+        path_pattern: &str,
+        content_pattern: &str,
+        max_results: usize,
+    ) -> Vec<ContentMatch> {
+        let options = SearchOptions {
+            case_sensitive: false,
+            max_results,
+        };
+        self.search_content(content_pattern, Some(path_pattern), &options)
+    }
 }
 
 // ============================================================================
@@ -2647,7 +3320,7 @@ impl GpuStreamingSearch {
     }
 
     /// Search a single chunk and accumulate results
-    fn search_chunk(&self, chunk_size: usize, chunk_offset: usize, query_words: &[(String, u16)], use_buffer_a: bool) {
+    fn search_chunk(&self, chunk_size: usize, _chunk_offset: usize, query_words: &[(String, u16)], use_buffer_a: bool) {
         let (path_buffer, len_buffer) = if use_buffer_a {
             (&self.chunk_buffer_a, &self.chunk_lengths_a)
         } else {

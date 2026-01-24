@@ -26,10 +26,10 @@ struct Element {
     int parent;
     int first_child;
     int next_sibling;
+    int prev_sibling;    // Issue #128: Enable O(1) cumulative height lookup
     uint text_start;
     uint text_length;
     uint token_index;
-    uint _padding;
 };
 
 struct ComputedStyle {

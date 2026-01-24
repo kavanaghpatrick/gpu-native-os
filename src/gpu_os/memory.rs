@@ -75,6 +75,8 @@ pub enum InputEventType {
     KeyDown = 5,
     KeyUp = 6,
     KeyRepeat = 7,
+    MouseDoubleClick = 8,  // Issue #122: Double-click detection
+    MouseTripleClick = 9,  // For text selection (select paragraph)
 }
 
 /// Ring buffer for input events
@@ -397,6 +399,30 @@ impl InputEvent {
             position: [0.0, 0.0],
             delta: [0.0, 0.0],
             modifiers,
+            timestamp: 0,
+        }
+    }
+
+    /// Create a new double-click event (Issue #122)
+    pub fn mouse_double_click(button: u16, x: f32, y: f32) -> Self {
+        Self {
+            event_type: InputEventType::MouseDoubleClick as u16,
+            keycode: button,
+            position: [x, y],
+            delta: [0.0, 0.0],
+            modifiers: 0,
+            timestamp: 0,
+        }
+    }
+
+    /// Create a new triple-click event (for text selection)
+    pub fn mouse_triple_click(button: u16, x: f32, y: f32) -> Self {
+        Self {
+            event_type: InputEventType::MouseTripleClick as u16,
+            keycode: button,
+            position: [x, y],
+            delta: [0.0, 0.0],
+            modifiers: 0,
             timestamp: 0,
         }
     }

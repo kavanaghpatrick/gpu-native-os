@@ -87,10 +87,10 @@ struct Element {
     int parent;
     int first_child;
     int next_sibling;
+    int prev_sibling;    // Issue #128: Enable O(1) cumulative height lookup
     uint text_start;
     uint text_length;
     uint token_index;
-    uint _padding;
 };
 
 // Helper: Compare tag name (case insensitive)
@@ -272,6 +272,7 @@ kernel void parse_build_tree(
         elements[elem_idx].parent = current_parent;
         elements[elem_idx].first_child = -1;
         elements[elem_idx].next_sibling = -1;
+        elements[elem_idx].prev_sibling = -1;  // Issue #128: Initialize prev_sibling
         elements[elem_idx].text_start = 0;
         elements[elem_idx].text_length = 0;
         elements[elem_idx].token_index = i;
@@ -285,6 +286,7 @@ kernel void parse_build_tree(
             } else {
                 // Link as sibling of last child
                 elements[last].next_sibling = elem_idx;
+                elements[elem_idx].prev_sibling = last;  // Issue #128: Set prev_sibling
             }
             last_child[stack_ptr] = elem_idx;  // Update last child
         } else {
@@ -292,6 +294,7 @@ kernel void parse_build_tree(
             int last = last_child[0];
             if (last >= 0) {
                 elements[last].next_sibling = elem_idx;
+                elements[elem_idx].prev_sibling = last;  // Issue #128: Set prev_sibling
             }
             last_child[0] = elem_idx;
         }

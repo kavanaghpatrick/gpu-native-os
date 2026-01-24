@@ -16,6 +16,7 @@ use rust_experiment::gpu_os::filesystem::{
     GpuStreamingSearch, parse_query_words, STREAM_CHUNK_SIZE,
 };
 use rust_experiment::gpu_os::content_search::{GpuContentSearch, ContentMatch, SearchOptions};
+use rust_experiment::gpu_os::batch_io::GpuBatchLoader;
 use rust_experiment::gpu_os::duplicate_finder::{GpuDuplicateFinder, DuplicateGroup};
 use rust_experiment::gpu_os::text_render::{BitmapFont, TextRenderer, colors};
 use std::collections::HashMap;
@@ -26,7 +27,9 @@ use std::path::Path;
 use std::time::Instant;
 
 const INDEX_FILE: &str = "/Users/patrickkavanagh/.filesystem_index.txt";
-const MAX_GPU_PATHS: usize = 500_000; // Reduced from 3M to prevent memory exhaustion (~128MB)
+// 10M paths = ~2.5GB GPU memory - easily fits on Apple Silicon with unified memory
+// This eliminates the need for streaming search in most cases
+const MAX_GPU_PATHS: usize = 10_000_000;
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, WindowEvent},
@@ -125,7 +128,8 @@ impl FilesystemBrowserApp {
             .ok();
 
         // Create GPU content search engine
-        let content_search = GpuContentSearch::new(&device, 10000)
+        // Content search with larger capacity for more files
+        let content_search = GpuContentSearch::new(&device, 50_000)
             .map_err(|e| eprintln!("Warning: GPU content search init failed: {}", e))
             .ok();
 
@@ -397,12 +401,12 @@ impl FilesystemBrowserApp {
     }
 
     fn load_content_files(&mut self) {
-        // Load a sample of files for content searching
-        // Start with current directory for demo, could expand later
-        self.status_message = "Loading files for content search...".to_string();
+        // Load files for content searching using GPU-direct I/O (MTLIOCommandQueue)
+        // This bypasses CPU entirely for maximum performance
+        self.status_message = "Loading files via GPU-direct I/O...".to_string();
 
         if let Some(ref mut content_search) = self.content_search {
-            // Get first 1000 file paths from the path index
+            // Get searchable file paths from the path index (up to 10K files)
             let paths: Vec<std::path::PathBuf> = self.path_to_id
                 .keys()
                 .filter(|p| {
@@ -415,18 +419,46 @@ impl FilesystemBrowserApp {
                             "md" | "txt" | "c" | "h" | "cpp" | "hpp" | "go" | "java" | "swift" |
                             "rb" | "sh" | "bash" | "zsh" | "css" | "html" | "xml" | "sql")
                 })
-                .take(1000)
+                .take(10_000)  // Increased from 1000 - GPU can handle more
                 .map(|s| std::path::PathBuf::from(s))
                 .collect();
 
+            let load_start = Instant::now();
+
+            // Try GPU-direct I/O first (MTLIOCommandQueue - bypasses CPU)
+            if let Some(batch_loader) = GpuBatchLoader::new(&self.device) {
+                if let Some(batch_result) = batch_loader.load_batch(&paths) {
+                    match content_search.load_from_batch(&batch_result) {
+                        Ok(chunks) => {
+                            self.content_files_loaded = true;
+                            let load_time = load_start.elapsed();
+                            self.status_message = format!(
+                                "GPU-direct: {} files ({} chunks, {:.1}MB) in {:.0}ms",
+                                content_search.file_count(),
+                                chunks,
+                                batch_result.total_bytes as f64 / (1024.0 * 1024.0),
+                                load_time.as_secs_f64() * 1000.0
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("GPU batch load failed: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Fallback: CPU-based loading (slower but always works)
             let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
             match content_search.load_files(&path_refs) {
                 Ok(chunks) => {
                     self.content_files_loaded = true;
+                    let load_time = load_start.elapsed();
                     self.status_message = format!(
-                        "Loaded {} files ({} chunks) for content search",
+                        "CPU fallback: {} files ({} chunks) in {:.0}ms",
                         content_search.file_count(),
-                        chunks
+                        chunks,
+                        load_time.as_secs_f64() * 1000.0
                     );
                 }
                 Err(e) => {

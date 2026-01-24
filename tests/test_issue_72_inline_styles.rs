@@ -37,10 +37,10 @@ fn process_html(
     let (mut tokenizer, mut parser, mut styler, mut layout) = setup();
 
     let tokens = tokenizer.tokenize(html);
-    let (elements, _) = parser.parse(&tokens, html);
+    let (elements, text_buffer) = parser.parse(&tokens, html);
     let stylesheet = Stylesheet::parse(css);
     let styles = styler.resolve_styles(&elements, &tokens, html, &stylesheet);
-    let boxes = layout.compute_layout(&elements, &styles, viewport);
+    let boxes = layout.compute_layout(&elements, &styles, &text_buffer, viewport);
 
     (elements, boxes, styles)
 }
