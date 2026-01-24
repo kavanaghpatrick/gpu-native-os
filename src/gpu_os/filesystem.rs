@@ -2010,46 +2010,45 @@ impl GpuPathSearch {
     }
 
     /// Perform GPU fuzzy search and generate text for rendering
-    /// ALL computation stays on GPU. Returns result count.
+    /// ALL computation stays on GPU - including tokenization! Returns result count.
+    ///
+    /// CPU work: ONE memcpy of raw query bytes
+    /// GPU work: tokenization, search, sort, text generation
     pub fn search_and_render(&self, query: &str, start_y: f32, line_height: f32, max_display: usize) -> usize {
         if query.is_empty() || self.current_path_count == 0 {
             unsafe { *(self.char_count_buffer.contents() as *mut u32) = 0; }
             return 0;
         }
 
-        let words: Vec<&str> = query.split_whitespace().collect();
-        if words.is_empty() || words.len() > GPU_MAX_QUERY_WORDS {
-            unsafe { *(self.char_count_buffer.contents() as *mut u32) = 0; }
-            return 0;
-        }
-
+        let bytes = query.as_bytes();
+        let query_len = bytes.len().min(GPU_MAX_QUERY_LEN);
         let max_results = GPU_MAX_RESULTS.min(max_display);
 
-        // Reset counters
+        // =================================================================
+        // THE ONLY CPU WORK: Copy raw query bytes to GPU
+        // =================================================================
         unsafe {
+            // Copy raw query (NO tokenization, NO lowercasing - GPU will do it)
+            let query_ptr = self.raw_query_buffer.contents() as *mut u8;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), query_ptr, query_len);
+            std::ptr::write_bytes(query_ptr.add(query_len), 0, GPU_MAX_QUERY_LEN - query_len);
+
+            // Reset counters
             *(self.result_count_buffer.contents() as *mut u32) = 0;
             *(self.char_count_buffer.contents() as *mut u32) = 0;
-        }
 
-        // Write params
-        unsafe {
+            // Reset tokenize result
+            let tokenize_result = self.tokenize_result_buffer.contents() as *mut TokenizeResult;
+            (*tokenize_result).word_count = 0;
+
+            // Write params (word_count = MAX as sentinel for GPU tokenization)
             let params = self.params_buffer.contents() as *mut SearchParams;
             *params = SearchParams {
                 path_count: self.current_path_count as u32,
-                word_count: words.len() as u32,
+                word_count: GPU_MAX_QUERY_WORDS as u32, // GPU will use actual count
                 max_results: max_results as u32,
                 _padding: 0,
             };
-
-            let words_ptr = self.words_buffer.contents() as *mut SearchWord;
-            for (i, word) in words.iter().enumerate() {
-                let lower = word.to_lowercase();
-                let bytes = lower.as_bytes();
-                let len = bytes.len().min(GPU_MAX_WORD_LEN - 1);
-                let mut sw = SearchWord { chars: [0; 32], len: len as u16, _padding: 0 };
-                sw.chars[..len].copy_from_slice(&bytes[..len]);
-                *words_ptr.add(i) = sw;
-            }
 
             // Text params: [start_y, line_height]
             let tp = self.text_params_buffer.contents() as *mut f32;
@@ -2058,17 +2057,31 @@ impl GpuPathSearch {
 
             // max_sort as u32
             let ms = self.max_sort_buffer.contents() as *mut u32;
-            *ms = max_results.min(100) as u32; // Limit sort to 100 items max to prevent GPU hang
-
-            // For CPU-tokenized search, reset tokenize_result.word_count to 0
-            // so the kernel uses params.word_count instead
-            let tokenize_result = self.tokenize_result_buffer.contents() as *mut TokenizeResult;
-            (*tokenize_result).word_count = 0;
+            *ms = max_results.min(100) as u32;
         }
 
         let command_buffer = self.command_queue.new_command_buffer();
 
-        // Pass 1: Search
+        // =================================================================
+        // Pass 0: GPU Tokenization (Issue #79)
+        // =================================================================
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.tokenize_pipeline);
+            enc.set_buffer(0, Some(&self.raw_query_buffer), 0);
+            enc.set_buffer(1, Some(&self.words_buffer), 0);
+            enc.set_buffer(2, Some(&self.tokenize_result_buffer), 0);
+            enc.set_bytes(3, mem::size_of::<u32>() as u64, &(query_len as u32) as *const _ as *const _);
+
+            let threads = query_len as u64;
+            let threadgroup_size = threads.min(256);
+            enc.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(threadgroup_size, 1, 1));
+            enc.end_encoding();
+        }
+
+        // =================================================================
+        // Pass 1: GPU Search (uses GPU-tokenized word count)
+        // =================================================================
         {
             let enc = command_buffer.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.search_pipeline);
@@ -2078,14 +2091,16 @@ impl GpuPathSearch {
             enc.set_buffer(3, Some(&self.words_buffer), 0);
             enc.set_buffer(4, Some(&self.results_buffer), 0);
             enc.set_buffer(5, Some(&self.result_count_buffer), 0);
-            enc.set_buffer(6, Some(&self.tokenize_result_buffer), 0); // word_count=0 for CPU tokenization
+            enc.set_buffer(6, Some(&self.tokenize_result_buffer), 0); // GPU tokenization word count
             let tpg = 256;
             let tg = (self.current_path_count + tpg - 1) / tpg;
             enc.dispatch_thread_groups(MTLSize::new(tg as u64, 1, 1), MTLSize::new(tpg as u64, 1, 1));
             enc.end_encoding();
         }
 
-        // Pass 2: Sort
+        // =================================================================
+        // Pass 2: GPU Sort
+        // =================================================================
         {
             let enc = command_buffer.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.sort_pipeline);
@@ -2096,7 +2111,9 @@ impl GpuPathSearch {
             enc.end_encoding();
         }
 
-        // Pass 3: Generate text
+        // =================================================================
+        // Pass 3: GPU Text Generation
+        // =================================================================
         {
             let enc = command_buffer.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&self.text_gen_pipeline);
