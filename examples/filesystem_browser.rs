@@ -12,6 +12,8 @@ use core_graphics_types::geometry::CGSize;
 use metal::*;
 use objc::{rc::autoreleasepool, runtime::YES};
 use rust_experiment::gpu_os::filesystem::{FileType, GpuFilesystem, GpuPathSearch};
+use rust_experiment::gpu_os::content_search::{GpuContentSearch, ContentMatch, SearchOptions};
+use rust_experiment::gpu_os::duplicate_finder::{GpuDuplicateFinder, DuplicateGroup};
 use rust_experiment::gpu_os::text_render::{BitmapFont, TextRenderer, colors};
 use std::collections::HashMap;
 use std::fs;
@@ -24,12 +26,20 @@ const INDEX_FILE: &str = "/Users/patrickkavanagh/.filesystem_index.txt";
 const MAX_GPU_PATHS: usize = 3_000_000; // Support up to 3M paths on GPU
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent, Modifiers, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    keyboard::{Key, NamedKey},
+    keyboard::{Key, NamedKey, ModifiersState},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Window, WindowId},
 };
+
+/// Search mode - path search, content search, or duplicate finder
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchMode {
+    Path,       // Search file paths (default)
+    Content,    // Search file contents (grep-like)
+    Duplicates, // Find duplicate files
+}
 
 const WIDTH: u32 = 1200;
 const HEIGHT: u32 = 800;
@@ -53,14 +63,26 @@ struct FilesystemBrowserApp {
     font: BitmapFont,
     text_renderer: TextRenderer,
 
-    // GPU Search
+    // GPU Search (path search)
     gpu_search: Option<GpuPathSearch>,
+
+    // GPU Content Search (grep-like)
+    content_search: Option<GpuContentSearch>,
+    content_results: Vec<ContentMatch>,
+
+    // GPU Duplicate Finder
+    duplicate_finder: Option<GpuDuplicateFinder>,
+    duplicate_groups: Vec<DuplicateGroup>,
 
     // State
     search_query: String,
+    search_mode: SearchMode,
+    modifiers: ModifiersState,
     results: Vec<(String, i32, u64)>, // (path, match_score, size)
     path_to_id: HashMap<String, u32>,
     scan_complete: bool,
+    content_files_loaded: bool,
+    duplicates_scanned: bool,
     selected_index: usize,
     scroll_offset: usize,
     last_frame: Instant,
@@ -85,9 +107,19 @@ impl FilesystemBrowserApp {
         let text_renderer = TextRenderer::new(&device, 20000)
             .expect("Failed to create text renderer");
 
-        // Create GPU search engine
+        // Create GPU path search engine
         let gpu_search = GpuPathSearch::new(&device, MAX_GPU_PATHS)
             .map_err(|e| eprintln!("Warning: GPU search init failed: {}", e))
+            .ok();
+
+        // Create GPU content search engine
+        let content_search = GpuContentSearch::new(&device, 10000)
+            .map_err(|e| eprintln!("Warning: GPU content search init failed: {}", e))
+            .ok();
+
+        // Create GPU duplicate finder
+        let duplicate_finder = GpuDuplicateFinder::new(&device, 50000)
+            .map_err(|e| eprintln!("Warning: GPU duplicate finder init failed: {}", e))
             .ok();
 
         Self {
@@ -98,10 +130,18 @@ impl FilesystemBrowserApp {
             font,
             text_renderer,
             gpu_search,
+            content_search,
+            content_results: Vec::new(),
+            duplicate_finder,
+            duplicate_groups: Vec::new(),
             search_query: String::new(),
+            search_mode: SearchMode::Path,
+            modifiers: ModifiersState::empty(),
             results: Vec::new(),
             path_to_id: HashMap::new(),
             scan_complete: false,
+            content_files_loaded: false,
+            duplicates_scanned: false,
             selected_index: 0,
             scroll_offset: 0,
             last_frame: Instant::now(),
@@ -198,39 +238,190 @@ impl FilesystemBrowserApp {
         );
     }
 
+    fn toggle_search_mode(&mut self) {
+        self.search_mode = match self.search_mode {
+            SearchMode::Path => {
+                // Switch to content mode - load files if needed
+                if !self.content_files_loaded {
+                    self.load_content_files();
+                }
+                SearchMode::Content
+            }
+            SearchMode::Content => SearchMode::Path,
+            SearchMode::Duplicates => SearchMode::Path,
+        };
+        self.search_query.clear();
+        self.results.clear();
+        self.content_results.clear();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+        self.status_message = format!(
+            "Search mode: {} (Ctrl+Shift+F to toggle)",
+            match self.search_mode {
+                SearchMode::Path => "Path Search",
+                SearchMode::Content => "Content Search (grep)",
+                SearchMode::Duplicates => "Duplicates",
+            }
+        );
+    }
+
+    fn run_duplicate_scan(&mut self) {
+        self.search_mode = SearchMode::Duplicates;
+        self.search_query.clear();
+        self.results.clear();
+        self.content_results.clear();
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+        self.status_message = "Scanning for duplicate files...".to_string();
+
+        let scan_start = Instant::now();
+
+        if let Some(ref mut finder) = self.duplicate_finder {
+            // Scan home directory for demo
+            let scan_path = std::path::Path::new("/Users/patrickkavanagh");
+
+            match finder.scan_directory(scan_path) {
+                Ok(result) => {
+                    self.status_message = format!(
+                        "Found {} files with potential duplicates, hashing...",
+                        result.files_scanned
+                    );
+
+                    // Compute hashes
+                    if let Err(e) = finder.compute_hashes() {
+                        self.status_message = format!("Hash error: {}", e);
+                        return;
+                    }
+
+                    // Find duplicates
+                    self.duplicate_groups = finder.find_duplicates();
+                    let total_wasted = finder.total_wasted_bytes(&self.duplicate_groups);
+
+                    self.last_search_time_us = scan_start.elapsed().as_micros() as u64;
+                    self.duplicates_scanned = true;
+
+                    // Convert to results format for display
+                    self.results = self.duplicate_groups
+                        .iter()
+                        .map(|g| {
+                            let display = format!(
+                                "{} files ({} each) - {} wasted",
+                                g.files.len(),
+                                format_size(g.file_size),
+                                format_size(g.wasted_bytes)
+                            );
+                            (display, g.files.len() as i32, g.wasted_bytes)
+                        })
+                        .collect();
+
+                    self.status_message = format!(
+                        "{} duplicate groups, {} wasted ({:.1}ms GPU)",
+                        self.duplicate_groups.len(),
+                        format_size(total_wasted),
+                        self.last_search_time_us as f64 / 1000.0
+                    );
+                }
+                Err(e) => {
+                    self.status_message = format!("Scan error: {}", e);
+                }
+            }
+        } else {
+            self.status_message = "Duplicate finder not available".to_string();
+        }
+    }
+
+    fn load_content_files(&mut self) {
+        // Load a sample of files for content searching
+        // Start with current directory for demo, could expand later
+        self.status_message = "Loading files for content search...".to_string();
+
+        if let Some(ref mut content_search) = self.content_search {
+            // Get first 1000 file paths from the path index
+            let paths: Vec<std::path::PathBuf> = self.path_to_id
+                .keys()
+                .filter(|p| {
+                    // Only include text-like files
+                    let ext = std::path::Path::new(p)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("");
+                    matches!(ext, "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml" |
+                            "md" | "txt" | "c" | "h" | "cpp" | "hpp" | "go" | "java" | "swift" |
+                            "rb" | "sh" | "bash" | "zsh" | "css" | "html" | "xml" | "sql")
+                })
+                .take(1000)
+                .map(|s| std::path::PathBuf::from(s))
+                .collect();
+
+            let path_refs: Vec<&Path> = paths.iter().map(|p| p.as_path()).collect();
+            match content_search.load_files(&path_refs) {
+                Ok(chunks) => {
+                    self.content_files_loaded = true;
+                    self.status_message = format!(
+                        "Loaded {} files ({} chunks) for content search",
+                        content_search.file_count(),
+                        chunks
+                    );
+                }
+                Err(e) => {
+                    self.status_message = format!("Error loading files: {}", e);
+                }
+            }
+        }
+    }
+
     fn perform_search(&mut self) {
         if self.search_query.is_empty() {
             self.results.clear();
+            self.content_results.clear();
             self.last_search_time_us = 0;
             return;
         }
 
         let search_start = Instant::now();
 
-        // Use GPU search if available
-        if let Some(ref gpu_search) = self.gpu_search {
-            // GPU parallel fuzzy search across all paths
-            let matches = gpu_search.search(&self.search_query, 500);
+        match self.search_mode {
+            SearchMode::Path => {
+                // Use GPU path search
+                if let Some(ref gpu_search) = self.gpu_search {
+                    let matches = gpu_search.search(&self.search_query, 500);
+                    self.last_search_time_us = search_start.elapsed().as_micros() as u64;
 
-            self.last_search_time_us = search_start.elapsed().as_micros() as u64;
+                    self.results = matches
+                        .iter()
+                        .filter_map(|(idx, score)| {
+                            let path = gpu_search.get_path(*idx)?;
+                            let metadata = fs::metadata(path).ok()?;
+                            if metadata.is_dir() {
+                                return None;
+                            }
+                            Some((path.to_string(), *score, metadata.len()))
+                        })
+                        .collect();
+                }
+            }
+            SearchMode::Content => {
+                // Use GPU content search
+                if let Some(ref content_search) = self.content_search {
+                    let options = SearchOptions::default();
+                    self.content_results = content_search.search(&self.search_query, &options);
+                    self.last_search_time_us = search_start.elapsed().as_micros() as u64;
 
-            // Convert to results with file metadata
-            self.results = matches
-                .iter()
-                .filter_map(|(idx, score)| {
-                    let path = gpu_search.get_path(*idx)?;
-                    let metadata = fs::metadata(path).ok()?;
-                    // Skip directories - only show files
-                    if metadata.is_dir() {
-                        return None;
-                    }
-                    Some((path.to_string(), *score, metadata.len()))
-                })
-                .collect();
-        } else {
-            // Fallback: CPU search (shouldn't happen)
-            self.results.clear();
-            self.last_search_time_us = 0;
+                    // Convert content matches to display format
+                    self.results = self.content_results
+                        .iter()
+                        .map(|m| {
+                            let display = format!("{}:{}", m.file_path, m.line_number);
+                            (display, m.line_number as i32, 0)
+                        })
+                        .collect();
+                }
+            }
+            SearchMode::Duplicates => {
+                // Duplicates mode doesn't use the search query
+                // Results are already populated by run_duplicate_scan
+                return;
+            }
         }
 
         self.selected_index = 0;
@@ -283,24 +474,46 @@ impl FilesystemBrowserApp {
         let line_height = self.text_renderer.line_height();
         let mut y = 30.0;
 
-        // Title
-        self.text_renderer.add_text("GPU Filesystem Browser", 20.0, y, colors::WHITE);
+        // Title with search mode indicator
+        let mode_str = match self.search_mode {
+            SearchMode::Path => "[Path]",
+            SearchMode::Content => "[Content]",
+            SearchMode::Duplicates => "[Duplicates]",
+        };
+        let title = format!("GPU Filesystem Browser {}", mode_str);
+        self.text_renderer.add_text(&title, 20.0, y, colors::WHITE);
+
+        // Mode hint on right side
+        let hint = "Ctrl+Shift+F: toggle | Ctrl+D: duplicates";
+        let hint_x = WIDTH as f32 - self.text_renderer.text_width(hint) - 20.0;
+        self.text_renderer.add_text(hint, hint_x, y, colors::DARK_GRAY);
         y += line_height * 1.2;
 
-        // Search box
-        self.text_renderer.add_text("Search: ", 20.0, y, colors::GRAY);
-        let query_x = 20.0 + self.text_renderer.text_width("Search: ");
+        // Search box with mode-specific label (not shown in Duplicates mode)
+        if self.search_mode != SearchMode::Duplicates {
+            let search_label = match self.search_mode {
+                SearchMode::Path => "Search: ",
+                SearchMode::Content => "Grep: ",
+                SearchMode::Duplicates => "",
+            };
+            self.text_renderer.add_text(search_label, 20.0, y, colors::GRAY);
+            let query_x = 20.0 + self.text_renderer.text_width(search_label);
 
-        if self.search_query.is_empty() {
-            self.text_renderer.add_text("Type to search...", query_x, y, colors::DARK_GRAY);
+            if self.search_query.is_empty() {
+                self.text_renderer.add_text("Type to search...", query_x, y, colors::DARK_GRAY);
+            } else {
+                self.text_renderer.add_text(&self.search_query, query_x, y, colors::WHITE);
+            }
+
+            // Cursor
+            let cursor_x = query_x + self.text_renderer.text_width(&self.search_query);
+            self.text_renderer.add_text("_", cursor_x, y, colors::GREEN);
+            y += line_height * 1.2;
         } else {
-            self.text_renderer.add_text(&self.search_query, query_x, y, colors::WHITE);
+            // In duplicates mode, show status instead of search box
+            self.text_renderer.add_text("Duplicate files found:", 20.0, y, colors::GRAY);
+            y += line_height * 1.2;
         }
-
-        // Cursor
-        let cursor_x = query_x + self.text_renderer.text_width(&self.search_query);
-        self.text_renderer.add_text("_", cursor_x, y, colors::GREEN);
-        y += line_height * 1.2;
 
         // Separator
         self.text_renderer.add_text(&"-".repeat(60), 20.0, y, colors::DARK_GRAY);
@@ -382,6 +595,26 @@ impl FilesystemBrowserApp {
     fn handle_key(&mut self, key: Key, state: ElementState) {
         if state != ElementState::Pressed {
             return;
+        }
+
+        // Check for Ctrl+Shift+F to toggle content search mode
+        if self.modifiers.control_key() && self.modifiers.shift_key() {
+            if let Key::Character(c) = &key {
+                if c.as_str().eq_ignore_ascii_case("f") {
+                    self.toggle_search_mode();
+                    return;
+                }
+            }
+        }
+
+        // Check for Ctrl+D to run duplicate scan
+        if self.modifiers.control_key() && !self.modifiers.shift_key() {
+            if let Key::Character(c) = &key {
+                if c.as_str().eq_ignore_ascii_case("d") {
+                    self.run_duplicate_scan();
+                    return;
+                }
+            }
         }
 
         match key {
@@ -471,6 +704,9 @@ impl ApplicationHandler for FilesystemBrowserApp {
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
+            }
+            WindowEvent::ModifiersChanged(new_modifiers) => {
+                self.modifiers = new_modifiers.state();
             }
             WindowEvent::KeyboardInput {
                 event: KeyEvent { logical_key, state, .. },

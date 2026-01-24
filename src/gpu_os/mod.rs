@@ -25,6 +25,8 @@ pub mod metaballs;         // Metaballs Organic Blob Demo
 pub mod waves;             // Wave Simulation app
 pub mod benchmark_visual;  // GPU vs CPU Benchmark Demo
 pub mod filesystem;        // GPU-Native Filesystem (Issue #19-24)
+pub mod content_search;    // GPU Content Search (Issue #50)
+pub mod duplicate_finder;  // GPU Duplicate Finder (Issue #51)
 pub mod document;          // GPU-Native Document Viewer (Issue #25+)
 
 // Demo modules (legacy - standalone implementations)
