@@ -830,21 +830,14 @@ kernel void fuzzy_search_kernel(
             }
             if (starts_with) score += 50;
         }
-        // Check for exact substring in full path
-        else if (contains_substring_gpu(path, path_len, word, word_len)) {
-            score += 30;
-        }
-        // Check fuzzy match in filename
+        // Check fuzzy match in filename only
         else if (fuzzy_match_gpu(filename, filename_len, word, word_len)) {
             score += 20;
         }
-        // Check fuzzy match in full path
-        else if (fuzzy_match_gpu(path, path_len, word, word_len)) {
-            score += 5;
-        }
-        // Word doesn't match at all - reject this path
+        // Word doesn't match filename - reject this path
+        // NOTE: We intentionally skip full-path matching to avoid matching on directory names
         else {
-            return;  // No match, don't write anything
+            return;  // No match in filename, skip this file
         }
     }
 
@@ -2108,6 +2101,8 @@ impl GpuStreamingSearch {
             let params = self.params_buffer.contents() as *mut SearchParams;
             (*params).path_count = chunk_size as u32;
             (*params).word_count = query_words.len() as u32;
+            (*params).max_results = STREAM_MAX_RESULTS as u32;  // CRITICAL: was missing!
+            (*params)._padding = 0;
         }
 
         // Upload query words

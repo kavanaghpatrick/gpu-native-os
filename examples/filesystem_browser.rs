@@ -11,7 +11,10 @@ use cocoa::{appkit::NSView, base::id as cocoa_id};
 use core_graphics_types::geometry::CGSize;
 use metal::*;
 use objc::{rc::autoreleasepool, runtime::YES};
-use rust_experiment::gpu_os::filesystem::{FileType, GpuFilesystem, GpuPathSearch};
+use rust_experiment::gpu_os::filesystem::{
+    FileType, GpuFilesystem, GpuPathSearch,
+    GpuStreamingSearch, parse_query_words, STREAM_CHUNK_SIZE,
+};
 use rust_experiment::gpu_os::content_search::{GpuContentSearch, ContentMatch, SearchOptions};
 use rust_experiment::gpu_os::duplicate_finder::{GpuDuplicateFinder, DuplicateGroup};
 use rust_experiment::gpu_os::text_render::{BitmapFont, TextRenderer, colors};
@@ -26,7 +29,7 @@ const INDEX_FILE: &str = "/Users/patrickkavanagh/.filesystem_index.txt";
 const MAX_GPU_PATHS: usize = 500_000; // Reduced from 3M to prevent memory exhaustion (~128MB)
 use winit::{
     application::ApplicationHandler,
-    event::{ElementState, KeyEvent, Modifiers, WindowEvent},
+    event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     keyboard::{Key, NamedKey, ModifiersState},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
@@ -66,6 +69,11 @@ struct FilesystemBrowserApp {
     // GPU Search (path search)
     gpu_search: Option<GpuPathSearch>,
 
+    // GPU Streaming Search (for large filesystems with 3M+ paths)
+    streaming_search: Option<GpuStreamingSearch>,
+    use_streaming: bool,  // True when path count exceeds MAX_GPU_PATHS
+    all_paths: Vec<String>,  // Store all paths for streaming search path lookups
+
     // GPU Content Search (grep-like)
     content_search: Option<GpuContentSearch>,
     content_results: Vec<ContentMatch>,
@@ -90,6 +98,10 @@ struct FilesystemBrowserApp {
     file_count: usize,
     dir_count: usize,
     last_search_time_us: u64, // Track GPU search timing
+
+    // Debouncing - only search after user stops typing
+    last_keystroke: Instant,
+    search_pending: bool,
 }
 
 impl FilesystemBrowserApp {
@@ -122,6 +134,11 @@ impl FilesystemBrowserApp {
             .map_err(|e| eprintln!("Warning: GPU duplicate finder init failed: {}", e))
             .ok();
 
+        // Create GPU streaming search for large filesystems
+        let streaming_search = GpuStreamingSearch::new(&device)
+            .map_err(|e| eprintln!("Warning: GPU streaming search init failed: {}", e))
+            .ok();
+
         Self {
             window: None,
             device,
@@ -130,6 +147,9 @@ impl FilesystemBrowserApp {
             font,
             text_renderer,
             gpu_search,
+            streaming_search,
+            use_streaming: false,
+            all_paths: Vec::new(),
             content_search,
             content_results: Vec::new(),
             duplicate_finder,
@@ -149,6 +169,8 @@ impl FilesystemBrowserApp {
             file_count: 0,
             dir_count: 0,
             last_search_time_us: 0,
+            last_keystroke: Instant::now(),
+            search_pending: false,
         }
     }
 
@@ -161,8 +183,29 @@ impl FilesystemBrowserApp {
             self.file_count = file_count;
             self.dir_count = dir_count;
 
-            // Load paths into GPU
+            let path_count = self.path_to_id.len();
             let gpu_start = Instant::now();
+
+            // Check if we need streaming mode (too many paths for regular GPU search)
+            if path_count > MAX_GPU_PATHS {
+                // Use streaming search - don't load all paths into GPU memory
+                self.use_streaming = true;
+                self.all_paths = self.path_to_id.keys().cloned().collect();
+                println!("Using streaming search for {} paths (exceeds {} limit)",
+                    path_count, MAX_GPU_PATHS);
+
+                self.scan_complete = true;
+                self.status_message = format!(
+                    "{} files, {} folders - STREAMING MODE ({}M paths) - loaded in {:.1}s",
+                    self.file_count,
+                    self.dir_count,
+                    path_count / 1_000_000,
+                    start.elapsed().as_secs_f32()
+                );
+                return;
+            }
+
+            // Regular GPU search - load paths into GPU buffer
             if let Some(ref mut gpu_search) = self.gpu_search {
                 let path_list: Vec<String> = self.path_to_id.keys().cloned().collect();
                 if let Err(e) = gpu_search.add_paths(&path_list) {
@@ -212,9 +255,32 @@ impl FilesystemBrowserApp {
         self.scan_complete = true;
 
         let total = self.file_count + self.dir_count;
+        let path_count = self.path_to_id.len();
+        let gpu_start = Instant::now();
+
+        // Check if we need streaming mode (too many paths for regular GPU search)
+        if path_count > MAX_GPU_PATHS {
+            self.use_streaming = true;
+            self.all_paths = self.path_to_id.keys().cloned().collect();
+            println!("Using streaming search for {} paths (exceeds {} limit)",
+                path_count, MAX_GPU_PATHS);
+
+            // Save to cache
+            save_index(&self.path_to_id, self.file_count, self.dir_count);
+
+            self.status_message = format!(
+                "{} files + {} folders = {} - STREAMING MODE - in {:.1}s | skip:{} err:{}",
+                self.file_count,
+                self.dir_count,
+                total,
+                start.elapsed().as_secs_f32(),
+                skipped,
+                errors
+            );
+            return;
+        }
 
         // Load paths into GPU
-        let gpu_start = Instant::now();
         if let Some(ref mut gpu_search) = self.gpu_search {
             let path_list: Vec<String> = self.path_to_id.keys().cloned().collect();
             if let Err(e) = gpu_search.add_paths(&path_list) {
@@ -382,8 +448,12 @@ impl FilesystemBrowserApp {
 
         match self.search_mode {
             SearchMode::Path => {
-                // Use GPU path search
-                if let Some(ref gpu_search) = self.gpu_search {
+                if self.use_streaming {
+                    // Use GPU streaming search for large filesystems
+                    self.perform_streaming_search();
+                    self.last_search_time_us = search_start.elapsed().as_micros() as u64;
+                } else if let Some(ref gpu_search) = self.gpu_search {
+                    // Use regular GPU path search
                     let matches = gpu_search.search(&self.search_query, 500);
                     self.last_search_time_us = search_start.elapsed().as_micros() as u64;
 
@@ -428,18 +498,114 @@ impl FilesystemBrowserApp {
         self.scroll_offset = 0;
     }
 
+    /// Perform streaming search for large filesystems (3M+ paths)
+    /// Processes paths in 50K chunks to avoid GPU memory exhaustion
+    fn perform_streaming_search(&mut self) {
+        let Some(ref mut streaming) = self.streaming_search else {
+            self.status_message = "Streaming search not available".to_string();
+            return;
+        };
+
+        // Parse query into words
+        let query_words = parse_query_words(&self.search_query);
+        if query_words.is_empty() {
+            return;
+        }
+
+        // Reset streaming search state
+        streaming.reset();
+
+        // Process all paths in chunks
+        let chunk_size = STREAM_CHUNK_SIZE;
+        let total_paths = self.all_paths.len();
+        let mut chunk_offset = 0;
+        let mut chunks_processed = 0;
+
+        while chunk_offset < total_paths {
+            let chunk_end = (chunk_offset + chunk_size).min(total_paths);
+            let chunk: Vec<String> = self.all_paths[chunk_offset..chunk_end].to_vec();
+
+            streaming.process_chunk(&chunk, chunk_offset, &query_words);
+
+            chunk_offset = chunk_end;
+            chunks_processed += 1;
+        }
+
+        // Get sorted results
+        let stream_results = streaming.get_results();
+
+        // Convert to display format
+        self.results = stream_results
+            .iter()
+            .filter_map(|r| {
+                let path = self.all_paths.get(r.path_index as usize)?;
+                let metadata = fs::metadata(path).ok()?;
+                if metadata.is_dir() {
+                    return None;
+                }
+                Some((path.clone(), r.score, metadata.len()))
+            })
+            .take(500)  // Limit results for display
+            .collect();
+
+        let (total_searched, _) = streaming.stats();
+        self.status_message = format!(
+            "Streaming: {} results from {}M paths ({} chunks)",
+            self.results.len(),
+            total_searched / 1_000_000,
+            chunks_processed
+        );
+    }
+
     fn render(&mut self) {
+        static mut FRAME_COUNT: u64 = 0;
+        static mut LAST_DEBUG_SECS: u64 = 0;
+
+        unsafe {
+            FRAME_COUNT += 1;
+        }
+
+        // Debounce: only search after 150ms of no typing
+        const DEBOUNCE_MS: u128 = 150;
+        if self.search_pending && self.last_keystroke.elapsed().as_millis() >= DEBOUNCE_MS {
+            self.search_pending = false;
+            self.perform_search();
+        }
+
         // Clear text renderer for new frame
         self.text_renderer.clear();
 
         // Build the UI text
         self.build_ui();
 
+        // DEBUG: Print text stats every 60 frames
+        unsafe {
+            if FRAME_COUNT % 60 == 1 {
+                println!("[DEBUG] Frame {} | Chars: {} | Scale: {}",
+                    FRAME_COUNT,
+                    self.text_renderer.char_count(),
+                    self.text_renderer.scale
+                );
+            }
+        }
+
         // Get drawable
         let drawable = match self.layer.next_drawable() {
             Some(d) => d,
-            None => return,
+            None => {
+                println!("[DEBUG] No drawable available!");
+                return;
+            }
         };
+
+        // DEBUG: Check drawable texture dimensions
+        unsafe {
+            if FRAME_COUNT == 1 {
+                let tex = drawable.texture();
+                println!("[DEBUG] Drawable texture: {}x{} format={:?}",
+                    tex.width(), tex.height(), tex.pixel_format());
+            }
+        }
 
         // Create command buffer
         let command_buffer = self.command_queue.new_command_buffer();
@@ -449,23 +615,33 @@ impl FilesystemBrowserApp {
         let color_attachment = render_desc.color_attachments().object_at(0).unwrap();
         color_attachment.set_texture(Some(drawable.texture()));
         color_attachment.set_load_action(MTLLoadAction::Clear);
-        color_attachment.set_clear_color(MTLClearColor::new(0.1, 0.1, 0.12, 1.0));
+        // DEBUG: Use bright red clear color to verify render pass works
+        color_attachment.set_clear_color(MTLClearColor::new(0.3, 0.0, 0.0, 1.0));
         color_attachment.set_store_action(MTLStoreAction::Store);
 
+        // Render text using bitmap font
         let encoder = command_buffer.new_render_command_encoder(&render_desc);
-
-        // Render all text using the library
-        self.text_renderer.render(
-            encoder,
-            &self.font,
-            WIDTH as f32,
-            HEIGHT as f32,
-        );
-
+        if self.text_renderer.char_count() > 0 {
+            self.text_renderer.render(
+                &encoder,
+                &self.font,
+                WIDTH as f32,
+                HEIGHT as f32,
+            );
+        }
         encoder.end_encoding();
 
         command_buffer.present_drawable(&drawable);
         command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // DEBUG: After GPU is done, check vertex data
+        unsafe {
+            if FRAME_COUNT == 3 {
+                self.text_renderer.debug_atlas_info();
+                self.text_renderer.debug_dump_vertices(18);
+            }
+        }
 
         self.last_frame = Instant::now();
     }
@@ -554,10 +730,28 @@ impl FilesystemBrowserApp {
 
             let prefix = if is_selected { "> " } else { "  " };
 
-            // Truncate path to fit
-            let max_path_len = 80;
+            // Truncate path but ALWAYS show full filename
+            // Leave room for file size column (10 chars) on right
+            let max_path_len = 70;
             let display_path = if path.len() > max_path_len {
-                format!("...{}", &path[path.len() - max_path_len + 3..])
+                // Find the filename (after last /)
+                let filename_start = path.rfind('/').map(|i| i + 1).unwrap_or(0);
+                let filename = &path[filename_start..];
+                let dir_path = &path[..filename_start];
+
+                // Calculate how much space we have for directory
+                let available_for_dir = max_path_len.saturating_sub(filename.len() + 4); // 4 for ".../"
+
+                if available_for_dir > 10 && dir_path.len() > available_for_dir {
+                    // Truncate directory, keep filename
+                    format!("...{}{}", &dir_path[dir_path.len() - available_for_dir..], filename)
+                } else if filename.len() > max_path_len - 3 {
+                    // Filename itself is too long, truncate it
+                    format!("...{}", &filename[filename.len() - (max_path_len - 3)..])
+                } else {
+                    // Just show filename with ... prefix
+                    format!(".../{}", filename)
+                }
             } else {
                 path.clone()
             };
@@ -622,20 +816,24 @@ impl FilesystemBrowserApp {
                 let s = c.as_str();
                 if s.chars().all(|c| c.is_ascii() && !c.is_control()) {
                     self.search_query.push_str(s);
-                    self.perform_search();
+                    self.last_keystroke = Instant::now();
+                    self.search_pending = true;
                 }
             }
             Key::Named(NamedKey::Space) => {
                 self.search_query.push(' ');
-                self.perform_search();
+                self.last_keystroke = Instant::now();
+                self.search_pending = true;
             }
             Key::Named(NamedKey::Backspace) => {
                 self.search_query.pop();
-                self.perform_search();
+                self.last_keystroke = Instant::now();
+                self.search_pending = true;
             }
             Key::Named(NamedKey::Escape) => {
                 self.search_query.clear();
                 self.results.clear();
+                self.search_pending = false;
             }
             Key::Named(NamedKey::ArrowDown) => {
                 if !self.results.is_empty() {

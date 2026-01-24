@@ -6,10 +6,14 @@
 
 use super::memory::{FrameState, GpuMemory, InputEvent, InputEventType};
 use super::input::InputHandler;
+use super::text_render::{BitmapFont, TextRenderer};
 use super::vsync::FrameTiming;
 use metal::*;
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
+
+// Re-export text rendering types for convenience
+pub use super::text_render::{BitmapFont as Font, TextRenderer as Text, TextChar, colors};
 
 // ============================================================================
 // Pipeline Mode - Latency vs Throughput Tradeoff
@@ -123,6 +127,17 @@ pub trait GpuApp {
     fn buffer_set_for_frame(&self, _frame_number: u64) -> usize {
         0
     }
+
+    /// Whether this app wants to use the global text rendering system
+    /// If true, render_text() will be called after the main render pass
+    fn uses_text_rendering(&self) -> bool {
+        false
+    }
+
+    /// Render text using the global TextRenderer
+    /// Called after the main render pass if uses_text_rendering() returns true
+    /// Apps should call text_renderer.add_text() etc. here
+    fn render_text(&mut self, _text_renderer: &mut TextRenderer) {}
 }
 
 // ============================================================================
@@ -135,6 +150,10 @@ pub struct GpuRuntime {
     pub command_queue: CommandQueue,
     pub memory: GpuMemory,
     pub input: InputHandler,
+
+    // Global text rendering (available to all apps)
+    pub font: BitmapFont,
+    pub text_renderer: TextRenderer,
 
     // Frame timing
     last_frame: Instant,
@@ -153,9 +172,16 @@ impl GpuRuntime {
         let memory = GpuMemory::new(&device, 1024); // Support up to 1024 widgets
         let input = InputHandler::new(&device);
 
+        // Create global text rendering system
+        let font = BitmapFont::new(&device);
+        let text_renderer = TextRenderer::new(&device, 10000)
+            .expect("Failed to create global text renderer");
+
         Self {
             device,
             command_queue,
+            font,
+            text_renderer,
             previous_command_buffer: None,
             gpu_timing_queue: Arc::new(Mutex::new(Vec::new())),
             memory,
@@ -179,6 +205,21 @@ impl GpuRuntime {
     /// Get delta time from last frame
     pub fn delta_time(&self) -> f32 {
         self.delta_time
+    }
+
+    /// Get the global bitmap font (for text measurement, etc.)
+    pub fn font(&self) -> &BitmapFont {
+        &self.font
+    }
+
+    /// Get the global text renderer (for direct rendering outside GpuApp)
+    pub fn text_renderer(&self) -> &TextRenderer {
+        &self.text_renderer
+    }
+
+    /// Get mutable reference to text renderer (for adding text)
+    pub fn text_renderer_mut(&mut self) -> &mut TextRenderer {
+        &mut self.text_renderer
     }
 
     /// Push a mouse move event
@@ -287,6 +328,32 @@ impl GpuRuntime {
             app.vertex_count() as u64,
         );
         render_encoder.end_encoding();
+
+        // === TEXT RENDERING PASS (optional) ===
+        if app.uses_text_rendering() {
+            // Clear text renderer and let app add its text
+            self.text_renderer.clear();
+            app.render_text(&mut self.text_renderer);
+
+            // Only render if there's text to draw
+            if self.text_renderer.char_count() > 0 {
+                let text_pass = RenderPassDescriptor::new();
+                let text_attachment = text_pass.color_attachments().object_at(0).unwrap();
+                text_attachment.set_texture(Some(drawable.texture()));
+                text_attachment.set_load_action(MTLLoadAction::Load); // Preserve existing content
+                text_attachment.set_store_action(MTLStoreAction::Store);
+
+                let text_encoder = command_buffer.new_render_command_encoder(&text_pass);
+                let size = drawable.texture();
+                self.text_renderer.render(
+                    &text_encoder,
+                    &self.font,
+                    size.width() as f32,
+                    size.height() as f32,
+                );
+                text_encoder.end_encoding();
+            }
+        }
 
         // Present and commit
         command_buffer.present_drawable(drawable);

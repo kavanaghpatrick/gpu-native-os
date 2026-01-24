@@ -28,7 +28,8 @@ pub mod filesystem;        // GPU-Native Filesystem (Issue #19-24)
 pub mod content_search;    // GPU Content Search (Issue #50)
 pub mod duplicate_finder;  // GPU Duplicate Finder (Issue #51)
 pub mod document;          // GPU-Native Document Viewer (Issue #25+)
-pub mod vector;            // GPU Vector Rasterizer (Issue #34)
+pub mod document_app;      // GPU-Native Document Browser (GpuApp implementation)
+pub mod vector;             // GPU Vector Rasterizer (Issue #34 + #35 + #36)
 
 // Demo modules (legacy - standalone implementations)
 pub mod ball_physics;   // 1024-Ball Physics demo

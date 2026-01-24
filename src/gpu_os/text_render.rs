@@ -1,18 +1,16 @@
-// GPU Text Rendering - SDF Font System (GPU-Native)
+// GPU Text Rendering - Simple Bitmap Font System
 //
-// Zero CPU work per frame:
-// - All text stored in single GPU buffer
-// - Single compute dispatch for layout
-// - Single render pass for drawing
+// Provides GPU-accelerated text rendering using an 8x8 bitmap font.
+// All rendering happens on the GPU via Metal shaders.
 //
 // Usage:
-//   let mut renderer = TextRenderer::new(&device, max_chars)?;
-//   renderer.add_text("Hello", 10.0, 10.0, colors::WHITE);
-//   renderer.render(&command_buffer, &render_pass_desc, width, height);
+//   let font = BitmapFont::new(&device);
+//   let mut renderer = TextRenderer::new(&device, &font);
+//   renderer.add_text("Hello", 10.0, 10.0, 0xFFFFFFFF);
+//   renderer.render(&encoder, screen_width, screen_height);
 
 use metal::*;
 use std::mem;
-use super::sdf_text::atlas_data::{GLYPH_METRICS, UNITS_PER_EM, ATLAS_WIDTH, ATLAS_HEIGHT, SDF_SIZE, ATLAS_DATA};
 
 /// Color constants for convenience
 pub mod colors {
@@ -28,88 +26,137 @@ pub mod colors {
     pub const LIGHT_GRAY: u32 = 0xCCCCCCFF;
 }
 
-/// Text segment metadata (GPU-side)
+/// A single character to render
 #[repr(C)]
-#[derive(Copy, Clone)]
-struct TextSegment {
-    x: f32,
-    y: f32,
-    font_size: f32,
-    start_char: u32,    // Offset into text buffer
-    char_count: u32,    // Number of characters
-    color: [f32; 4],
-    _padding: [f32; 3], // Pad to 48 bytes (multiple of 16)
+#[derive(Copy, Clone, Default)]
+pub struct TextChar {
+    pub x: f32,
+    pub y: f32,
+    pub char_code: u32,
+    pub color: u32, // RGBA packed as 0xRRGGBBAA
 }
 
-/// SDF text vertex (matches shader)
+/// Uniforms passed to the text shader
 #[repr(C)]
 #[derive(Copy, Clone)]
-struct SdfTextVertex {
-    position: [f32; 2],
-    uv: [f32; 2],
-    color: [f32; 4],
+pub struct TextUniforms {
+    pub screen_size: [f32; 2],
+    pub scale: f32,
+    pub _padding: f32,
 }
 
-/// GPU parameters
-#[repr(C)]
-#[derive(Copy, Clone)]
-struct LayoutParams {
-    screen_width: f32,
-    screen_height: f32,
-    segment_count: u32,
-    _padding: u32,
+/// 8x8 bitmap font stored as a GPU texture
+pub struct BitmapFont {
+    pub texture: Texture,
+    pub char_width: f32,
+    pub char_height: f32,
+    pub chars_per_row: u32,
+    pub num_rows: u32,
 }
 
-/// Text renderer - single GPU buffer, single dispatch
+impl BitmapFont {
+    /// Create a new bitmap font with the standard ASCII character set (32-127)
+    pub fn new(device: &Device) -> Self {
+        let char_w = 8usize;
+        let char_h = 8usize;
+        let chars_per_row = 16usize;
+        let num_rows = 6usize;
+        let width = (chars_per_row * char_w) as u64;
+        let height = (num_rows * char_h) as u64;
+
+        let desc = TextureDescriptor::new();
+        desc.set_width(width);
+        desc.set_height(height);
+        desc.set_pixel_format(MTLPixelFormat::R8Unorm);
+        desc.set_texture_type(MTLTextureType::D2);
+        desc.set_usage(MTLTextureUsage::ShaderRead);
+        desc.set_storage_mode(MTLStorageMode::Shared);
+
+        let texture = device.new_texture(&desc);
+        let mut data = vec![0u8; (width * height) as usize];
+
+        // Render font data into texture
+        let font = get_font_data();
+        for ascii in 32u8..128 {
+            let idx = (ascii - 32) as usize;
+            if idx * 8 + 7 >= font.len() {
+                continue;
+            }
+
+            let col = idx % chars_per_row;
+            let row = idx / chars_per_row;
+            let base_x = col * char_w;
+            let base_y = row * char_h;
+
+            for py in 0..8 {
+                let byte = font[idx * 8 + py];
+                for px in 0..8 {
+                    let bit = (byte >> (7 - px)) & 1;
+                    let x = base_x + px;
+                    let y = base_y + py;
+                    if x < width as usize && y < height as usize {
+                        data[y * width as usize + x] = if bit == 1 { 255 } else { 0 };
+                    }
+                }
+            }
+        }
+
+        texture.replace_region(
+            MTLRegion::new_2d(0, 0, width, height),
+            0,
+            data.as_ptr() as *const _,
+            width,
+        );
+
+        Self {
+            texture,
+            char_width: char_w as f32,
+            char_height: char_h as f32,
+            chars_per_row: chars_per_row as u32,
+            num_rows: num_rows as u32,
+        }
+    }
+
+    /// Get the spacing between characters (accounting for scale)
+    pub fn char_spacing(&self, scale: f32) -> f32 {
+        self.char_width * scale
+    }
+
+    /// Get line height (accounting for scale)
+    pub fn line_height(&self, scale: f32) -> f32 {
+        self.char_height * scale * 1.5 // 1.5x for line spacing
+    }
+}
+
+/// Text renderer that batches text drawing into a single GPU call
 pub struct TextRenderer {
-    // Pipelines
-    layout_pipeline: ComputePipelineState,
-    render_pipeline: RenderPipelineState,
-
-    // GPU buffers
-    text_buffer: Buffer,        // Raw character bytes
-    segments_buffer: Buffer,    // TextSegment array
-    vertices_buffer: Buffer,    // Output vertices
-    params_buffer: Buffer,      // LayoutParams
-    metrics_buffer: Buffer,     // Glyph metrics
-    screen_buffer: Buffer,      // Screen size for vertex shader
-
-    // Atlas
-    atlas_texture: Texture,
-
-    // State (CPU-side tracking only)
-    text_offset: usize,         // Current write position in text_buffer
-    segment_count: usize,       // Number of segments
-    total_chars: usize,         // Total characters added
+    pipeline: RenderPipelineState,
+    chars_buffer: Buffer,
+    uniforms_buffer: Buffer,
+    chars: Vec<TextChar>,
     max_chars: usize,
-    max_segments: usize,
-
-    pub font_size: f32,
+    pub scale: f32,
 }
-
-const MAX_SEGMENTS: usize = 256;
 
 impl TextRenderer {
+    /// Create a new text renderer
     pub fn new(device: &Device, max_chars: usize) -> Result<Self, String> {
-        // Compile shaders
         let library = device
-            .new_library_with_source(SDF_BATCH_SHADER, &CompileOptions::new())
-            .map_err(|e| format!("Failed to compile SDF shader: {}", e))?;
+            .new_library_with_source(TEXT_SHADER_SOURCE, &CompileOptions::new())
+            .map_err(|e| format!("Failed to compile text shaders: {}", e))?;
 
-        let layout_fn = library.get_function("sdf_batch_layout", None)
-            .map_err(|e| format!("Missing sdf_batch_layout: {}", e))?;
-        let layout_pipeline = device.new_compute_pipeline_state_with_function(&layout_fn)
-            .map_err(|e| format!("Failed to create layout pipeline: {}", e))?;
-
-        let vertex_fn = library.get_function("sdf_vertex", None)
-            .map_err(|e| format!("Missing sdf_vertex: {}", e))?;
-        let fragment_fn = library.get_function("sdf_fragment", None)
-            .map_err(|e| format!("Missing sdf_fragment: {}", e))?;
+        let vertex_fn = library
+            .get_function("text_vertex", None)
+            .map_err(|e| format!("Missing text_vertex function: {}", e))?;
+        let fragment_fn = library
+            .get_function("text_fragment", None)
+            .map_err(|e| format!("Missing text_fragment function: {}", e))?;
 
         let render_desc = RenderPipelineDescriptor::new();
         render_desc.set_vertex_function(Some(&vertex_fn));
         render_desc.set_fragment_function(Some(&fragment_fn));
 
+        // Enable alpha blending
         let attachment = render_desc.color_attachments().object_at(0).unwrap();
         attachment.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
         attachment.set_blending_enabled(true);
@@ -118,405 +165,378 @@ impl TextRenderer {
         attachment.set_source_alpha_blend_factor(MTLBlendFactor::One);
         attachment.set_destination_alpha_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
 
-        let render_pipeline = device.new_render_pipeline_state(&render_desc)
-            .map_err(|e| format!("Failed to create render pipeline: {}", e))?;
+        let pipeline = device
+            .new_render_pipeline_state(&render_desc)
+            .map_err(|e| format!("Failed to create text pipeline: {}", e))?;
 
-        // Create buffers
-        let text_buffer = device.new_buffer(
-            max_chars as u64,
-            MTLResourceOptions::StorageModeShared,
+        let chars_buffer = device.new_buffer(
+            (max_chars * mem::size_of::<TextChar>()) as u64,
+            MTLResourceOptions::CPUCacheModeDefaultCache,
         );
 
-        let segments_buffer = device.new_buffer(
-            (MAX_SEGMENTS * mem::size_of::<TextSegment>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        let vertices_buffer = device.new_buffer(
-            (max_chars * 6 * mem::size_of::<SdfTextVertex>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        let params_buffer = device.new_buffer(
-            mem::size_of::<LayoutParams>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        // Create metrics buffer with GPU-compatible layout
-        #[repr(C)]
-        struct GpuGlyphMetric {
-            advance: f32,
-            _pad1: f32,
-            _pad2: f32,
-            _pad3: f32,
-            bounds: [f32; 4],
-            atlas_x: u32,
-            atlas_y: u32,
-            _pad4: u32,
-            _pad5: u32,
-        }
-
-        let gpu_metrics: Vec<GpuGlyphMetric> = GLYPH_METRICS.iter().map(|m| {
-            GpuGlyphMetric {
-                advance: m.advance,
-                _pad1: 0.0, _pad2: 0.0, _pad3: 0.0,
-                bounds: m.bounds,
-                atlas_x: m.atlas_x,
-                atlas_y: m.atlas_y,
-                _pad4: 0, _pad5: 0,
-            }
-        }).collect();
-
-        let metrics_buffer = device.new_buffer_with_data(
-            gpu_metrics.as_ptr() as *const _,
-            (gpu_metrics.len() * mem::size_of::<GpuGlyphMetric>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        let screen_buffer = device.new_buffer(
-            8,  // float2
-            MTLResourceOptions::StorageModeShared,
-        );
-
-        // Create atlas texture
-        let texture_desc = TextureDescriptor::new();
-        texture_desc.set_width(ATLAS_WIDTH as u64);
-        texture_desc.set_height(ATLAS_HEIGHT as u64);
-        texture_desc.set_pixel_format(MTLPixelFormat::R8Unorm);
-        texture_desc.set_texture_type(MTLTextureType::D2);
-        texture_desc.set_usage(MTLTextureUsage::ShaderRead);
-        texture_desc.set_storage_mode(MTLStorageMode::Shared);
-
-        let atlas_texture = device.new_texture(&texture_desc);
-        atlas_texture.replace_region(
-            MTLRegion::new_2d(0, 0, ATLAS_WIDTH as u64, ATLAS_HEIGHT as u64),
-            0,
-            ATLAS_DATA.as_ptr() as *const _,
-            ATLAS_WIDTH as u64,
+        let uniforms_buffer = device.new_buffer(
+            mem::size_of::<TextUniforms>() as u64,
+            MTLResourceOptions::CPUCacheModeDefaultCache,
         );
 
         Ok(Self {
-            layout_pipeline,
-            render_pipeline,
-            text_buffer,
-            segments_buffer,
-            vertices_buffer,
-            params_buffer,
-            metrics_buffer,
-            screen_buffer,
-            atlas_texture,
-            text_offset: 0,
-            segment_count: 0,
-            total_chars: 0,
+            pipeline,
+            chars_buffer,
+            uniforms_buffer,
+            chars: Vec::with_capacity(max_chars),
             max_chars,
-            max_segments: MAX_SEGMENTS,
-            font_size: 14.0,
+            scale: 1.5, // Default scale for readability
         })
     }
 
-    /// Clear all text (resets buffer offsets)
+    /// Clear all queued text
     pub fn clear(&mut self) {
-        self.text_offset = 0;
-        self.segment_count = 0;
-        self.total_chars = 0;
+        self.chars.clear();
     }
 
-    /// Add text - writes directly to GPU buffer
+    /// Add text at the specified position with the given color
+    /// Color format: 0xRRGGBBAA
     pub fn add_text(&mut self, text: &str, x: f32, y: f32, color: u32) {
-        self.add_text_sized(text, x, y, color, self.font_size);
+        let spacing = 8.0 * self.scale;
+        let mut cx = x;
+
+        for c in text.chars() {
+            if self.chars.len() >= self.max_chars {
+                break;
+            }
+
+            if c.is_ascii() && c >= ' ' && c <= '~' {
+                self.chars.push(TextChar {
+                    x: cx,
+                    y,
+                    char_code: c as u32,
+                    color,
+                });
+                cx += spacing;
+            }
+        }
     }
 
-    /// Add text with scale (backwards compatibility)
+    /// Add text with a specific scale override
     pub fn add_text_scaled(&mut self, text: &str, x: f32, y: f32, color: u32, scale: f32) {
-        self.add_text_sized(text, x, y, color, 8.0 * scale);
+        let spacing = 8.0 * scale;
+        let mut cx = x;
+
+        for c in text.chars() {
+            if self.chars.len() >= self.max_chars {
+                break;
+            }
+
+            if c.is_ascii() && c >= ' ' && c <= '~' {
+                self.chars.push(TextChar {
+                    x: cx,
+                    y,
+                    char_code: c as u32,
+                    color,
+                });
+                cx += spacing;
+            }
+        }
     }
 
-    /// Add text with specific font size
-    pub fn add_text_sized(&mut self, text: &str, x: f32, y: f32, color: u32, font_size: f32) {
-        if text.is_empty() || self.segment_count >= self.max_segments {
-            return;
-        }
-
-        let char_count = text.len().min(self.max_chars - self.text_offset);
-        if char_count == 0 {
-            return;
-        }
-
-        // Write text bytes to GPU buffer
-        unsafe {
-            let ptr = self.text_buffer.contents() as *mut u8;
-            std::ptr::copy_nonoverlapping(
-                text.as_ptr(),
-                ptr.add(self.text_offset),
-                char_count,
-            );
-        }
-
-        // Write segment metadata
-        let color_f32 = [
-            ((color >> 24) & 0xFF) as f32 / 255.0,
-            ((color >> 16) & 0xFF) as f32 / 255.0,
-            ((color >> 8) & 0xFF) as f32 / 255.0,
-            (color & 0xFF) as f32 / 255.0,
-        ];
-
-        let segment = TextSegment {
-            x,
-            y,
-            font_size,
-            start_char: self.text_offset as u32,
-            char_count: char_count as u32,
-            color: color_f32,
-            _padding: [0.0; 3],
-        };
-
-        unsafe {
-            let ptr = self.segments_buffer.contents() as *mut TextSegment;
-            *ptr.add(self.segment_count) = segment;
-        }
-
-        self.text_offset += char_count;
-        self.total_chars += char_count;
-        self.segment_count += 1;
-    }
-
-    /// Get text width at current font size
+    /// Get the width of a string in pixels (at current scale)
     pub fn text_width(&self, text: &str) -> f32 {
-        self.text_width_sized(text, self.font_size)
+        let char_count = text.chars().filter(|c| c.is_ascii() && *c >= ' ' && *c <= '~').count();
+        char_count as f32 * 8.0 * self.scale
+    }
+
+    /// Get line height at current scale
+    pub fn line_height(&self) -> f32 {
+        8.0 * self.scale * 1.5
+    }
+
+    /// Render all queued text
+    pub fn render(
+        &mut self,
+        encoder: &RenderCommandEncoderRef,
+        font: &BitmapFont,
+        screen_width: f32,
+        screen_height: f32,
+    ) {
+        if self.chars.is_empty() {
+            return;
+        }
+
+        // Upload uniforms
+        let uniforms = TextUniforms {
+            screen_size: [screen_width, screen_height],
+            scale: self.scale,
+            _padding: 0.0,
+        };
+        unsafe {
+            let ptr = self.uniforms_buffer.contents() as *mut TextUniforms;
+            *ptr = uniforms;
+        }
+
+        // Upload character data
+        unsafe {
+            let ptr = self.chars_buffer.contents() as *mut TextChar;
+            for (i, ch) in self.chars.iter().enumerate() {
+                *ptr.add(i) = *ch;
+            }
+        }
+
+        // Set pipeline and buffers
+        encoder.set_render_pipeline_state(&self.pipeline);
+        encoder.set_vertex_buffer(0, Some(&self.uniforms_buffer), 0);
+        encoder.set_vertex_buffer(1, Some(&self.chars_buffer), 0);
+        encoder.set_fragment_texture(0, Some(&font.texture));
+
+        // Draw: 6 vertices per character (2 triangles)
+        encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, (self.chars.len() * 6) as u64);
+    }
+
+    /// Get the number of characters currently queued
+    pub fn char_count(&self) -> usize {
+        self.chars.len()
+    }
+
+    // === Compatibility methods for code that used SDF API ===
+
+    /// Add text with specific font size (converts to scale)
+    pub fn add_text_sized(&mut self, text: &str, x: f32, y: f32, color: u32, font_size: f32) {
+        let scale = font_size / 8.0;  // 8px base font size
+        self.add_text_scaled(text, x, y, color, scale);
     }
 
     /// Get text width at specific font size
     pub fn text_width_sized(&self, text: &str, font_size: f32) -> f32 {
-        let scale = font_size / UNITS_PER_EM;
-        text.chars()
-            .filter(|c| c.is_ascii() && *c >= ' ' && *c <= '~')
-            .map(|c| {
-                let idx = (c as u32 - 32) as usize;
-                if idx < GLYPH_METRICS.len() {
-                    GLYPH_METRICS[idx].advance * scale
-                } else {
-                    0.0
-                }
-            })
-            .sum()
+        let scale = font_size / 8.0;
+        let char_count = text.chars().filter(|c| c.is_ascii() && *c >= ' ' && *c <= '~').count();
+        char_count as f32 * 8.0 * scale
     }
 
-    /// Get line height
-    pub fn line_height(&self) -> f32 {
-        self.font_size * 1.5
+    /// Stub: segment count (SDF concept, not used in bitmap)
+    pub fn segment_count(&self) -> usize {
+        0
     }
 
-    /// Render all text - single compute dispatch + single render pass
-    pub fn render(
-        &mut self,
-        command_buffer: &CommandBufferRef,
-        render_pass_desc: &RenderPassDescriptorRef,
-        screen_width: f32,
-        screen_height: f32,
-    ) {
-        if self.total_chars == 0 {
-            return;
-        }
+    /// Stub: debug dump vertices (no-op for bitmap)
+    pub fn debug_dump_vertices(&self, _count: usize) {}
 
-        // Update params
-        unsafe {
-            let ptr = self.params_buffer.contents() as *mut LayoutParams;
-            *ptr = LayoutParams {
-                screen_width,
-                screen_height,
-                segment_count: self.segment_count as u32,
-                _padding: 0,
-            };
-
-            let screen_ptr = self.screen_buffer.contents() as *mut [f32; 2];
-            *screen_ptr = [screen_width, screen_height];
-        }
-
-        // Single compute dispatch for ALL text layout
-        {
-            let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.layout_pipeline);
-            encoder.set_buffer(0, Some(&self.vertices_buffer), 0);
-            encoder.set_buffer(1, Some(&self.text_buffer), 0);
-            encoder.set_buffer(2, Some(&self.segments_buffer), 0);
-            encoder.set_buffer(3, Some(&self.metrics_buffer), 0);
-            encoder.set_buffer(4, Some(&self.params_buffer), 0);
-
-            // One thread per character
-            let threads = self.total_chars;
-            let tpg = 256;
-            let groups = (threads + tpg - 1) / tpg;
-            encoder.dispatch_thread_groups(
-                MTLSize::new(groups as u64, 1, 1),
-                MTLSize::new(tpg as u64, 1, 1),
-            );
-            encoder.end_encoding();
-        }
-
-        // Single render pass
-        {
-            let encoder = command_buffer.new_render_command_encoder(render_pass_desc);
-            encoder.set_render_pipeline_state(&self.render_pipeline);
-            encoder.set_vertex_buffer(0, Some(&self.vertices_buffer), 0);
-            encoder.set_vertex_buffer(1, Some(&self.screen_buffer), 0);
-            encoder.set_fragment_texture(0, Some(&self.atlas_texture));
-
-            let vertex_count = self.total_chars * 6;
-            encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count as u64);
-            encoder.end_encoding();
-        }
-    }
-
-    pub fn char_count(&self) -> usize {
-        self.total_chars
-    }
+    /// Stub: debug atlas info (no-op for bitmap)
+    pub fn debug_atlas_info(&self) {}
 }
 
-// Keep for backwards compatibility
-pub struct BitmapFont;
-impl BitmapFont {
-    pub fn new(_device: &Device) -> Self { BitmapFont }
-    pub fn char_spacing(&self, scale: f32) -> f32 { 8.0 * scale }
-    pub fn line_height(&self, scale: f32) -> f32 { 8.0 * scale * 1.5 }
+/// Returns the 8x8 bitmap font data for ASCII 32-127
+fn get_font_data() -> [u8; 768] {
+    [
+        // 32 ' ' (space)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // 33 '!'
+        0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00,
+        // 34 '"'
+        0x6C, 0x6C, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // 35 '#'
+        0x24, 0x24, 0x7E, 0x24, 0x7E, 0x24, 0x24, 0x00,
+        // 36 '$'
+        0x18, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x18, 0x00,
+        // 37 '%'
+        0x00, 0x62, 0x64, 0x08, 0x10, 0x26, 0x46, 0x00,
+        // 38 '&'
+        0x30, 0x48, 0x30, 0x56, 0x88, 0x88, 0x76, 0x00,
+        // 39 '''
+        0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // 40 '('
+        0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00,
+        // 41 ')'
+        0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00,
+        // 42 '*'
+        0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00,
+        // 43 '+'
+        0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00,
+        // 44 ','
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30,
+        // 45 '-'
+        0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00,
+        // 46 '.'
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x00,
+        // 47 '/'
+        0x02, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0x00,
+        // 48 '0'
+        0x3C, 0x66, 0x6E, 0x7E, 0x76, 0x66, 0x3C, 0x00,
+        // 49 '1'
+        0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00,
+        // 50 '2'
+        0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0x00,
+        // 51 '3'
+        0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0x00,
+        // 52 '4'
+        0x0C, 0x1C, 0x3C, 0x6C, 0x7E, 0x0C, 0x0C, 0x00,
+        // 53 '5'
+        0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0x00,
+        // 54 '6'
+        0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0x00,
+        // 55 '7'
+        0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00,
+        // 56 '8'
+        0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0x00,
+        // 57 '9'
+        0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0x00,
+        // 58 ':'
+        0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00, 0x00,
+        // 59 ';'
+        0x00, 0x18, 0x18, 0x00, 0x18, 0x18, 0x30, 0x00,
+        // 60 '<'
+        0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00,
+        // 61 '='
+        0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00,
+        // 62 '>'
+        0x60, 0x30, 0x18, 0x0C, 0x18, 0x30, 0x60, 0x00,
+        // 63 '?'
+        0x3C, 0x66, 0x06, 0x0C, 0x18, 0x00, 0x18, 0x00,
+        // 64 '@'
+        0x3C, 0x66, 0x6E, 0x6A, 0x6E, 0x60, 0x3C, 0x00,
+        // 65 'A'
+        0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x00,
+        // 66 'B'
+        0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0x00,
+        // 67 'C'
+        0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0x00,
+        // 68 'D'
+        0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0x00,
+        // 69 'E'
+        0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x7E, 0x00,
+        // 70 'F'
+        0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0x00,
+        // 71 'G'
+        0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0x00,
+        // 72 'H'
+        0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0x00,
+        // 73 'I'
+        0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00,
+        // 74 'J'
+        0x06, 0x06, 0x06, 0x06, 0x66, 0x66, 0x3C, 0x00,
+        // 75 'K'
+        0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0x00,
+        // 76 'L'
+        0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0x00,
+        // 77 'M'
+        0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0x00,
+        // 78 'N'
+        0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0x00,
+        // 79 'O'
+        0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00,
+        // 80 'P'
+        0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0x00,
+        // 81 'Q'
+        0x3C, 0x66, 0x66, 0x66, 0x6A, 0x6C, 0x36, 0x00,
+        // 82 'R'
+        0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0x00,
+        // 83 'S'
+        0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0x00,
+        // 84 'T'
+        0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00,
+        // 85 'U'
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x00,
+        // 86 'V'
+        0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00,
+        // 87 'W'
+        0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0x00,
+        // 88 'X'
+        0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00,
+        // 89 'Y'
+        0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00,
+        // 90 'Z'
+        0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00,
+        // 91 '['
+        0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00,
+        // 92 '\'
+        0x40, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x02, 0x00,
+        // 93 ']'
+        0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00,
+        // 94 '^'
+        0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // 95 '_'
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x00,
+        // 96 '`'
+        0x30, 0x18, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // 97 'a'
+        0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00,
+        // 98 'b'
+        0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00,
+        // 99 'c'
+        0x00, 0x00, 0x3C, 0x66, 0x60, 0x66, 0x3C, 0x00,
+        // 100 'd'
+        0x06, 0x06, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0x00,
+        // 101 'e'
+        0x00, 0x00, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0x00,
+        // 102 'f'
+        0x1C, 0x30, 0x30, 0x7C, 0x30, 0x30, 0x30, 0x00,
+        // 103 'g'
+        0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x3C,
+        // 104 'h'
+        0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00,
+        // 105 'i'
+        0x18, 0x00, 0x38, 0x18, 0x18, 0x18, 0x3C, 0x00,
+        // 106 'j'
+        0x0C, 0x00, 0x1C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38,
+        // 107 'k'
+        0x60, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0x00,
+        // 108 'l'
+        0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00,
+        // 109 'm'
+        0x00, 0x00, 0x76, 0x7F, 0x6B, 0x6B, 0x63, 0x00,
+        // 110 'n'
+        0x00, 0x00, 0x7C, 0x66, 0x66, 0x66, 0x66, 0x00,
+        // 111 'o'
+        0x00, 0x00, 0x3C, 0x66, 0x66, 0x66, 0x3C, 0x00,
+        // 112 'p'
+        0x00, 0x00, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60,
+        // 113 'q'
+        0x00, 0x00, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x06,
+        // 114 'r'
+        0x00, 0x00, 0x7C, 0x66, 0x60, 0x60, 0x60, 0x00,
+        // 115 's'
+        0x00, 0x00, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x00,
+        // 116 't'
+        0x30, 0x30, 0x7C, 0x30, 0x30, 0x30, 0x1C, 0x00,
+        // 117 'u'
+        0x00, 0x00, 0x66, 0x66, 0x66, 0x66, 0x3E, 0x00,
+        // 118 'v'
+        0x00, 0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x00,
+        // 119 'w'
+        0x00, 0x00, 0x63, 0x6B, 0x6B, 0x7F, 0x36, 0x00,
+        // 120 'x'
+        0x00, 0x00, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x00,
+        // 121 'y'
+        0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C,
+        // 122 'z'
+        0x00, 0x00, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00,
+        // 123 '{'
+        0x0E, 0x18, 0x18, 0x70, 0x18, 0x18, 0x0E, 0x00,
+        // 124 '|'
+        0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00,
+        // 125 '}'
+        0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0x00,
+        // 126 '~'
+        0x32, 0x4C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        // 127 DEL (placeholder)
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ]
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Default)]
-pub struct TextChar {
-    pub x: f32,
-    pub y: f32,
-    pub char_code: u32,
-    pub color: u32,
-}
-
-const SDF_BATCH_SHADER: &str = r#"
+const TEXT_SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
 using namespace metal;
 
-struct TextSegment {
+struct TextUniforms {
+    float2 screen_size;
+    float scale;
+    float _padding;
+};
+
+struct TextChar {
     float x;
     float y;
-    float font_size;
-    uint start_char;
-    uint char_count;
-    float4 color;
-    float3 _padding;
+    uint char_code;
+    uint color;
 };
-
-struct GlyphMetric {
-    float advance;
-    float _pad1;
-    float _pad2;
-    float _pad3;
-    float4 bounds;
-    uint atlas_x;
-    uint atlas_y;
-    uint _pad4;
-    uint _pad5;
-};
-
-struct LayoutParams {
-    float screen_width;
-    float screen_height;
-    uint segment_count;
-    uint _padding;
-};
-
-struct SdfTextVertex {
-    float2 position;
-    float2 uv;
-    float4 color;
-};
-
-constant uint SDF_SIZE = 48;
-constant uint ATLAS_WIDTH = 500;
-constant uint ATLAS_HEIGHT = 500;
-constant float UNITS_PER_EM = 2048.0;
-
-// Find which segment this character belongs to
-kernel void sdf_batch_layout(
-    device SdfTextVertex* vertices [[buffer(0)]],
-    device const uchar* text [[buffer(1)]],
-    device const TextSegment* segments [[buffer(2)]],
-    device const GlyphMetric* metrics [[buffer(3)]],
-    constant LayoutParams& params [[buffer(4)]],
-    uint gid [[thread_position_in_grid]]
-) {
-    // Find which segment this global char index belongs to
-    uint char_idx = gid;
-    uint seg_idx = 0;
-    uint local_idx = char_idx;
-    uint global_offset = 0;
-
-    for (uint s = 0; s < params.segment_count; s++) {
-        if (char_idx < global_offset + segments[s].char_count) {
-            seg_idx = s;
-            local_idx = char_idx - global_offset;
-            break;
-        }
-        global_offset += segments[s].char_count;
-    }
-
-    if (char_idx >= global_offset + segments[seg_idx].char_count) {
-        // Out of bounds - write zero vertices
-        uint base = gid * 6;
-        for (uint i = 0; i < 6; i++) {
-            vertices[base + i] = SdfTextVertex{float2(0), float2(0), float4(0)};
-        }
-        return;
-    }
-
-    TextSegment seg = segments[seg_idx];
-    float scale = seg.font_size / UNITS_PER_EM;
-
-    // Get character
-    uchar c = text[seg.start_char + local_idx];
-    if (c < 32 || c > 126) c = 32;
-    uint glyph_idx = c - 32;
-    GlyphMetric m = metrics[glyph_idx];
-
-    // Calculate cursor X by summing advances of previous chars in this segment
-    float cursor_x = seg.x;
-    for (uint i = 0; i < local_idx; i++) {
-        uchar prev_c = text[seg.start_char + i];
-        if (prev_c < 32 || prev_c > 126) prev_c = 32;
-        cursor_x += metrics[prev_c - 32].advance * scale;
-    }
-
-    // Glyph bounds
-    float glyph_width = m.bounds.z - m.bounds.x;
-    float glyph_height = m.bounds.w - m.bounds.y;
-
-    // Position
-    float x = cursor_x + m.bounds.x * scale;
-    float y = seg.y - m.bounds.w * scale;
-    float w = glyph_width * scale;
-    float h = glyph_height * scale;
-
-    uint base = gid * 6;
-
-    // Skip space or empty glyphs
-    if (c == 32 || glyph_width <= 0 || glyph_height <= 0) {
-        for (uint i = 0; i < 6; i++) {
-            vertices[base + i] = SdfTextVertex{float2(0), float2(0), float4(0)};
-        }
-        return;
-    }
-
-    // UV coordinates
-    float u0 = float(m.atlas_x) / float(ATLAS_WIDTH);
-    float v0 = float(m.atlas_y) / float(ATLAS_HEIGHT);
-    float u1 = float(m.atlas_x + SDF_SIZE) / float(ATLAS_WIDTH);
-    float v1 = float(m.atlas_y + SDF_SIZE) / float(ATLAS_HEIGHT);
-
-    // Generate quad (2 triangles)
-    vertices[base + 0] = SdfTextVertex{float2(x, y), float2(u0, v1), seg.color};
-    vertices[base + 1] = SdfTextVertex{float2(x, y + h), float2(u0, v0), seg.color};
-    vertices[base + 2] = SdfTextVertex{float2(x + w, y + h), float2(u1, v0), seg.color};
-    vertices[base + 3] = SdfTextVertex{float2(x, y), float2(u0, v1), seg.color};
-    vertices[base + 4] = SdfTextVertex{float2(x + w, y + h), float2(u1, v0), seg.color};
-    vertices[base + 5] = SdfTextVertex{float2(x + w, y), float2(u1, v1), seg.color};
-}
 
 struct VertexOut {
     float4 position [[position]];
@@ -524,38 +544,76 @@ struct VertexOut {
     float4 color;
 };
 
-vertex VertexOut sdf_vertex(
-    device const SdfTextVertex* vertices [[buffer(0)]],
-    constant float2& screen_size [[buffer(1)]],
-    uint vid [[vertex_id]]
+vertex VertexOut text_vertex(
+    uint vid [[vertex_id]],
+    constant TextUniforms& uniforms [[buffer(0)]],
+    constant TextChar* chars [[buffer(1)]]
 ) {
-    SdfTextVertex v = vertices[vid];
+    uint char_idx = vid / 6;
+    uint vert_idx = vid % 6;
+
+    TextChar ch = chars[char_idx];
+
+    // Unpack color (RGBA: 0xRRGGBBAA)
+    float4 color;
+    color.r = float((ch.color >> 24) & 0xFF) / 255.0;
+    color.g = float((ch.color >> 16) & 0xFF) / 255.0;
+    color.b = float((ch.color >> 8) & 0xFF) / 255.0;
+    color.a = float(ch.color & 0xFF) / 255.0;
+
+    // Character cell size (scaled)
+    float char_w = 8.0 * uniforms.scale;
+    float char_h = 8.0 * uniforms.scale;
+
+    // Quad vertices (two triangles)
+    float2 positions[6] = {
+        float2(0, 0), float2(char_w, 0), float2(char_w, char_h),
+        float2(0, 0), float2(char_w, char_h), float2(0, char_h)
+    };
+
+    // UV coordinates within cell (0-1)
+    float2 uvs[6] = {
+        float2(0, 0), float2(1, 0), float2(1, 1),
+        float2(0, 0), float2(1, 1), float2(0, 1)
+    };
+
+    float2 pos = float2(ch.x, ch.y) + positions[vert_idx];
 
     // Convert to clip space
-    float2 ndc = (v.position / screen_size) * 2.0 - 1.0;
+    float2 ndc = (pos / uniforms.screen_size) * 2.0 - 1.0;
     ndc.y = -ndc.y;
+
+    // Calculate UV based on character code
+    // Texture is 128x48 with 16x6 character grid
+    uint ascii = ch.char_code;
+    if (ascii < 32 || ascii > 127) ascii = 32;
+    uint idx = ascii - 32;
+    uint col = idx % 16;
+    uint row = idx / 16;
+
+    float cell_u = 8.0 / 128.0;
+    float cell_v = 8.0 / 48.0;
+
+    float2 uv_base = float2(float(col) * cell_u, float(row) * cell_v);
+    float2 uv_offset = uvs[vert_idx] * float2(cell_u, cell_v);
 
     VertexOut out;
     out.position = float4(ndc, 0.0, 1.0);
-    out.uv = v.uv;
-    out.color = v.color;
+    out.uv = uv_base + uv_offset;
+    out.color = color;
     return out;
 }
 
-fragment float4 sdf_fragment(
+fragment float4 text_fragment(
     VertexOut in [[stage_in]],
-    texture2d<float> atlas [[texture(0)]]
+    texture2d<float> font_tex [[texture(0)]]
 ) {
-    constexpr sampler samp(mag_filter::linear, min_filter::linear);
-    float d = atlas.sample(samp, in.uv).r;
+    constexpr sampler samp(mag_filter::nearest, min_filter::nearest);
+    float glyph = font_tex.sample(samp, in.uv).r;
 
-    // SDF threshold with anti-aliasing
-    float edge = 0.5;
-    float aa = fwidth(d) * 0.75;
-    float alpha = smoothstep(edge - aa, edge + aa, d);
+    // Discard transparent pixels
+    if (glyph < 0.5) discard_fragment();
 
-    if (alpha < 0.01) discard_fragment();
-
-    return float4(in.color.rgb, in.color.a * alpha);
+    return in.color;
 }
 "#;
