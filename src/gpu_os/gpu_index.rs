@@ -20,7 +20,7 @@ use std::path::Path;
 use std::mem;
 
 use super::mmap_buffer::{MmapBuffer, MmapError, PAGE_SIZE, align_to_page};
-use super::gpu_io::{GpuIOQueue, GpuIOFileHandle, IOPriority, IOQueueType};
+use super::gpu_io::{GpuIOQueue, GpuIOFileHandle, GpuIOCommandBuffer, IOPriority, IOQueueType};
 
 // ============================================================================
 // Constants
@@ -402,6 +402,97 @@ impl GpuResidentIndex {
         matches!(self.storage, IndexStorage::GpuDirect { .. })
     }
 
+    /// Smart load: auto-detects cache status and picks optimal method.
+    ///
+    /// **This is the recommended loading method.**
+    ///
+    /// Strategy:
+    /// - Probes file with small read to detect if it's in page cache
+    /// - Hot cache (< 500µs probe): uses mmap (249 GB/s, zero copy)
+    /// - Cold cache (> 500µs probe): uses GPU-direct (CPU free during I/O)
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Just use load_smart - it picks the best method automatically
+    /// let index = GpuResidentIndex::load_smart(&device, "index.bin")?;
+    /// println!("Loaded via: {}", if index.is_gpu_direct() { "GPU-direct" } else { "mmap" });
+    /// ```
+    pub fn load_smart(device: &Device, path: impl AsRef<Path>) -> Result<Self, IndexError> {
+        let path = path.as_ref();
+
+        // Probe: read first 4KB to detect cache status
+        // Hot cache: < 500µs (data in RAM)
+        // Cold cache: > 500µs (needs disk I/O)
+        let probe_start = std::time::Instant::now();
+        let file = std::fs::File::open(path).map_err(IndexError::IoError)?;
+        let mut probe_buf = [0u8; 4096];
+        use std::io::Read;
+        let _ = std::io::BufReader::new(&file).read(&mut probe_buf);
+        let probe_time = probe_start.elapsed();
+
+        // Threshold: 500µs distinguishes RAM access from disk access
+        let is_hot = probe_time < std::time::Duration::from_micros(500);
+
+        if is_hot {
+            // Hot cache: mmap is 20x faster (zero copy)
+            Self::load(device, path)
+        } else {
+            // Cold cache: GPU-direct keeps CPU free during disk I/O
+            // Fall back to mmap if GPU-direct fails (older hardware)
+            Self::load_gpu_direct(device, path)
+                .or_else(|_| Self::load(device, path))
+        }
+    }
+
+    /// Smart async load: starts loading and returns immediately.
+    ///
+    /// Returns a handle that can be polled for completion.
+    /// CPU is free to do other work while GPU loads the file.
+    ///
+    /// Best for: Loading in background while UI remains responsive.
+    pub fn load_async(device: &Device, path: impl AsRef<Path>) -> Result<AsyncIndexLoad, IndexError> {
+        let path = path.as_ref().to_path_buf();
+
+        // Get file size
+        let file_size = std::fs::metadata(&path)
+            .map_err(IndexError::IoError)?
+            .len() as usize;
+
+        if file_size < PAGE_SIZE {
+            return Err(IndexError::InvalidFormat("File too small for header".into()));
+        }
+
+        // Create IO queue
+        let io_queue = GpuIOQueue::new(device, IOPriority::High, IOQueueType::Concurrent)
+            .ok_or_else(|| IndexError::InvalidFormat("Failed to create GPU I/O queue".into()))?;
+
+        // Open file for GPU I/O
+        let file_handle = GpuIOFileHandle::open(device, &path)
+            .ok_or_else(|| IndexError::InvalidFormat("Failed to open file for GPU I/O".into()))?;
+
+        // Allocate GPU buffer
+        let aligned_size = align_to_page(file_size);
+        let buffer = device.new_buffer(
+            aligned_size as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Create and start I/O command
+        let cmd_buffer = io_queue.command_buffer()
+            .ok_or_else(|| IndexError::InvalidFormat("Failed to create I/O command buffer".into()))?;
+
+        cmd_buffer.load_buffer(&buffer, 0, file_size as u64, &file_handle, 0);
+        cmd_buffer.commit();
+
+        Ok(AsyncIndexLoad {
+            cmd_buffer,
+            buffer,
+            file_size,
+            _file_handle: file_handle,
+            _io_queue: io_queue,
+        })
+    }
+
     /// Build an index from a directory tree and save to disk.
     ///
     /// This scans the filesystem (slow) and writes entries in GPU-friendly format.
@@ -653,6 +744,75 @@ impl GpuResidentIndex {
             .filter(|e| path_set.contains(e.path_str()))
             .map(|e| e.size)
             .sum()
+    }
+}
+
+// ============================================================================
+// Async Index Loading
+// ============================================================================
+
+/// Handle for an in-progress async index load.
+///
+/// Allows CPU to do other work while GPU loads the file.
+pub struct AsyncIndexLoad {
+    cmd_buffer: GpuIOCommandBuffer,
+    buffer: Buffer,
+    file_size: usize,
+    _file_handle: GpuIOFileHandle,
+    _io_queue: GpuIOQueue,
+}
+
+impl AsyncIndexLoad {
+    /// Check if loading is complete (non-blocking).
+    pub fn is_complete(&self) -> bool {
+        use super::gpu_io::IOStatus;
+        self.cmd_buffer.status() == IOStatus::Complete
+    }
+
+    /// Wait for loading to complete and return the index.
+    ///
+    /// Blocks until GPU finishes loading.
+    pub fn wait(self) -> Result<GpuResidentIndex, IndexError> {
+        self.cmd_buffer.wait_until_completed();
+
+        // Validate header
+        let header = unsafe { &*(self.buffer.contents() as *const IndexHeader) };
+
+        if header.magic != INDEX_MAGIC {
+            return Err(IndexError::InvalidFormat("Invalid magic number".into()));
+        }
+
+        if header.version != INDEX_VERSION {
+            return Err(IndexError::InvalidFormat(format!(
+                "Version mismatch: expected {}, got {}",
+                INDEX_VERSION, header.version
+            )));
+        }
+
+        let expected_size = PAGE_SIZE + (header.entry_count as usize * GPU_ENTRY_SIZE);
+        if self.file_size < expected_size {
+            return Err(IndexError::InvalidFormat("File truncated".into()));
+        }
+
+        Ok(GpuResidentIndex {
+            storage: IndexStorage::GpuDirect {
+                buffer: self.buffer,
+                file_size: self.file_size,
+            },
+            entry_count: header.entry_count,
+            entries_offset: PAGE_SIZE,
+        })
+    }
+
+    /// Try to get the index if loading is complete (non-blocking).
+    ///
+    /// Returns `None` if still loading.
+    pub fn try_get(self) -> Result<Option<GpuResidentIndex>, IndexError> {
+        if self.is_complete() {
+            self.wait().map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
