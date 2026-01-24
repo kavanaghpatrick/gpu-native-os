@@ -13,7 +13,7 @@ use metal::*;
 use objc::{rc::autoreleasepool, runtime::YES};
 use rust_experiment::gpu_os::document::{
     GpuLayoutEngine, GpuPaintEngine, GpuParser, GpuStyler, GpuTokenizer, PaintVertex, Stylesheet,
-    Viewport, FLAG_TEXT,
+    Viewport, FLAG_TEXT, FLAG_BACKGROUND, FLAG_BORDER,
 };
 use rust_experiment::gpu_os::text_render::{BitmapFont, TextRenderer};
 use std::mem;
@@ -142,6 +142,9 @@ impl DocumentViewer {
         attachment.set_blending_enabled(true);
         attachment.set_source_rgb_blend_factor(MTLBlendFactor::SourceAlpha);
         attachment.set_destination_rgb_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
+        // Add missing alpha blend factors (identified by agents 1 & 7)
+        attachment.set_source_alpha_blend_factor(MTLBlendFactor::One);
+        attachment.set_destination_alpha_blend_factor(MTLBlendFactor::OneMinusSourceAlpha);
 
         let render_pipeline = device
             .new_render_pipeline_state(&pipeline_desc)
@@ -229,17 +232,25 @@ impl DocumentViewer {
         encoder.set_render_pipeline_state(&self.render_pipeline);
         encoder.set_vertex_buffer(0, Some(&self.vertex_buffer), 0);
         encoder.set_vertex_buffer(1, Some(&self.uniform_buffer), 0);
+        // Draw document backgrounds - restored to test in isolation (no text rendering)
         encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, self.vertex_count as u64);
+        encoder.end_encoding();
 
-        // Draw text
+        // Draw text - create new render pass with LoadAction::Load to preserve backgrounds
+        let text_render_pass_desc = RenderPassDescriptor::new();
+        let text_color_attachment = text_render_pass_desc.color_attachments().object_at(0).unwrap();
+        text_color_attachment.set_texture(Some(drawable.texture()));
+        text_color_attachment.set_load_action(MTLLoadAction::Load);
+        text_color_attachment.set_store_action(MTLStoreAction::Store);
+
+        let text_encoder = command_buffer.new_render_command_encoder(&text_render_pass_desc);
         self.text_renderer.render(
-            encoder,
+            &text_encoder,
             &self.font,
             WINDOW_WIDTH as f32,
             WINDOW_HEIGHT as f32,
         );
-
-        encoder.end_encoding();
+        text_encoder.end_encoding();
 
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
@@ -381,21 +392,62 @@ fn process_document(device: &Device) -> (Vec<Vertex>, Vec<TextItem>, f32) {
     let elapsed = start.elapsed();
     println!("Pipeline time: {:?}", elapsed);
 
+    // Verify paint vertices are valid (no uninitialized data)
+    let mut flag_counts = std::collections::HashMap::new();
+    for pv in &paint_vertices {
+        *flag_counts.entry(pv.flags).or_insert(0) += 1;
+    }
+    if flag_counts.contains_key(&0) {
+        println!("  WARNING: {} uninitialized (flag=0) vertices!", flag_counts.get(&0).unwrap());
+    }
+
     // Convert to simple vertices (backgrounds only) and extract text items
     let mut vertices = Vec::new();
     let mut text_items = Vec::new();
     let mut document_height: f32 = 0.0;
 
-    // Process paint vertices
-    for i in (0..paint_vertices.len()).step_by(4) {
-        if i + 3 >= paint_vertices.len() {
-            break;
-        }
+    // Helper function to validate vertex data
+    let is_valid_position = |p: &[f32; 2]| -> bool {
+        // NDC positions should be in reasonable range (allow some overflow for scrolling)
+        let valid_range = -10.0..10.0;
+        valid_range.contains(&p[0]) && valid_range.contains(&p[1])
+            && !p[0].is_nan() && !p[1].is_nan()
+            && !p[0].is_infinite() && !p[1].is_infinite()
+    };
 
+    let is_valid_color = |c: &[f32; 4]| -> bool {
+        // Colors should be in [0, 1] range
+        c.iter().all(|&v| v >= 0.0 && v <= 1.0 && !v.is_nan() && !v.is_infinite())
+    };
+
+    let colors_similar = |c1: &[f32; 4], c2: &[f32; 4]| -> bool {
+        // For solid backgrounds, all vertices should have the same color
+        const EPSILON: f32 = 0.01;
+        (c1[0] - c2[0]).abs() < EPSILON
+            && (c1[1] - c2[1]).abs() < EPSILON
+            && (c1[2] - c2[2]).abs() < EPSILON
+            && (c1[3] - c2[3]).abs() < EPSILON
+    };
+
+    // Process paint vertices - handle variable-length quads properly
+    // The paint kernel outputs vertices in groups, but borders use 16 vertices (4 per side)
+    // We need to process each quad by checking that all 4 vertices have consistent flags
+    let mut i = 0;
+    let mut skipped_invalid = 0;
+    while i + 3 < paint_vertices.len() {
         let v0 = &paint_vertices[i];
         let v1 = &paint_vertices[i + 1];
         let v2 = &paint_vertices[i + 2];
         let v3 = &paint_vertices[i + 3];
+
+        // Check flag consistency - all 4 vertices in a valid quad must have same flag
+        let flags_match = v0.flags == v1.flags && v1.flags == v2.flags && v2.flags == v3.flags;
+
+        // Skip if flags don't match (misaligned data) or flag is 0 (uninitialized)
+        if !flags_match || v0.flags == 0 {
+            i += 1; // Advance by 1 to try to realign
+            continue;
+        }
 
         if v0.flags == FLAG_TEXT {
             // This is a text glyph - extract text info
@@ -421,8 +473,39 @@ fn process_document(device: &Device) -> (Vec<Vertex>, Vec<TextItem>, f32) {
                     scale: 1.0,
                 });
             }
-        } else {
-            // Background quad - convert to two triangles
+            i += 4;
+        } else if v0.flags == FLAG_BACKGROUND || v0.flags == FLAG_BORDER {
+            // Validate ALL vertex positions and colors
+            let positions_valid = is_valid_position(&v0.position)
+                && is_valid_position(&v1.position)
+                && is_valid_position(&v2.position)
+                && is_valid_position(&v3.position);
+
+            let colors_valid = is_valid_color(&v0.color)
+                && is_valid_color(&v1.color)
+                && is_valid_color(&v2.color)
+                && is_valid_color(&v3.color);
+
+            // For backgrounds, all vertices should have the same color (solid fill)
+            let colors_consistent = v0.flags != FLAG_BACKGROUND || (
+                colors_similar(&v0.color, &v1.color)
+                && colors_similar(&v1.color, &v2.color)
+                && colors_similar(&v2.color, &v3.color)
+            );
+
+            // Skip if data validation fails
+            if !positions_valid || !colors_valid || !colors_consistent {
+                skipped_invalid += 1;
+                i += 4;
+                continue;
+            }
+
+            // Skip if color alpha is zero (invisible)
+            if v0.color[3] <= 0.0 {
+                i += 4;
+                continue;
+            }
+
             let to_vertex = |pv: &PaintVertex| Vertex {
                 position: pv.position,
                 color: pv.color,
@@ -443,14 +526,35 @@ fn process_document(device: &Device) -> (Vec<Vertex>, Vec<TextItem>, f32) {
                 let screen_y = (1.0 - v.position[1]) * 0.5 * WINDOW_HEIGHT as f32;
                 document_height = document_height.max(screen_y);
             }
+
+            i += 4;
+        } else {
+            // Unknown flag - skip this vertex and try to realign
+            i += 1;
         }
     }
+
+    if skipped_invalid > 0 {
+        println!("  Skipped {} invalid quads", skipped_invalid);
+    }
+
+    // Element types to skip (script, style contain non-visible text)
+    const ELEM_STYLE: u32 = 107;
+    const ELEM_SCRIPT: u32 = 108;
 
     // Extract text from elements and position them
     let mut real_text_items = Vec::new();
     for (i, elem) in elements.iter().enumerate() {
         if elem.element_type == 100 && elem.text_length > 0 {
-            // Text node
+            // Text node - skip if parent is script or style
+            let parent_idx = elem.parent as usize;
+            if parent_idx < elements.len() {
+                let parent_type = elements[parent_idx].element_type;
+                if parent_type == ELEM_SCRIPT || parent_type == ELEM_STYLE {
+                    continue; // Skip script/style content
+                }
+            }
+
             let start = elem.text_start as usize;
             let end = (elem.text_start + elem.text_length) as usize;
             if end <= text_buffer.len() {

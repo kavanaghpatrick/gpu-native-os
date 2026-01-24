@@ -63,8 +63,8 @@ struct SdfLayoutParams {
 };
 
 // Constants matching atlas_data.rs
-constant uint SDF_SIZE = 48;
-constant uint ATLAS_WIDTH = 500;
+constant uint SDF_SIZE = 64;
+constant uint ATLAS_WIDTH = 660;
 constant uint ATLAS_HEIGHT = 500;
 constant float UNITS_PER_EM = 2048.0;
 constant float SPREAD = 8.0;
@@ -173,12 +173,16 @@ fragment float4 sdf_text_fragment(
     float distance = atlas.sample(s, in.uv).r;
 
     // SDF: 0.5 = edge, <0.5 = inside, >0.5 = outside
+    // Adaptive AA: use screen-space derivative but clamp for crispness
     float edge = 0.5;
-    float width = fwidth(distance) * 0.75;
+    float screenAA = fwidth(distance);
+    float width = clamp(screenAA, 0.01, 0.08);  // Crisp but smooth edges
     float alpha = smoothstep(edge - width, edge + width, distance);
 
     // Invert because our SDF has inside < 0.5
     alpha = 1.0 - alpha;
+
+    if (alpha < 0.01) discard_fragment();
 
     return float4(in.color.rgb, in.color.a * alpha);
 }

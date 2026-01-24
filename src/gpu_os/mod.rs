@@ -7,10 +7,10 @@ pub mod input;       // #13 - Input Pipeline
 pub mod layout;      // #14 - Layout Engine
 pub mod widget;      // #15 - Widget System
 pub mod text;        // #16 - Text Rendering (MSDF - partial)
-pub mod text_render; // Simple bitmap font text rendering
+pub mod text_render; // Simple bitmap font text rendering (production)
 pub mod render;      // #17 - Hybrid Rendering
 pub mod vsync;       // #18 - VSync Execution
-pub mod sdf_text;    // #33 - SDF Text Engine (new)
+// sdf_text archived - see archive/sdf_text/ (was buggy, future: direct bezier rendering)
 
 // Application framework
 pub mod app;         // GpuApp trait and GpuRuntime

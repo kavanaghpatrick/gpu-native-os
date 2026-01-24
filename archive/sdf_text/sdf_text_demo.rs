@@ -157,7 +157,7 @@ impl SdfTextDemoApp {
             let vertex_count = char_count * 6;
 
             // Layout this text at the current offset
-            sdf_renderer.layout_text_at_offset(
+            sdf_renderer.layout_text(
                 &compute_encoder,
                 text,
                 *x,
@@ -167,7 +167,7 @@ impl SdfTextDemoApp {
                 screen_w,
                 screen_h,
                 sdf_vb,
-                vertex_offset,
+                vertex_offset as u64,
             );
 
             text_ranges.push((vertex_offset, vertex_count));
@@ -191,16 +191,10 @@ impl SdfTextDemoApp {
         sdf_renderer.render(render_encoder, sdf_vb, total_vertices, screen_w, screen_h);
 
         // Render bitmap UI text
-        if let (Some(text_renderer), Some(bitmap_font)) = (
-            self.text_renderer.as_mut(),
-            self.bitmap_font.as_ref(),
-        ) {
+        if let Some(text_renderer) = self.text_renderer.as_mut() {
             text_renderer.clear();
-            text_renderer.scale = 1.5;
-            text_renderer.add_text("SDF Text Engine - Issue #33", 20.0, 30.0, 0xFFFFFFFF);
-            text_renderer.scale = 1.2;
-            text_renderer.add_text("GPU-Native Rendering with Embedded Atlas", 20.0, 55.0, 0xAAAAAAFF);
-            text_renderer.scale = 1.0;
+            text_renderer.add_text_scaled("SDF Text Engine - Issue #33", 20.0, 30.0, 0xFFFFFFFF, 1.5);
+            text_renderer.add_text_scaled("GPU-Native Rendering with Embedded Atlas", 20.0, 55.0, 0xAAAAAAFF, 1.2);
             text_renderer.add_text(
                 &format!("Font Size: {:.0}pt (UP/DOWN)", self.font_size),
                 20.0, 85.0, 0x88FF88FF);
@@ -216,11 +210,22 @@ impl SdfTextDemoApp {
             text_renderer.add_text("  Phase 6: Integration [IN PROGRESS]", 20.0, y + 60.0, 0xFFAA44FF);
             text_renderer.add_text("100% GPU-native - no CPU per-frame work", 20.0, y + 100.0, 0x66FF66FF);
             text_renderer.add_text("Press ESC to exit", 20.0, y + 140.0, 0x666666FF);
-
-            text_renderer.render(render_encoder, bitmap_font, screen_w, screen_h);
         }
 
         render_encoder.end_encoding();
+
+        // Render text with its own pass (preserves SDF content)
+        if let (Some(text_renderer), Some(font)) = (self.text_renderer.as_mut(), self.bitmap_font.as_ref()) {
+            let text_pass = RenderPassDescriptor::new();
+            let text_attachment = text_pass.color_attachments().object_at(0).unwrap();
+            text_attachment.set_texture(Some(drawable.texture()));
+            text_attachment.set_load_action(MTLLoadAction::Load);
+            text_attachment.set_store_action(MTLStoreAction::Store);
+
+            let text_encoder = command_buffer.new_render_command_encoder(&text_pass);
+            text_renderer.render(&text_encoder, font, screen_w, screen_h);
+            text_encoder.end_encoding();
+        }
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
 

@@ -16,6 +16,7 @@ const MAX_VERTICES: usize = MAX_ELEMENTS * 64;  // Up to 64 vertices per element
 pub const FLAG_BACKGROUND: u32 = 1;
 pub const FLAG_BORDER: u32 = 2;
 pub const FLAG_TEXT: u32 = 4;
+pub const FLAG_IMAGE: u32 = 8;
 
 /// Paint vertex for GPU rendering
 #[repr(C)]

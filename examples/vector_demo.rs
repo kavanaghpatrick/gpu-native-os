@@ -9,12 +9,15 @@ use cocoa::{appkit::NSView, base::id as cocoa_id};
 use core_graphics_types::geometry::CGSize;
 use metal::*;
 use objc::{rc::autoreleasepool, runtime::YES};
-use rust_experiment::gpu_os::vector::{Color, PathBuilder, VectorRenderer};
+use rust_experiment::gpu_os::vector::{
+    AntiAliasMode, Color, GradientStop, LinearGradient, Paint, PathBuilder, RadialGradient, VectorRenderer,
+};
 use std::time::Instant;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Window, WindowId},
 };
@@ -59,6 +62,13 @@ impl VectorDemoApp {
         println!("  - Bezier path rendering");
         println!("  - Shapes: rect, rounded rect, circle, ellipse");
         println!("  - Solid color fills");
+        println!("  - Linear gradients (Issue #35)");
+        println!("  - Radial gradients (Issue #35)");
+        println!("  - Anti-aliasing (Issue #36)");
+        println!("\nControls:");
+        println!("  1 - AA Off");
+        println!("  2 - AA Fast (default)");
+        println!("  3 - AA Quality");
 
         // Create Metal layer
         let layer = MetalLayer::new();
@@ -152,10 +162,72 @@ impl VectorDemoApp {
         path.close();
         renderer.fill_color(&path.build(), Color::YELLOW);
 
-        // 5. Rounded rect
+        // 5. Rounded rect with solid color
         let mut path = PathBuilder::new();
         path.rounded_rect(700.0, 400.0, 200.0, 150.0, 20.0);
         renderer.fill_color(&path.build(), Color::MAGENTA);
+
+        // === Issue #35: Gradient Demos ===
+
+        // 6. Linear gradient rectangle (horizontal red to blue)
+        let mut path = PathBuilder::new();
+        path.rect(700.0, 100.0, 200.0, 100.0);
+        let linear_grad = LinearGradient::new(
+            [700.0, 100.0],  // start
+            [900.0, 100.0],  // end (horizontal)
+            vec![
+                GradientStop::new(0.0, Color::RED),
+                GradientStop::new(0.5, Color::YELLOW),
+                GradientStop::new(1.0, Color::BLUE),
+            ],
+        );
+        renderer.fill(&path.build(), Paint::Linear(linear_grad));
+
+        // 7. Linear gradient rectangle (vertical with animation)
+        let mut path = PathBuilder::new();
+        path.rect(700.0, 220.0, 200.0, 100.0);
+        let anim_offset = (time * 0.5).sin() * 50.0;
+        let linear_grad = LinearGradient::new(
+            [700.0, 220.0 + anim_offset],  // start (animated)
+            [700.0, 320.0 + anim_offset],  // end
+            vec![
+                GradientStop::new(0.0, Color::CYAN),
+                GradientStop::new(1.0, Color::MAGENTA),
+            ],
+        );
+        renderer.fill(&path.build(), Paint::Linear(linear_grad));
+
+        // 8. Radial gradient circle
+        let rad_cx = 200.0;
+        let rad_cy = 650.0;
+        let rad_r = 70.0;
+        let mut path = PathBuilder::new();
+        path.circle(rad_cx, rad_cy, rad_r);
+        let radial_grad = RadialGradient::new(
+            [rad_cx, rad_cy],  // center
+            rad_r,             // radius
+            vec![
+                GradientStop::new(0.0, Color::WHITE),
+                GradientStop::new(0.5, Color::YELLOW),
+                GradientStop::new(1.0, Color::RED),
+            ],
+        );
+        renderer.fill(&path.build(), Paint::Radial(radial_grad));
+
+        // 9. Radial gradient rounded rect (sunset effect)
+        let mut path = PathBuilder::new();
+        path.rounded_rect(400.0, 600.0, 200.0, 100.0, 15.0);
+        let sunset_grad = RadialGradient::new(
+            [500.0, 650.0],  // center
+            150.0,           // radius
+            vec![
+                GradientStop::new(0.0, Color::from_hex(0xFFFF00)),  // Yellow
+                GradientStop::new(0.3, Color::from_hex(0xFF8800)),  // Orange
+                GradientStop::new(0.6, Color::from_hex(0xFF0044)),  // Red-pink
+                GradientStop::new(1.0, Color::from_hex(0x440088)),  // Purple
+            ],
+        );
+        renderer.fill(&path.build(), Paint::Radial(sunset_grad));
 
         // === Render ===
         let command_buffer = command_queue.new_command_buffer();
@@ -186,9 +258,15 @@ impl VectorDemoApp {
         if self.frame_count % 120 == 0 {
             let elapsed = self.start_time.elapsed().as_secs_f32();
             let fps = self.frame_count as f32 / elapsed;
+            let aa_mode = renderer.aa_mode();
+            let aa_str = match aa_mode {
+                AntiAliasMode::None => "Off",
+                AntiAliasMode::Fast => "Fast",
+                AntiAliasMode::Quality => "Quality",
+            };
             println!(
-                "Frame {} | {:.1} FPS | {} vertices",
-                self.frame_count, fps, self.last_vertex_count
+                "Frame {} | {:.1} FPS | {} vertices | AA: {}",
+                self.frame_count, fps, self.last_vertex_count, aa_str
             );
         }
     }
@@ -223,6 +301,29 @@ impl ApplicationHandler for VectorDemoApp {
                 WindowEvent::Resized(size) => {
                     if let Some(layer) = &self.layer {
                         layer.set_drawable_size(CGSize::new(size.width as f64, size.height as f64));
+                    }
+                }
+                WindowEvent::KeyboardInput { event, .. } => {
+                    if event.state == ElementState::Pressed {
+                        if let PhysicalKey::Code(key) = event.physical_key {
+                            if let Some(renderer) = &mut self.renderer {
+                                match key {
+                                    KeyCode::Digit1 => {
+                                        renderer.set_aa_mode(AntiAliasMode::None);
+                                        println!("AA Mode: Off");
+                                    }
+                                    KeyCode::Digit2 => {
+                                        renderer.set_aa_mode(AntiAliasMode::Fast);
+                                        println!("AA Mode: Fast");
+                                    }
+                                    KeyCode::Digit3 => {
+                                        renderer.set_aa_mode(AntiAliasMode::Quality);
+                                        println!("AA Mode: Quality");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}

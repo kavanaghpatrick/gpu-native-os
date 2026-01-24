@@ -12,6 +12,34 @@ pub const SEL_UNIVERSAL: u32 = 0;
 pub const SEL_TAG: u32 = 1;
 pub const SEL_CLASS: u32 = 2;
 pub const SEL_ID: u32 = 3;
+pub const SEL_ATTRIBUTE: u32 = 4;
+pub const SEL_PSEUDO: u32 = 5;
+
+// Combinator types
+pub const COMB_NONE: u32 = 0;
+pub const COMB_DESCENDANT: u32 = 1;  // E F (space)
+pub const COMB_CHILD: u32 = 2;       // E > F
+pub const COMB_ADJACENT: u32 = 3;    // E + F
+pub const COMB_SIBLING: u32 = 4;     // E ~ F
+
+// Attribute match operators
+pub const ATTR_EXISTS: u32 = 0;      // [attr]
+pub const ATTR_EQUALS: u32 = 1;      // [attr=val]
+pub const ATTR_CONTAINS: u32 = 2;    // [attr*=val]
+pub const ATTR_STARTS: u32 = 3;      // [attr^=val]
+pub const ATTR_ENDS: u32 = 4;        // [attr$=val]
+pub const ATTR_WORD: u32 = 5;        // [attr~=val]
+pub const ATTR_LANG: u32 = 6;        // [attr|=val]
+
+// Pseudo-class types
+pub const PSEUDO_FIRST_CHILD: u32 = 1;
+pub const PSEUDO_LAST_CHILD: u32 = 2;
+pub const PSEUDO_NTH_CHILD: u32 = 3;
+pub const PSEUDO_FIRST_OF_TYPE: u32 = 4;
+pub const PSEUDO_LAST_OF_TYPE: u32 = 5;
+pub const PSEUDO_ONLY_CHILD: u32 = 6;
+pub const PSEUDO_EMPTY: u32 = 7;
+pub const PSEUDO_ROOT: u32 = 8;
 
 // Display values
 pub const DISPLAY_NONE: u32 = 0;
@@ -19,6 +47,9 @@ pub const DISPLAY_BLOCK: u32 = 1;
 pub const DISPLAY_INLINE: u32 = 2;
 pub const DISPLAY_FLEX: u32 = 3;
 pub const DISPLAY_INLINE_BLOCK: u32 = 4;
+pub const DISPLAY_TABLE: u32 = 5;
+pub const DISPLAY_TABLE_ROW: u32 = 6;
+pub const DISPLAY_TABLE_CELL: u32 = 7;
 
 // Flex direction
 pub const FLEX_ROW: u32 = 0;
@@ -42,6 +73,26 @@ pub const TEXT_LEFT: u32 = 0;
 pub const TEXT_CENTER: u32 = 1;
 pub const TEXT_RIGHT: u32 = 2;
 
+// CSS Position values
+pub const POSITION_STATIC: u32 = 0;
+pub const POSITION_RELATIVE: u32 = 1;
+pub const POSITION_ABSOLUTE: u32 = 2;
+pub const POSITION_FIXED: u32 = 3;
+
+/// Special value indicating "auto" for offset properties
+pub const OFFSET_AUTO: f32 = f32::MAX;
+
+// CSS Overflow values
+pub const OVERFLOW_VISIBLE: u32 = 0;
+pub const OVERFLOW_HIDDEN: u32 = 1;
+pub const OVERFLOW_SCROLL: u32 = 2;
+pub const OVERFLOW_AUTO: u32 = 3;
+
+// CSS Gradient types
+pub const GRADIENT_NONE: u32 = 0;
+pub const GRADIENT_LINEAR: u32 = 1;
+pub const GRADIENT_RADIAL: u32 = 2;
+
 // Property IDs
 pub const PROP_DISPLAY: u32 = 0;
 pub const PROP_WIDTH: u32 = 1;
@@ -63,21 +114,46 @@ pub const PROP_BORDER_WIDTH: u32 = 16;
 pub const PROP_BORDER_COLOR: u32 = 17;
 pub const PROP_BORDER_RADIUS: u32 = 18;
 pub const PROP_OPACITY: u32 = 19;
+pub const PROP_POSITION: u32 = 20;
+pub const PROP_TOP: u32 = 21;
+pub const PROP_RIGHT: u32 = 22;
+pub const PROP_BOTTOM: u32 = 23;
+pub const PROP_LEFT: u32 = 24;
+pub const PROP_Z_INDEX: u32 = 25;
+pub const PROP_OVERFLOW: u32 = 26;
+pub const PROP_OVERFLOW_X: u32 = 27;
+pub const PROP_OVERFLOW_Y: u32 = 28;
+pub const PROP_BOX_SHADOW: u32 = 29;        // offset_x, offset_y, blur, spread
+pub const PROP_BOX_SHADOW_COLOR: u32 = 30;  // RGBA color
+pub const PROP_BOX_SHADOW_INSET: u32 = 31;  // inset flag
+pub const PROP_GRADIENT_TYPE: u32 = 32;     // type (NONE, LINEAR, RADIAL)
+pub const PROP_GRADIENT_ANGLE: u32 = 33;    // angle in degrees
+pub const PROP_GRADIENT_STOP: u32 = 34;     // color stop (idx, pos, r, g, b, a encoded)
+pub const PROP_BORDER_COLLAPSE: u32 = 35;   // 0 = separate, 1 = collapse
+pub const PROP_BORDER_SPACING: u32 = 36;    // spacing in pixels
 
 // Buffer sizes
 pub const MAX_SELECTORS: usize = 1024;
 pub const MAX_STYLE_DEFS: usize = 4096;
 const THREAD_COUNT: u64 = 1024;
 
-/// A CSS selector
+/// A CSS selector (supports combinators and complex selectors)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Selector {
-    pub selector_type: u32,
-    pub hash: u32,
+    pub selector_type: u32,      // TAG, CLASS, ID, ATTRIBUTE, PSEUDO
+    pub hash: u32,               // Hash of tag/class/id name
     pub specificity: u32,
     pub style_start: u32,
     pub style_count: u32,
+    pub combinator: u32,         // NONE, DESCENDANT, CHILD, ADJACENT, SIBLING
+    pub next_part: i32,          // Index of next selector part (for complex selectors like "div p")
+    pub pseudo_type: u32,        // For pseudo-classes: FIRST_CHILD, NTH_CHILD, etc.
+    pub attr_name_hash: u32,     // For attribute selectors
+    pub attr_op: u32,            // ATTR_EXISTS, ATTR_EQUALS, etc.
+    pub attr_value_hash: u32,    // For attribute value matching
+    pub nth_a: i32,              // For :nth-child(an+b)
+    pub nth_b: i32,
     pub _padding: [u32; 3],
 }
 
@@ -88,6 +164,13 @@ pub struct StyleDef {
     pub property_id: u32,
     pub values: [f32; 4],
 }
+
+// Property set bitmask flags (for tracking which properties were explicitly set)
+pub const PROP_SET_COLOR: u32 = 1 << 0;
+pub const PROP_SET_FONT_SIZE: u32 = 1 << 1;
+pub const PROP_SET_LINE_HEIGHT: u32 = 1 << 2;
+pub const PROP_SET_FONT_WEIGHT: u32 = 1 << 3;
+pub const PROP_SET_TEXT_ALIGN: u32 = 1 << 4;
 
 /// Computed style for an element
 #[repr(C)]
@@ -113,7 +196,36 @@ pub struct ComputedStyle {
     pub border_color: [f32; 4],
     pub border_radius: f32,
     pub opacity: f32,
-    pub _padding: [f32; 2],
+    // CSS Positioning
+    pub position: u32,       // POSITION_STATIC, RELATIVE, ABSOLUTE, FIXED
+    pub top: f32,            // Offset from top (OFFSET_AUTO = auto)
+    pub right: f32,          // Offset from right
+    pub bottom: f32,         // Offset from bottom
+    pub left: f32,           // Offset from left
+    pub z_index: i32,        // Stacking order (0 = auto/default)
+    /// Bitmask of explicitly set properties (for inheritance)
+    pub properties_set: u32,
+    // CSS Overflow
+    pub overflow_x: u32,     // OVERFLOW_VISIBLE, HIDDEN, SCROLL, AUTO
+    pub overflow_y: u32,     // OVERFLOW_VISIBLE, HIDDEN, SCROLL, AUTO
+    // Box Shadow (up to 4 shadows)
+    pub shadow_count: u32,           // Number of shadows (0-4)
+    pub shadow_offset_x: [f32; 4],   // Horizontal offset per shadow
+    pub shadow_offset_y: [f32; 4],   // Vertical offset per shadow
+    pub shadow_blur: [f32; 4],       // Blur radius per shadow
+    pub shadow_spread: [f32; 4],     // Spread radius per shadow
+    pub shadow_color: [f32; 16],     // RGBA color per shadow (4 floats * 4 shadows)
+    pub shadow_inset: [u32; 4],      // 1 = inset, 0 = outset
+    // Gradients (up to 8 color stops)
+    pub gradient_type: u32,          // GRADIENT_NONE, LINEAR, RADIAL
+    pub gradient_angle: f32,         // Angle in degrees (for linear gradient)
+    pub gradient_stop_count: u32,    // Number of color stops (0-8)
+    pub gradient_stop_colors: [f32; 32], // RGBA color per stop (4 floats * 8 stops)
+    pub gradient_stop_positions: [f32; 8], // Position 0.0-1.0 per stop
+    // Table layout
+    pub border_collapse: u32,        // 0 = separate, 1 = collapse
+    pub border_spacing: f32,         // Spacing between cells
+    pub _padding: [f32; 2],          // Pad to maintain 16-byte alignment
 }
 
 impl Default for ComputedStyle {
@@ -139,6 +251,34 @@ impl Default for ComputedStyle {
             border_color: [0.0, 0.0, 0.0, 1.0],
             border_radius: 0.0,
             opacity: 1.0,
+            // CSS Positioning defaults
+            position: POSITION_STATIC,
+            top: OFFSET_AUTO,
+            right: OFFSET_AUTO,
+            bottom: OFFSET_AUTO,
+            left: OFFSET_AUTO,
+            z_index: 0,
+            properties_set: 0,  // No properties explicitly set
+            // CSS Overflow defaults
+            overflow_x: OVERFLOW_VISIBLE,
+            overflow_y: OVERFLOW_VISIBLE,
+            // Box Shadow defaults
+            shadow_count: 0,
+            shadow_offset_x: [0.0; 4],
+            shadow_offset_y: [0.0; 4],
+            shadow_blur: [0.0; 4],
+            shadow_spread: [0.0; 4],
+            shadow_color: [0.0; 16],
+            shadow_inset: [0; 4],
+            // Gradient defaults
+            gradient_type: GRADIENT_NONE,
+            gradient_angle: 180.0,  // Default: to bottom
+            gradient_stop_count: 0,
+            gradient_stop_colors: [0.0; 32],
+            gradient_stop_positions: [0.0; 8],
+            // Table layout defaults
+            border_collapse: 0,  // separate
+            border_spacing: 0.0,
             _padding: [0.0; 2],
         }
     }
@@ -204,10 +344,7 @@ impl Stylesheet {
                 }
             }
 
-            // Parse selector type and hash
-            let (selector_type, hash, specificity) = parse_selector(selector_str);
-
-            // Parse style definitions
+            // Parse style definitions first
             let style_start = style_defs.len() as u32;
             let mut style_count = 0u32;
 
@@ -218,7 +355,26 @@ impl Stylesheet {
                 }
 
                 if let Some((name, value)) = prop.split_once(':') {
-                    if let Some(def) = parse_property(name.trim(), value.trim()) {
+                    let name = name.trim();
+                    let value = value.trim();
+
+                    // Handle box-shadow specially (generates multiple StyleDefs)
+                    if name == "box-shadow" {
+                        let shadow_defs = parse_box_shadow(value);
+                        for def in shadow_defs {
+                            style_defs.push(def);
+                            style_count += 1;
+                        }
+                    // Handle gradients in background property
+                    } else if (name == "background" || name == "background-image")
+                        && (value.contains("linear-gradient") || value.contains("radial-gradient"))
+                    {
+                        let gradient_defs = parse_gradient(value);
+                        for def in gradient_defs {
+                            style_defs.push(def);
+                            style_count += 1;
+                        }
+                    } else if let Some(def) = parse_property(name, value) {
                         style_defs.push(def);
                         style_count += 1;
                     }
@@ -226,14 +382,14 @@ impl Stylesheet {
             }
 
             if style_count > 0 {
-                selectors.push(Selector {
-                    selector_type,
-                    hash,
-                    specificity,
-                    style_start,
-                    style_count,
-                    _padding: [0; 3],
-                });
+                // Parse selector (may be complex with combinators)
+                let base_idx = parse_full_selector(selector_str, &mut selectors);
+
+                // Update first selector with style info
+                if let Some(first) = selectors.get_mut(base_idx) {
+                    first.style_start = style_start;
+                    first.style_count = style_count;
+                }
             }
         }
 
@@ -251,20 +407,324 @@ pub fn hash_string(s: &str) -> u32 {
     hash
 }
 
-fn parse_selector(s: &str) -> (u32, u32, u32) {
+/// Selector type for combined selectors (tag.class, tag#id)
+pub const SEL_TAG_CLASS: u32 = 6;
+pub const SEL_TAG_ID: u32 = 7;
+
+/// Parse a simple selector part (tag, class, id, or pseudo-class)
+fn parse_simple_selector(s: &str) -> Selector {
     let s = s.trim();
+
+    // Check for pseudo-class
+    if let Some(pseudo_pos) = s.find(':') {
+        let (base, pseudo) = s.split_at(pseudo_pos);
+        let pseudo = &pseudo[1..];  // Remove leading ':'
+
+        let mut sel = if base.is_empty() {
+            Selector {
+                selector_type: SEL_UNIVERSAL,
+                specificity: 0,
+                ..Default::default()
+            }
+        } else {
+            parse_simple_selector(base)
+        };
+
+        // Add pseudo-class specificity
+        sel.specificity += 10;
+        sel.pseudo_type = match pseudo {
+            "first-child" => PSEUDO_FIRST_CHILD,
+            "last-child" => PSEUDO_LAST_CHILD,
+            "first-of-type" => PSEUDO_FIRST_OF_TYPE,
+            "last-of-type" => PSEUDO_LAST_OF_TYPE,
+            "only-child" => PSEUDO_ONLY_CHILD,
+            "empty" => PSEUDO_EMPTY,
+            "root" => PSEUDO_ROOT,
+            p if p.starts_with("nth-child") => {
+                // Parse nth-child(an+b)
+                if let Some(start) = p.find('(') {
+                    if let Some(end) = p.find(')') {
+                        let formula = &p[start + 1..end];
+                        let (a, b) = parse_nth_formula(formula);
+                        sel.nth_a = a;
+                        sel.nth_b = b;
+                    }
+                }
+                PSEUDO_NTH_CHILD
+            }
+            _ => 0,
+        };
+
+        return sel;
+    }
+
+    // Check for attribute selector
+    if s.contains('[') {
+        if let Some(start) = s.find('[') {
+            if let Some(end) = s.find(']') {
+                let base = &s[..start];
+                let attr_part = &s[start + 1..end];
+
+                let mut sel = if base.is_empty() {
+                    Selector {
+                        selector_type: SEL_UNIVERSAL,
+                        specificity: 0,
+                        ..Default::default()
+                    }
+                } else {
+                    parse_simple_selector(base)
+                };
+
+                sel.selector_type = SEL_ATTRIBUTE;
+                sel.specificity += 10;
+
+                // Parse attribute selector
+                if let Some(eq_pos) = attr_part.find('=') {
+                    let attr_name = attr_part[..eq_pos].trim_end_matches(|c| c == '^' || c == '$' || c == '*' || c == '~' || c == '|');
+                    let attr_value = attr_part[eq_pos + 1..].trim_matches(|c: char| c == '"' || c == '\'' || c.is_whitespace());
+
+                    sel.attr_name_hash = hash_string(attr_name);
+                    sel.attr_value_hash = hash_string(attr_value);
+
+                    // Determine operator
+                    let op_char = if eq_pos > 0 { attr_part.chars().nth(eq_pos - 1) } else { None };
+                    sel.attr_op = match op_char {
+                        Some('^') => ATTR_STARTS,
+                        Some('$') => ATTR_ENDS,
+                        Some('*') => ATTR_CONTAINS,
+                        Some('~') => ATTR_WORD,
+                        Some('|') => ATTR_LANG,
+                        _ => ATTR_EQUALS,
+                    };
+                } else {
+                    // Just [attr] - exists check
+                    sel.attr_name_hash = hash_string(attr_part.trim());
+                    sel.attr_op = ATTR_EXISTS;
+                }
+
+                return sel;
+            }
+        }
+    }
+
+    // Check for combined tag.class selector (e.g., "p.highlight")
+    if let Some(dot_pos) = s.find('.') {
+        if dot_pos > 0 {
+            // Has tag before the dot
+            let tag = &s[..dot_pos];
+            let class = &s[dot_pos + 1..];
+            return Selector {
+                selector_type: SEL_TAG_CLASS,
+                hash: hash_string(tag),          // tag hash in main hash
+                attr_name_hash: hash_string(class),  // class hash in attr_name_hash
+                specificity: 11,  // 1 (tag) + 10 (class)
+                ..Default::default()
+            };
+        }
+    }
+
+    // Check for combined tag#id selector (e.g., "div#main")
+    if let Some(hash_pos) = s.find('#') {
+        if hash_pos > 0 {
+            // Has tag before the hash
+            let tag = &s[..hash_pos];
+            let id = &s[hash_pos + 1..];
+            return Selector {
+                selector_type: SEL_TAG_ID,
+                hash: hash_string(tag),          // tag hash in main hash
+                attr_name_hash: hash_string(id), // id hash in attr_name_hash
+                specificity: 101,  // 1 (tag) + 100 (id)
+                ..Default::default()
+            };
+        }
+    }
+
+    // Simple selector
     if s == "*" {
-        (SEL_UNIVERSAL, 0, 0)
+        Selector {
+            selector_type: SEL_UNIVERSAL,
+            specificity: 0,
+            ..Default::default()
+        }
     } else if s.starts_with('.') {
         let class_name = &s[1..];
-        (SEL_CLASS, hash_string(class_name), 10)
+        Selector {
+            selector_type: SEL_CLASS,
+            hash: hash_string(class_name),
+            specificity: 10,
+            ..Default::default()
+        }
     } else if s.starts_with('#') {
         let id_name = &s[1..];
-        (SEL_ID, hash_string(id_name), 100)
+        Selector {
+            selector_type: SEL_ID,
+            hash: hash_string(id_name),
+            specificity: 100,
+            ..Default::default()
+        }
     } else {
         // Tag selector
-        (SEL_TAG, hash_string(s), 1)
+        Selector {
+            selector_type: SEL_TAG,
+            hash: hash_string(s),
+            specificity: 1,
+            ..Default::default()
+        }
     }
+}
+
+/// Parse nth-child formula like "2n+1", "odd", "even", "3"
+fn parse_nth_formula(formula: &str) -> (i32, i32) {
+    let formula = formula.trim().to_lowercase();
+
+    if formula == "odd" {
+        return (2, 1);
+    }
+    if formula == "even" {
+        return (2, 0);
+    }
+
+    // Parse "an+b" format
+    if let Some(n_pos) = formula.find('n') {
+        let a_str = &formula[..n_pos];
+        let a = if a_str.is_empty() || a_str == "+" {
+            1
+        } else if a_str == "-" {
+            -1
+        } else {
+            a_str.parse().unwrap_or(1)
+        };
+
+        let b_part = &formula[n_pos + 1..];
+        let b = if b_part.is_empty() {
+            0
+        } else {
+            b_part.trim_start_matches('+').parse().unwrap_or(0)
+        };
+
+        (a, b)
+    } else {
+        // Just a number
+        (0, formula.parse().unwrap_or(0))
+    }
+}
+
+/// Parse a full selector (with combinators like "div > p" or "div p")
+///
+/// CSS selectors are written left-to-right (ancestor to descendant), but
+/// matching starts from the target element. We reverse the order so:
+/// - First selector = rightmost (target element)
+/// - Combinator on each selector indicates how to find the previous element
+/// - Last selector = leftmost (root of the selector chain)
+fn parse_full_selector(s: &str, selectors: &mut Vec<Selector>) -> usize {
+    let s = s.trim();
+
+    // Tokenize by combinators, preserving combinator info
+    // parts[i].1 is the combinator BEFORE parts[i] (how parts[i-1] relates to parts[i])
+    let mut parts: Vec<(String, u32)> = Vec::new();
+    let mut current = String::new();
+    let mut chars = s.chars().peekable();
+    let mut pending_combinator = COMB_NONE;
+
+    while let Some(c) = chars.next() {
+        match c {
+            '>' => {
+                if !current.trim().is_empty() {
+                    parts.push((current.trim().to_string(), pending_combinator));
+                    current = String::new();
+                }
+                // Skip whitespace
+                while chars.peek() == Some(&' ') { chars.next(); }
+                pending_combinator = COMB_CHILD;
+            }
+            '+' => {
+                if !current.trim().is_empty() {
+                    parts.push((current.trim().to_string(), pending_combinator));
+                    current = String::new();
+                }
+                while chars.peek() == Some(&' ') { chars.next(); }
+                pending_combinator = COMB_ADJACENT;
+            }
+            '~' => {
+                if !current.trim().is_empty() {
+                    parts.push((current.trim().to_string(), pending_combinator));
+                    current = String::new();
+                }
+                while chars.peek() == Some(&' ') { chars.next(); }
+                pending_combinator = COMB_SIBLING;
+            }
+            ' ' => {
+                // Could be descendant combinator or just whitespace before another combinator
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    parts.push((trimmed, pending_combinator));
+                    current = String::new();
+
+                    // Peek to see if next non-space is a combinator
+                    let mut temp_chars = chars.clone();
+                    while temp_chars.peek() == Some(&' ') { temp_chars.next(); }
+
+                    match temp_chars.peek() {
+                        Some('>') | Some('+') | Some('~') => {
+                            // Next is an explicit combinator, will be set when we hit it
+                            pending_combinator = COMB_NONE;
+                        }
+                        Some(_) => {
+                            // Next is another selector part - this is descendant combinator
+                            pending_combinator = COMB_DESCENDANT;
+                        }
+                        None => {
+                            pending_combinator = COMB_NONE;
+                        }
+                    }
+                }
+                // Skip whitespace
+                while chars.peek() == Some(&' ') { chars.next(); }
+            }
+            _ => current.push(c),
+        }
+    }
+
+    // Add final part
+    if !current.trim().is_empty() {
+        parts.push((current.trim().to_string(), pending_combinator));
+    }
+
+    if parts.is_empty() {
+        return 0;
+    }
+
+    // Reverse parts so rightmost (target) is first
+    // For "div p" we have [("div", NONE), ("p", DESCENDANT)]
+    // After reverse: [("p", DESCENDANT), ("div", NONE)]
+    // The combinator on "p" tells us how to find "div" (its ancestor)
+    parts.reverse();
+
+    // Create selector chain
+    let base_idx = selectors.len();
+    let mut total_specificity = 0u32;
+
+    for (i, (part, comb)) in parts.iter().enumerate() {
+        let mut sel = parse_simple_selector(part);
+        sel.combinator = *comb;  // Combinator indicates how to find next element
+        total_specificity += sel.specificity;
+
+        // Link to next part
+        if i + 1 < parts.len() {
+            sel.next_part = (base_idx + i + 1) as i32;
+        } else {
+            sel.next_part = -1;
+        }
+
+        selectors.push(sel);
+    }
+
+    // Update first selector with total specificity
+    if let Some(first) = selectors.get_mut(base_idx) {
+        first.specificity = total_specificity;
+    }
+
+    base_idx
 }
 
 fn parse_property(name: &str, value: &str) -> Option<StyleDef> {
@@ -291,6 +751,17 @@ fn parse_property(name: &str, value: &str) -> Option<StyleDef> {
         "border-color" => PROP_BORDER_COLOR,
         "border-radius" => PROP_BORDER_RADIUS,
         "opacity" => PROP_OPACITY,
+        "position" => PROP_POSITION,
+        "top" => PROP_TOP,
+        "right" => PROP_RIGHT,
+        "bottom" => PROP_BOTTOM,
+        "left" => PROP_LEFT,
+        "z-index" => PROP_Z_INDEX,
+        "overflow" => PROP_OVERFLOW,
+        "overflow-x" => PROP_OVERFLOW_X,
+        "overflow-y" => PROP_OVERFLOW_Y,
+        "border-collapse" => PROP_BORDER_COLLAPSE,
+        "border-spacing" => PROP_BORDER_SPACING,
         _ => return None,
     };
 
@@ -308,6 +779,9 @@ fn parse_value(property_id: u32, value: &str) -> Option<[f32; 4]> {
                 "inline" => DISPLAY_INLINE as f32,
                 "flex" => DISPLAY_FLEX as f32,
                 "inline-block" => DISPLAY_INLINE_BLOCK as f32,
+                "table" => DISPLAY_TABLE as f32,
+                "table-row" => DISPLAY_TABLE_ROW as f32,
+                "table-cell" => DISPLAY_TABLE_CELL as f32,
                 _ => DISPLAY_BLOCK as f32,
             };
             Some([v, 0.0, 0.0, 0.0])
@@ -369,7 +843,460 @@ fn parse_value(property_id: u32, value: &str) -> Option<[f32; 4]> {
         PROP_COLOR | PROP_BACKGROUND | PROP_BORDER_COLOR => {
             parse_color(value)
         }
+        PROP_POSITION => {
+            let v = match value {
+                "static" => POSITION_STATIC as f32,
+                "relative" => POSITION_RELATIVE as f32,
+                "absolute" => POSITION_ABSOLUTE as f32,
+                "fixed" => POSITION_FIXED as f32,
+                _ => POSITION_STATIC as f32,
+            };
+            Some([v, 0.0, 0.0, 0.0])
+        }
+        PROP_TOP | PROP_RIGHT | PROP_BOTTOM | PROP_LEFT => {
+            let v = if value == "auto" {
+                OFFSET_AUTO
+            } else {
+                parse_length_or_percent(value)?
+            };
+            Some([v, 0.0, 0.0, 0.0])
+        }
+        PROP_Z_INDEX => {
+            let v: i32 = value.trim().parse().ok()?;
+            Some([v as f32, 0.0, 0.0, 0.0])
+        }
+        PROP_OVERFLOW => {
+            let v = parse_overflow_value(value)?;
+            // Shorthand sets both x and y
+            Some([v as f32, v as f32, 0.0, 0.0])
+        }
+        PROP_OVERFLOW_X => {
+            let v = parse_overflow_value(value)?;
+            Some([v as f32, 0.0, 0.0, 0.0])
+        }
+        PROP_OVERFLOW_Y => {
+            let v = parse_overflow_value(value)?;
+            Some([v as f32, 0.0, 0.0, 0.0])
+        }
+        PROP_BORDER_COLLAPSE => {
+            let v = match value.trim() {
+                "collapse" => 1.0,
+                "separate" => 0.0,
+                _ => 0.0,
+            };
+            Some([v, 0.0, 0.0, 0.0])
+        }
+        PROP_BORDER_SPACING => {
+            let v = parse_length(value)?;
+            Some([v, 0.0, 0.0, 0.0])
+        }
         _ => None,
+    }
+}
+
+fn parse_overflow_value(value: &str) -> Option<u32> {
+    match value.trim() {
+        "visible" => Some(OVERFLOW_VISIBLE),
+        "hidden" => Some(OVERFLOW_HIDDEN),
+        "scroll" => Some(OVERFLOW_SCROLL),
+        "auto" => Some(OVERFLOW_AUTO),
+        "clip" => Some(OVERFLOW_HIDDEN), // clip behaves like hidden
+        _ => None,
+    }
+}
+
+/// Parse box-shadow CSS property
+/// Returns multiple StyleDefs for shadow geometry, color, and inset flag
+fn parse_box_shadow(value: &str) -> Vec<StyleDef> {
+    let value = value.trim();
+
+    // Handle "none"
+    if value == "none" {
+        return vec![];  // No shadows
+    }
+
+    let mut defs = Vec::new();
+
+    // Split multiple shadows by comma (handle nested parens for rgb/rgba)
+    let shadows: Vec<&str> = split_shadows(value);
+
+    for (idx, shadow) in shadows.iter().enumerate() {
+        if idx >= 4 {
+            break;  // Max 4 shadows
+        }
+
+        if let Some((geom, color, inset)) = parse_single_shadow(shadow.trim()) {
+            // Geometry: offset_x, offset_y, blur, spread
+            defs.push(StyleDef {
+                property_id: PROP_BOX_SHADOW,
+                values: [
+                    geom.0 + (idx as f32 * 1000.0),  // Encode shadow index in offset
+                    geom.1,
+                    geom.2,
+                    geom.3,
+                ],
+            });
+
+            // Color: RGBA
+            defs.push(StyleDef {
+                property_id: PROP_BOX_SHADOW_COLOR,
+                values: [
+                    color.0 + (idx as f32 * 10.0),  // Encode shadow index
+                    color.1,
+                    color.2,
+                    color.3,
+                ],
+            });
+
+            // Inset flag
+            if inset {
+                defs.push(StyleDef {
+                    property_id: PROP_BOX_SHADOW_INSET,
+                    values: [idx as f32, 1.0, 0.0, 0.0],
+                });
+            }
+        }
+    }
+
+    defs
+}
+
+/// Split shadow definitions by comma, handling nested parentheses
+fn split_shadows(value: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut depth = 0;
+
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start < value.len() {
+        result.push(&value[start..]);
+    }
+
+    result
+}
+
+/// Parse a single box-shadow value
+/// Returns (offset_x, offset_y, blur, spread), (r, g, b, a), inset
+fn parse_single_shadow(value: &str) -> Option<((f32, f32, f32, f32), (f32, f32, f32, f32), bool)> {
+    let mut inset = false;
+    let mut lengths: Vec<f32> = Vec::new();
+    let mut color = (0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32);  // Default: black
+
+    // Tokenize the shadow value
+    let mut chars = value.chars().peekable();
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(current.clone());
+                current.clear();
+            }
+            chars.next();
+        } else if c == '(' {
+            // Collect function call (rgb, rgba, etc.)
+            current.push(chars.next().unwrap());
+            while let Some(&c2) = chars.peek() {
+                current.push(chars.next().unwrap());
+                if c2 == ')' {
+                    break;
+                }
+            }
+        } else {
+            current.push(chars.next().unwrap());
+        }
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    for token in &tokens {
+        let token = token.trim();
+
+        if token == "inset" {
+            inset = true;
+        } else if token.starts_with("rgb") || token.starts_with("rgba") {
+            color = parse_css_color_fn(token);
+        } else if token.starts_with('#') {
+            color = parse_hex_color(token);
+        } else if let Some(len) = parse_shadow_length(token) {
+            lengths.push(len);
+        } else {
+            // Try named color
+            if let Some(c) = parse_named_color(token) {
+                color = c;
+            }
+        }
+    }
+
+    if lengths.len() < 2 {
+        return None;  // Need at least offset-x and offset-y
+    }
+
+    let offset_x = lengths[0];
+    let offset_y = lengths[1];
+    let blur = lengths.get(2).copied().unwrap_or(0.0);
+    let spread = lengths.get(3).copied().unwrap_or(0.0);
+
+    Some(((offset_x, offset_y, blur, spread), color, inset))
+}
+
+fn parse_shadow_length(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value == "0" {
+        return Some(0.0);
+    }
+
+    let num_str = value
+        .trim_end_matches("px")
+        .trim_end_matches("em")
+        .trim_end_matches("rem");
+
+    num_str.parse::<f32>().ok()
+}
+
+fn parse_css_color_fn(value: &str) -> (f32, f32, f32, f32) {
+    // Parse rgb(r, g, b) or rgba(r, g, b, a)
+    let inner = value
+        .trim_start_matches("rgba(")
+        .trim_start_matches("rgb(")
+        .trim_end_matches(')');
+
+    let parts: Vec<&str> = inner.split(',').collect();
+
+    let r = parts.get(0).and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(0.0) / 255.0;
+    let g = parts.get(1).and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(0.0) / 255.0;
+    let b = parts.get(2).and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(0.0) / 255.0;
+    let a = parts.get(3).and_then(|s| s.trim().parse::<f32>().ok()).unwrap_or(1.0);
+
+    (r, g, b, a)
+}
+
+fn parse_hex_color(value: &str) -> (f32, f32, f32, f32) {
+    let hex = value.trim_start_matches('#');
+
+    if hex.len() == 3 {
+        // #RGB
+        let r = u8::from_str_radix(&hex[0..1], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&hex[1..2], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&hex[2..3], 16).unwrap_or(0);
+        ((r * 17) as f32 / 255.0, (g * 17) as f32 / 255.0, (b * 17) as f32 / 255.0, 1.0)
+    } else if hex.len() == 6 {
+        // #RRGGBB
+        let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+        let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(0);
+        let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(0);
+        (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, 1.0)
+    } else {
+        (0.0, 0.0, 0.0, 1.0)
+    }
+}
+
+fn parse_named_color(name: &str) -> Option<(f32, f32, f32, f32)> {
+    match name.to_lowercase().as_str() {
+        "black" => Some((0.0, 0.0, 0.0, 1.0)),
+        "white" => Some((1.0, 1.0, 1.0, 1.0)),
+        "red" => Some((1.0, 0.0, 0.0, 1.0)),
+        "green" => Some((0.0, 0.5, 0.0, 1.0)),
+        "blue" => Some((0.0, 0.0, 1.0, 1.0)),
+        "yellow" => Some((1.0, 1.0, 0.0, 1.0)),
+        "cyan" => Some((0.0, 1.0, 1.0, 1.0)),
+        "magenta" => Some((1.0, 0.0, 1.0, 1.0)),
+        "orange" => Some((1.0, 0.65, 0.0, 1.0)),
+        "purple" => Some((0.5, 0.0, 0.5, 1.0)),
+        "pink" => Some((1.0, 0.75, 0.8, 1.0)),
+        "gray" | "grey" => Some((0.5, 0.5, 0.5, 1.0)),
+        "transparent" => Some((0.0, 0.0, 0.0, 0.0)),
+        _ => None,
+    }
+}
+
+/// Parse CSS gradient (linear-gradient or radial-gradient)
+fn parse_gradient(value: &str) -> Vec<StyleDef> {
+    let mut defs = Vec::new();
+    let value = value.trim();
+
+    // Detect gradient type
+    let (gradient_type, inner) = if value.starts_with("linear-gradient(") {
+        (GRADIENT_LINEAR, value.trim_start_matches("linear-gradient(").trim_end_matches(')'))
+    } else if value.starts_with("radial-gradient(") {
+        (GRADIENT_RADIAL, value.trim_start_matches("radial-gradient(").trim_end_matches(')'))
+    } else {
+        return defs;  // Not a gradient
+    };
+
+    // Add gradient type
+    defs.push(StyleDef {
+        property_id: PROP_GRADIENT_TYPE,
+        values: [gradient_type as f32, 0.0, 0.0, 0.0],
+    });
+
+    // Parse gradient content
+    let parts: Vec<&str> = split_gradient_parts(inner);
+
+    let mut angle = 180.0_f32;  // Default: to bottom
+    let mut color_stops: Vec<((f32, f32, f32, f32), f32)> = Vec::new();
+    let mut stop_idx = 0;
+
+    for part in parts {
+        let part = part.trim();
+
+        // Check for direction keywords or angle
+        if part.starts_with("to ") {
+            angle = parse_gradient_direction(part);
+        } else if part.ends_with("deg") {
+            if let Ok(a) = part.trim_end_matches("deg").parse::<f32>() {
+                angle = a;
+            }
+        } else {
+            // Parse color stop
+            if let Some((color, pos)) = parse_color_stop(part) {
+                color_stops.push((color, pos));
+            }
+        }
+    }
+
+    // Add angle
+    defs.push(StyleDef {
+        property_id: PROP_GRADIENT_ANGLE,
+        values: [angle, 0.0, 0.0, 0.0],
+    });
+
+    // Auto-calculate positions if not specified
+    let stop_count = color_stops.len();
+    for (idx, (color, mut pos)) in color_stops.into_iter().enumerate() {
+        if pos < 0.0 {
+            // Position not specified, calculate automatically
+            pos = if stop_count == 1 {
+                0.5
+            } else {
+                idx as f32 / (stop_count - 1) as f32
+            };
+        }
+
+        // Encode: idx in values[0], pos in values[1], encode color in values[2] and values[3]
+        // Pack RGBA into two floats: values[2] = R + G*256, values[3] = B + A*256 (scaled)
+        defs.push(StyleDef {
+            property_id: PROP_GRADIENT_STOP,
+            values: [
+                idx as f32,
+                pos,
+                color.0 + color.1 * 256.0,  // Encode R, G
+                color.2 + color.3 * 256.0,  // Encode B, A
+            ],
+        });
+        stop_idx += 1;
+
+        if stop_idx >= 8 {
+            break;  // Max 8 stops
+        }
+    }
+
+    defs
+}
+
+/// Split gradient parts by comma, handling nested parentheses
+fn split_gradient_parts(value: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut depth = 0;
+
+    for (i, c) in value.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                result.push(&value[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+
+    if start < value.len() {
+        result.push(&value[start..]);
+    }
+
+    result
+}
+
+/// Parse gradient direction keyword
+fn parse_gradient_direction(dir: &str) -> f32 {
+    match dir.trim() {
+        "to top" => 0.0,
+        "to right" => 90.0,
+        "to bottom" => 180.0,
+        "to left" => 270.0,
+        "to top right" | "to right top" => 45.0,
+        "to bottom right" | "to right bottom" => 135.0,
+        "to bottom left" | "to left bottom" => 225.0,
+        "to top left" | "to left top" => 315.0,
+        _ => 180.0,  // Default: to bottom
+    }
+}
+
+/// Parse a color stop (color and optional position)
+fn parse_color_stop(value: &str) -> Option<((f32, f32, f32, f32), f32)> {
+    let value = value.trim();
+    let mut color = (0.0_f32, 0.0_f32, 0.0_f32, 1.0_f32);
+    let mut position = -1.0_f32;  // -1 means auto
+
+    // Try to split into color and position
+    // Color can be: named, #hex, rgb(), rgba()
+    if value.starts_with("rgb") {
+        // Find the closing paren
+        if let Some(end) = value.find(')') {
+            color = parse_css_color_fn(&value[..=end]);
+            let rest = value[end + 1..].trim();
+            if !rest.is_empty() {
+                position = parse_percentage_or_length(rest);
+            }
+        }
+    } else if value.starts_with('#') {
+        // Hex color, possibly followed by position
+        let parts: Vec<&str> = value.split_whitespace().collect();
+        color = parse_hex_color(parts[0]);
+        if parts.len() > 1 {
+            position = parse_percentage_or_length(parts[1]);
+        }
+    } else {
+        // Named color, possibly followed by position
+        let parts: Vec<&str> = value.split_whitespace().collect();
+        if let Some(c) = parse_named_color(parts[0]) {
+            color = c;
+            if parts.len() > 1 {
+                position = parse_percentage_or_length(parts[1]);
+            }
+        } else {
+            return None;
+        }
+    }
+
+    Some((color, position))
+}
+
+/// Parse percentage (returns 0.0-1.0) or length
+fn parse_percentage_or_length(value: &str) -> f32 {
+    let value = value.trim();
+    if value.ends_with('%') {
+        value.trim_end_matches('%').parse::<f32>().unwrap_or(0.0) / 100.0
+    } else if value.ends_with("px") {
+        // For now, treat px as percentage of some default (this is a simplification)
+        value.trim_end_matches("px").parse::<f32>().unwrap_or(0.0) / 100.0
+    } else {
+        value.parse::<f32>().unwrap_or(0.0)
     }
 }
 
@@ -385,6 +1312,34 @@ fn parse_length(value: &str) -> Option<f32> {
         .trim_end_matches("em")
         .trim_end_matches("rem")
         .trim_end_matches("%");
+
+    num_str.parse::<f32>().ok()
+}
+
+/// Parse length value, returning percentage as negative value
+/// (for layout engine to interpret as percentage of containing block)
+fn parse_length_or_percent(value: &str) -> Option<f32> {
+    let value = value.trim();
+    if value == "auto" {
+        return Some(OFFSET_AUTO);
+    }
+    if value == "0" {
+        return Some(0.0);
+    }
+
+    // Check for percentage
+    if value.ends_with('%') {
+        let num_str = value.trim_end_matches('%');
+        // Store percentage as negative value (convention for layout engine)
+        // -10.0 means 10%
+        return num_str.parse::<f32>().ok().map(|v| -v);
+    }
+
+    // Strip px/em/rem units
+    let num_str = value
+        .trim_end_matches("px")
+        .trim_end_matches("em")
+        .trim_end_matches("rem");
 
     num_str.parse::<f32>().ok()
 }
@@ -479,6 +1434,9 @@ fn parse_color(value: &str) -> Option<[f32; 4]> {
     None
 }
 
+// Note: Inline style extraction and parsing now happens entirely on GPU
+// in the Metal shader (parse_inline_style_gpu function in style.metal)
+
 /// Metal shader source for the style resolver
 const STYLE_SHADER: &str = include_str!("style.metal");
 
@@ -506,6 +1464,7 @@ pub struct GpuStyler {
     // Count buffers
     element_count_buffer: Buffer,
     selector_count_buffer: Buffer,
+    // Note: Inline style parsing happens entirely on GPU in the Metal shader
 }
 
 impl GpuStyler {
@@ -565,6 +1524,7 @@ impl GpuStyler {
         );
         let element_count_buffer = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
         let selector_count_buffer = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+        // Note: Inline style parsing happens entirely on GPU in the Metal shader
 
         Ok(Self {
             device: device.clone(),
@@ -652,6 +1612,7 @@ impl GpuStyler {
         }
 
         // Initialize computed styles to default
+        // Note: Inline style parsing happens entirely on GPU in the Metal shader
         unsafe {
             let ptr = self.computed_buffer.contents() as *mut ComputedStyle;
             for i in 0..element_count {
@@ -673,6 +1634,7 @@ impl GpuStyler {
             encoder.set_buffer(5, Some(&self.computed_buffer), 0);
             encoder.set_buffer(6, Some(&self.element_count_buffer), 0);
             encoder.set_buffer(7, Some(&self.selector_count_buffer), 0);
+            // Inline styles are now parsed directly on GPU in the Metal shader
 
             let threadgroups = ((element_count as u64 + THREAD_COUNT - 1) / THREAD_COUNT).max(1);
             encoder.dispatch_thread_groups(
@@ -682,24 +1644,30 @@ impl GpuStyler {
             encoder.end_encoding();
         }
 
-        // Pass 2: Apply inheritance (disabled for now)
-        // TODO: Implement proper CSS inheritance that only inherits properties
-        // that weren't explicitly set. Current implementation overwrites explicitly
-        // set values which breaks selector-based styling.
-        // {
-        //     let encoder = command_buffer.new_compute_command_encoder();
-        //     encoder.set_compute_pipeline_state(&self.inherit_pipeline);
-        //     encoder.set_buffer(0, Some(&self.element_buffer), 0);
-        //     encoder.set_buffer(1, Some(&self.computed_buffer), 0);
-        //     encoder.set_buffer(2, Some(&self.element_count_buffer), 0);
-        //
-        //     let threadgroups = ((element_count as u64 + THREAD_COUNT - 1) / THREAD_COUNT).max(1);
-        //     encoder.dispatch_thread_groups(
-        //         MTLSize::new(threadgroups, 1, 1),
-        //         MTLSize::new(THREAD_COUNT, 1, 1),
-        //     );
-        //     encoder.end_encoding();
-        // }
+        // Pass 2: Apply inheritance
+        // Uses properties_set bitmask to only inherit properties that weren't explicitly set
+        // Run multiple passes to handle deep nesting (grandparent -> parent -> child)
+        {
+            // For proper inheritance in deeply nested trees, we run multiple passes
+            // Each pass propagates inheritance one level deeper
+            // We use log2(max_depth) passes which handles trees up to 2^passes deep
+            const MAX_INHERITANCE_PASSES: u64 = 8;  // Handles trees up to 256 levels deep
+
+            for _ in 0..MAX_INHERITANCE_PASSES {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.inherit_pipeline);
+                encoder.set_buffer(0, Some(&self.element_buffer), 0);
+                encoder.set_buffer(1, Some(&self.computed_buffer), 0);
+                encoder.set_buffer(2, Some(&self.element_count_buffer), 0);
+
+                let threadgroups = ((element_count as u64 + THREAD_COUNT - 1) / THREAD_COUNT).max(1);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(threadgroups, 1, 1),
+                    MTLSize::new(THREAD_COUNT, 1, 1),
+                );
+                encoder.end_encoding();
+            }
+        }
 
         command_buffer.commit();
         command_buffer.wait_until_completed();

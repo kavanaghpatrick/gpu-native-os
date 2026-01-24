@@ -15,6 +15,33 @@ const MAX_PATHS: usize = 1024;
 const MAX_SEGMENTS: usize = 16384;
 const MAX_VERTICES: usize = 262144; // 256K vertices
 const TESSELLATION_TOLERANCE: f32 = 0.5; // Pixels
+const DEFAULT_AA_WIDTH: f32 = 1.5; // Anti-aliasing width in pixels (Issue #36)
+
+// ============================================================================
+// Anti-Aliasing Mode (Issue #36)
+// ============================================================================
+
+/// Anti-aliasing quality mode
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub enum AntiAliasMode {
+    /// No anti-aliasing (fastest, jagged edges)
+    None,
+    /// Fast analytical AA (good quality, minimal overhead)
+    #[default]
+    Fast,
+    /// High quality AA (best quality, slightly slower)
+    Quality,
+}
+
+impl AntiAliasMode {
+    fn as_u32(&self) -> u32 {
+        match self {
+            AntiAliasMode::None => 0,
+            AntiAliasMode::Fast => 1,
+            AntiAliasMode::Quality => 2,
+        }
+    }
+}
 
 // ============================================================================
 // Data Structures
@@ -152,6 +179,13 @@ impl Default for Paint {
     }
 }
 
+/// Internal paint representation for rendering
+#[derive(Clone, Debug)]
+enum InternalPaint {
+    Solid(Color),
+    Gradient(usize), // Index into gradients vec
+}
+
 /// Paint type constants for GPU
 const PAINT_SOLID: u32 = 0;
 const PAINT_LINEAR: u32 = 1;
@@ -193,16 +227,18 @@ struct PathHeader {
 }
 
 /// Vector vertex output from tessellation
+/// Issue #36: Added edge_dist for anti-aliasing
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 struct VectorVertex {
     position: [f32; 2],     // Clip space position
     world_pos: [f32; 2],    // Original world position (for gradients)
     color: [f32; 4],        // Solid color or vertex color
-    paint_info: [f32; 4],   // [paint_type, gradient_index, 0, 0]
+    paint_info: [f32; 4],   // [paint_type, gradient_index, edge_dist, aa_mode]
 }
 
 /// Tessellation parameters
+/// Issue #36: Added AA settings
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 struct TessParams {
@@ -210,6 +246,9 @@ struct TessParams {
     screen_width: f32,
     screen_height: f32,
     path_count: u32,
+    aa_width: f32,          // Anti-aliasing width in pixels
+    aa_mode: u32,           // 0=none, 1=fast, 2=quality
+    _padding: [u32; 2],     // Align to 32 bytes
 }
 
 /// Vertex count (atomic)
@@ -230,13 +269,18 @@ fn shader_source() -> String {
 {header}
 
 // ============================================================================
-// Vector Rasterizer Structures (Issue #35: Gradient Support)
+// Vector Rasterizer Structures (Issue #35: Gradients, Issue #36: Anti-Aliasing)
 // ============================================================================
 
 // Paint type constants
 constant uint PAINT_SOLID = 0;
 constant uint PAINT_LINEAR = 1;
 constant uint PAINT_RADIAL = 2;
+
+// Anti-aliasing mode constants (Issue #36)
+constant uint AA_NONE = 0;
+constant uint AA_FAST = 1;
+constant uint AA_QUALITY = 2;
 
 // Maximum gradient stops
 constant uint MAX_GRADIENT_STOPS = 8;
@@ -278,6 +322,9 @@ struct TessParams {{
     float screen_width;
     float screen_height;
     uint path_count;
+    float aa_width;       // Anti-aliasing width in pixels (Issue #36)
+    uint aa_mode;         // 0=none, 1=fast, 2=quality (Issue #36)
+    uint _padding[2];
 }};
 
 struct VertexCount {{
@@ -342,16 +389,23 @@ uint cubic_segments(float2 p0, float2 p1, float2 p2, float2 p3, float tol) {{
 constant uint MAX_SEGMENT_COUNT = 1024u;
 constant uint MAX_VERTEX_COUNT = 262144u;
 
-// Macro-like inline function for writing triangles with bounds checking
-// Now includes paint_info for gradient support
+// Macro for writing triangles with edge distance for AA (Issue #36)
+// p0 = centroid (interior), p1/p2 = edge vertices
+// paint_info.z = edge_dist: centroid has large dist, edge verts have 0
+// paint_info.w = aa_mode
 #define WRITE_TRI(p0, p1, p2) {{ \
     uint base = atomic_fetch_add_explicit(&vertex_count->count, 3, memory_order_relaxed); \
     if (base + 3 <= MAX_VERTEX_COUNT) {{ \
         float2 scale = float2(2.0 / screen_size.x, -2.0 / screen_size.y); \
         float2 bias = float2(-1.0, 1.0); \
-        vertices[base + 0] = VectorVertex{{(p0) * scale + bias, (p0), color, paint_info}}; \
-        vertices[base + 1] = VectorVertex{{(p1) * scale + bias, (p1), color, paint_info}}; \
-        vertices[base + 2] = VectorVertex{{(p2) * scale + bias, (p2), color, paint_info}}; \
+        /* Centroid vertex: interior, large edge distance */ \
+        float4 pi0 = float4(paint_info.xy, 1000.0, aa_mode); \
+        /* Edge vertices: on the edge, distance = 0 */ \
+        float4 pi1 = float4(paint_info.xy, 0.0, aa_mode); \
+        float4 pi2 = float4(paint_info.xy, 0.0, aa_mode); \
+        vertices[base + 0] = VectorVertex{{(p0) * scale + bias, (p0), color, pi0}}; \
+        vertices[base + 1] = VectorVertex{{(p1) * scale + bias, (p1), color, pi1}}; \
+        vertices[base + 2] = VectorVertex{{(p2) * scale + bias, (p2), color, pi2}}; \
     }} \
 }}
 
@@ -375,6 +429,7 @@ kernel void tessellate_paths(
     float4 color = header.color;
     float4 paint_info = float4(float(header.paint_type), float(header.gradient_index), 0.0, 0.0);
     float2 screen_size = float2(params.screen_width, params.screen_height);
+    float aa_mode = float(params.aa_mode);  // Issue #36: AA mode for fragment shader
 
     // Validate screen size to prevent division by zero
     if (screen_size.x < 1.0 || screen_size.y < 1.0) return;
@@ -475,7 +530,7 @@ struct VertexOut {{
     float4 position [[position]];
     float2 world_pos;
     float4 color;
-    float4 paint_info;   // [paint_type, gradient_index, 0, 0]
+    float4 paint_info;   // [paint_type, gradient_index, edge_dist, aa_mode]
 }};
 
 vertex VertexOut vector_vertex(
@@ -542,15 +597,20 @@ float4 sample_gradient(device const GpuGradient* gradients, uint idx, float t) {
     return float4(last0.y, last0.z, last0.w, last1.x);
 }}
 
+// Issue #36: Anti-aliasing support in fragment shader
 fragment float4 vector_fragment(
     VertexOut in [[stage_in]],
     device const GpuGradient* gradients [[buffer(0)]]
 ) {{
     uint paint_type = uint(in.paint_info.x);
     uint gradient_index = uint(in.paint_info.y);
+    float edge_dist = in.paint_info.z;
+    uint aa_mode = uint(in.paint_info.w);
 
+    // Compute base color from paint type
+    float4 base_color;
     if (paint_type == PAINT_SOLID) {{
-        return in.color;
+        base_color = in.color;
     }}
     else if (paint_type == PAINT_LINEAR) {{
         GpuGradient grad = gradients[gradient_index];
@@ -562,7 +622,7 @@ fragment float4 vector_fragment(
         if (len2 > 0.0001) {{
             t = dot(in.world_pos - start, dir) / len2;
         }}
-        return sample_gradient(gradients, gradient_index, t);
+        base_color = sample_gradient(gradients, gradient_index, t);
     }}
     else if (paint_type == PAINT_RADIAL) {{
         GpuGradient grad = gradients[gradient_index];
@@ -570,10 +630,40 @@ fragment float4 vector_fragment(
         float radius = grad.point2.z;
         float dist = length(in.world_pos - center);
         float t = dist / max(radius, 0.0001);
-        return sample_gradient(gradients, gradient_index, t);
+        base_color = sample_gradient(gradients, gradient_index, t);
+    }}
+    else {{
+        base_color = in.color;
     }}
 
-    return in.color;
+    // Issue #36: Apply anti-aliasing based on edge distance
+    if (aa_mode == AA_NONE) {{
+        // No AA - hard edges
+        return base_color;
+    }}
+
+    // Compute AA using screen-space derivatives of edge_dist
+    // The edge_dist interpolates from 1000 (centroid) to 0 (edge)
+    // We want smooth alpha transition at the edges
+
+    if (aa_mode == AA_FAST) {{
+        // Fast AA: simple smoothstep based on edge distance
+        // Width of 1.5 pixels gives good results
+        float aa_width = 1.5;
+        float alpha = smoothstep(0.0, aa_width, edge_dist);
+        return float4(base_color.rgb, base_color.a * alpha);
+    }}
+    else if (aa_mode == AA_QUALITY) {{
+        // Quality AA: use screen-space derivatives for adaptive width
+        float2 grad_dist = float2(dfdx(edge_dist), dfdy(edge_dist));
+        float edge_width = length(grad_dist);
+        // Adaptive AA width based on how fast edge_dist changes
+        float aa_width = max(edge_width * 1.5, 0.5);
+        float alpha = smoothstep(0.0, aa_width, edge_dist);
+        return float4(base_color.rgb, base_color.a * alpha);
+    }}
+
+    return base_color;
 }}
 
 "#,
@@ -597,10 +687,13 @@ pub struct VectorRenderer {
     vertices_buffer: Buffer,
     vertex_count_buffer: Buffer,
     params_buffer: Buffer,
+    gradients_buffer: Buffer, // Issue #35: Gradient buffer
 
     // State
-    paths: Vec<(Path, Color)>,
+    paths: Vec<(Path, InternalPaint)>,
+    gradients: Vec<GpuGradient>, // Issue #35: Gradient storage
     segment_count: usize,
+    aa_mode: AntiAliasMode, // Issue #36: Anti-aliasing mode
 }
 
 impl VectorRenderer {
@@ -618,6 +711,7 @@ impl VectorRenderer {
         let vertices_buffer = builder.create_buffer(MAX_VERTICES * mem::size_of::<VectorVertex>());
         let vertex_count_buffer = builder.create_buffer(mem::size_of::<VertexCount>());
         let params_buffer = builder.create_buffer(mem::size_of::<TessParams>());
+        let gradients_buffer = builder.create_buffer(MAX_GRADIENTS * mem::size_of::<GpuGradient>());
 
         let command_queue = device.new_command_queue();
 
@@ -630,37 +724,117 @@ impl VectorRenderer {
             vertices_buffer,
             vertex_count_buffer,
             params_buffer,
+            gradients_buffer,
             paths: Vec::new(),
+            gradients: Vec::new(),
             segment_count: 0,
+            aa_mode: AntiAliasMode::Fast,
         })
     }
 
-    /// Add a filled path
-    pub fn fill(&mut self, path: &Path, paint: Paint) {
-        let color = match paint {
-            Paint::Solid(c) => c,
-        };
-        self.paths.push((path.clone(), color));
+    /// Set anti-aliasing mode (Issue #36)
+    pub fn set_aa_mode(&mut self, mode: AntiAliasMode) {
+        self.aa_mode = mode;
     }
 
-    /// Add a filled path with color directly
+    /// Get current anti-aliasing mode
+    pub fn aa_mode(&self) -> AntiAliasMode {
+        self.aa_mode
+    }
+
+    /// Add a filled path with paint (supports gradients)
+    pub fn fill(&mut self, path: &Path, paint: Paint) {
+        match paint {
+            Paint::Solid(color) => {
+                self.paths.push((path.clone(), InternalPaint::Solid(color)));
+            }
+            Paint::Linear(gradient) => {
+                let idx = self.add_linear_gradient(&gradient);
+                self.paths.push((path.clone(), InternalPaint::Gradient(idx)));
+            }
+            Paint::Radial(gradient) => {
+                let idx = self.add_radial_gradient(&gradient);
+                self.paths.push((path.clone(), InternalPaint::Gradient(idx)));
+            }
+        }
+    }
+
+    /// Add a filled path with solid color directly
     pub fn fill_color(&mut self, path: &Path, color: Color) {
-        self.paths.push((path.clone(), color));
+        self.paths.push((path.clone(), InternalPaint::Solid(color)));
+    }
+
+    /// Add a linear gradient and return its index
+    fn add_linear_gradient(&mut self, gradient: &LinearGradient) -> usize {
+        let idx = self.gradients.len();
+        let mut gpu_grad = GpuGradient {
+            paint_type: PAINT_LINEAR,
+            stop_count: gradient.stops.len().min(MAX_GRADIENT_STOPS) as u32,
+            _padding: [0; 2],
+            point1: [gradient.start[0], gradient.start[1], 0.0, 0.0],
+            point2: [gradient.end[0], gradient.end[1], 0.0, 0.0],
+            stops: [[0.0; 8]; MAX_GRADIENT_STOPS],
+        };
+
+        // Pack stops: [pos, r, g, b, a, pad, pad, pad]
+        for (i, stop) in gradient.stops.iter().take(MAX_GRADIENT_STOPS).enumerate() {
+            gpu_grad.stops[i] = [
+                stop.position, stop.color.r, stop.color.g, stop.color.b,
+                stop.color.a, 0.0, 0.0, 0.0,
+            ];
+        }
+
+        self.gradients.push(gpu_grad);
+        idx
+    }
+
+    /// Add a radial gradient and return its index
+    fn add_radial_gradient(&mut self, gradient: &RadialGradient) -> usize {
+        let idx = self.gradients.len();
+        let mut gpu_grad = GpuGradient {
+            paint_type: PAINT_RADIAL,
+            stop_count: gradient.stops.len().min(MAX_GRADIENT_STOPS) as u32,
+            _padding: [0; 2],
+            point1: [gradient.center[0], gradient.center[1], 0.0, 0.0],
+            point2: [0.0, 0.0, gradient.radius, 0.0],
+            stops: [[0.0; 8]; MAX_GRADIENT_STOPS],
+        };
+
+        // Pack stops
+        for (i, stop) in gradient.stops.iter().take(MAX_GRADIENT_STOPS).enumerate() {
+            gpu_grad.stops[i] = [
+                stop.position, stop.color.r, stop.color.g, stop.color.b,
+                stop.color.a, 0.0, 0.0, 0.0,
+            ];
+        }
+
+        self.gradients.push(gpu_grad);
+        idx
     }
 
     /// Stroke a path with the given color and width
     pub fn stroke(&mut self, path: &Path, color: Color, width: f32) {
         // Expand stroke to filled path
         let stroke_path = Self::expand_stroke(path, width);
-        self.paths.push((stroke_path, color));
+        self.paths.push((stroke_path, InternalPaint::Solid(color)));
     }
 
     /// Stroke a path with paint
     pub fn stroke_paint(&mut self, path: &Path, paint: Paint, width: f32) {
-        let color = match paint {
-            Paint::Solid(c) => c,
-        };
-        self.stroke(path, color, width);
+        let stroke_path = Self::expand_stroke(path, width);
+        match paint {
+            Paint::Solid(color) => {
+                self.paths.push((stroke_path, InternalPaint::Solid(color)));
+            }
+            Paint::Linear(gradient) => {
+                let idx = self.add_linear_gradient(&gradient);
+                self.paths.push((stroke_path, InternalPaint::Gradient(idx)));
+            }
+            Paint::Radial(gradient) => {
+                let idx = self.add_radial_gradient(&gradient);
+                self.paths.push((stroke_path, InternalPaint::Gradient(idx)));
+            }
+        }
     }
 
     /// Expand a stroke into a filled path
@@ -790,9 +964,10 @@ impl VectorRenderer {
         builder.build()
     }
 
-    /// Clear all paths
+    /// Clear all paths and gradients
     pub fn clear(&mut self) {
         self.paths.clear();
+        self.gradients.clear();
         self.segment_count = 0;
     }
 
@@ -815,7 +990,7 @@ impl VectorRenderer {
         unsafe {
             let seg_ptr = self.segments_buffer.contents() as *mut PathSegment;
 
-            for (path, color) in &self.paths {
+            for (path, paint) in &self.paths {
                 // Copy segments
                 for (i, seg) in path.segments.iter().enumerate() {
                     if segment_offset + i >= MAX_SEGMENTS {
@@ -824,11 +999,25 @@ impl VectorRenderer {
                     *seg_ptr.add(segment_offset + i) = *seg;
                 }
 
+                // Determine paint type and gradient index
+                let (paint_type, gradient_index, color) = match paint {
+                    InternalPaint::Solid(c) => (PAINT_SOLID, 0, [c.r, c.g, c.b, c.a]),
+                    InternalPaint::Gradient(idx) => {
+                        let pt = if *idx < self.gradients.len() {
+                            self.gradients[*idx].paint_type
+                        } else {
+                            PAINT_SOLID
+                        };
+                        (pt, *idx as u32, [1.0, 1.0, 1.0, 1.0])
+                    }
+                };
+
                 headers.push(PathHeader {
                     segment_start: segment_offset as u32,
                     segment_count: path.segments.len() as u32,
-                    _padding: [0; 2],
-                    color: [color.r, color.g, color.b, color.a],
+                    paint_type,
+                    gradient_index,
+                    color,
                     bounds: path.bounds,
                 });
 
@@ -841,13 +1030,27 @@ impl VectorRenderer {
                 *header_ptr.add(i) = *h;
             }
 
-            // Upload params
+            // Upload gradients
+            if !self.gradients.is_empty() {
+                let grad_ptr = self.gradients_buffer.contents() as *mut GpuGradient;
+                for (i, g) in self.gradients.iter().enumerate() {
+                    if i >= MAX_GRADIENTS {
+                        break;
+                    }
+                    *grad_ptr.add(i) = *g;
+                }
+            }
+
+            // Upload params (Issue #36: includes AA settings)
             let params_ptr = self.params_buffer.contents() as *mut TessParams;
             *params_ptr = TessParams {
                 tolerance: TESSELLATION_TOLERANCE,
                 screen_width,
                 screen_height,
                 path_count: self.paths.len() as u32,
+                aa_width: DEFAULT_AA_WIDTH,
+                aa_mode: self.aa_mode.as_u32(),
+                _padding: [0; 2],
             };
         }
 
@@ -863,6 +1066,7 @@ impl VectorRenderer {
         encoder.set_buffer(2, Some(&self.vertices_buffer), 0);
         encoder.set_buffer(3, Some(&self.vertex_count_buffer), 0);
         encoder.set_buffer(4, Some(&self.params_buffer), 0);
+        encoder.set_buffer(5, Some(&self.gradients_buffer), 0);
 
         let path_count = self.paths.len() as u64;
         let threads_per_group = 64u64;
@@ -901,6 +1105,8 @@ impl VectorRenderer {
         // Render
         encoder.set_render_pipeline_state(&self.render_pipeline);
         encoder.set_vertex_buffer(0, Some(&self.vertices_buffer), 0);
+        // Pass gradients buffer to fragment shader (buffer index 0 for fragment)
+        encoder.set_fragment_buffer(0, Some(&self.gradients_buffer), 0);
         encoder.draw_primitives(MTLPrimitiveType::Triangle, 0, vertex_count);
     }
 
@@ -932,14 +1138,25 @@ mod tests {
 
     #[test]
     fn test_vertex_size() {
-        // VectorVertex: 2 + 2 + 4 floats = 8 * 4 = 32 bytes
-        assert_eq!(mem::size_of::<VectorVertex>(), 32);
+        // VectorVertex: 2 + 2 + 4 + 4 floats = 12 * 4 = 48 bytes
+        assert_eq!(mem::size_of::<VectorVertex>(), 48);
     }
 
     #[test]
     fn test_path_header_size() {
-        // PathHeader: 2 u32 + 2 u32 padding + 4 f32 + 4 f32 = 8 + 8 + 16 + 16 = 48 bytes
-        // Metal float4 requires 16-byte alignment
+        // PathHeader: 4 u32 (16 bytes) + 4 f32 (16 bytes) + 4 f32 (16 bytes) = 48 bytes
         assert_eq!(mem::size_of::<PathHeader>(), 48);
+    }
+
+    #[test]
+    fn test_tess_params_size() {
+        // TessParams: 3 f32 + 1 u32 + 1 f32 + 1 u32 + 2 u32 padding = 32 bytes
+        assert_eq!(mem::size_of::<TessParams>(), 32);
+    }
+
+    #[test]
+    fn test_gpu_gradient_size() {
+        // GpuGradient should be well-aligned for Metal
+        assert_eq!(mem::size_of::<GpuGradient>(), 304);
     }
 }

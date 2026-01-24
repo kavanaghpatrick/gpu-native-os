@@ -12,11 +12,11 @@ use rust_experiment::gpu_os::sdf_text::{PathSegment, SdfFont};
 use std::fs::File;
 use std::io::Write;
 
-const SDF_SIZE: u32 = 48;        // Pixels per glyph SDF
+const SDF_SIZE: u32 = 64;        // Pixels per glyph SDF (increased from 48)
 const ATLAS_COLS: u32 = 10;      // Glyphs per row
 const ATLAS_ROWS: u32 = 10;      // Rows in atlas
 const PADDING: u32 = 2;          // Padding between glyphs
-const SPREAD: f32 = 8.0;         // SDF spread in pixels
+const SPREAD: f32 = 4.0;         // SDF spread in pixels (reduced from 8 for better gradients)
 
 fn main() {
     println!("===========================================");
@@ -218,6 +218,10 @@ fn generate_glyph_sdf(
     let center_x = (x_min + x_max) * 0.5;
     let center_y = (y_min + y_max) * 0.5;
 
+    // Convert spread from pixels to font units for proper normalization
+    // spread is in pixels, we need it in font units to match signed_dist
+    let spread_in_font_units = spread / scale;
+
     // Flatten path segments to line segments for easier processing
     let lines = flatten_path(segments);
 
@@ -241,8 +245,8 @@ fn generate_glyph_sdf(
             // Apply sign
             let signed_dist = if inside { -min_dist } else { min_dist };
 
-            // Normalize to 0-1 range
-            let normalized = (signed_dist / spread) * 0.5 + 0.5;
+            // Normalize to 0-1 range (both signed_dist and spread now in font units)
+            let normalized = (signed_dist / spread_in_font_units) * 0.5 + 0.5;
 
             // Write to atlas
             let ax = atlas_x + px;
@@ -272,7 +276,7 @@ fn flatten_path(segments: &[PathSegment]) -> Vec<((f32, f32), (f32, f32))> {
             }
             PathSegment::QuadTo(cx, cy, x, y) => {
                 // Flatten quadratic bezier to line segments
-                let steps = 8;
+                let steps = 16;  // Increased from 8 for smoother curves
                 for i in 0..steps {
                     let t0 = i as f32 / steps as f32;
                     let t1 = (i + 1) as f32 / steps as f32;
@@ -285,7 +289,7 @@ fn flatten_path(segments: &[PathSegment]) -> Vec<((f32, f32), (f32, f32))> {
             }
             PathSegment::CubicTo(c1x, c1y, c2x, c2y, x, y) => {
                 // Flatten cubic bezier to line segments
-                let steps = 8;
+                let steps = 24;  // Increased from 8 for smoother curves (cubic needs more)
                 for i in 0..steps {
                     let t0 = i as f32 / steps as f32;
                     let t1 = (i + 1) as f32 / steps as f32;

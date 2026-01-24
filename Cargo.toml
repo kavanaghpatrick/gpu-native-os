@@ -77,6 +77,14 @@ path = "examples/document_pipeline_demo.rs"
 name = "generate_sdf_atlas"
 path = "examples/generate_sdf_atlas.rs"
 
+[[example]]
+name = "document_images"
+path = "examples/document_images.rs"
+
+[[example]]
+name = "vector_demo"
+path = "examples/vector_demo.rs"
+
 [dependencies]
 metal = "0.33"
 cocoa = "0.26"

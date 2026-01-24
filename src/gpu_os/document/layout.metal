@@ -74,8 +74,57 @@ struct ComputedStyle {
     float border_radius;
     float opacity;
 
+    // CSS Positioning
+    uint position;       // POSITION_STATIC, RELATIVE, ABSOLUTE, FIXED
+    float top;           // Offset from top
+    float right_;        // Offset from right
+    float bottom;        // Offset from bottom
+    float left;          // Offset from left
+    int z_index;         // Stacking order
+
+    // Inheritance tracking
+    uint properties_set;
+
+    // CSS Overflow
+    uint overflow_x;
+    uint overflow_y;
+
+    // Box Shadow (up to 4 shadows)
+    uint shadow_count;
+    float shadow_offset_x[4];
+    float shadow_offset_y[4];
+    float shadow_blur[4];
+    float shadow_spread[4];
+    float shadow_color[16];
+    uint shadow_inset[4];
+
+    // Gradients (up to 8 color stops)
+    uint gradient_type;
+    float gradient_angle;
+    uint gradient_stop_count;
+    float gradient_stop_colors[32];
+    float gradient_stop_positions[8];
+
+    // Table layout
+    uint border_collapse;
+    float border_spacing;
     float _padding[2];
 };
+
+// CSS Position values
+constant uint POSITION_STATIC = 0;
+constant uint POSITION_RELATIVE = 1;
+constant uint POSITION_ABSOLUTE = 2;
+constant uint POSITION_FIXED = 3;
+
+// Special value for "auto" offset
+constant float OFFSET_AUTO = 3.4028235e+38;
+
+// CSS Overflow values
+constant uint OVERFLOW_VISIBLE = 0;
+constant uint OVERFLOW_HIDDEN = 1;
+constant uint OVERFLOW_SCROLL = 2;
+constant uint OVERFLOW_AUTO = 3;
 
 struct LayoutBox {
     // Position (relative to parent content box)
@@ -105,15 +154,62 @@ struct Viewport {
     float _padding[2];
 };
 
-// Calculate intrinsic content width for text
+// Calculate glyph advance for a character
+float glyph_advance(uint char_code, float font_size) {
+    if (char_code == ' ') return font_size * 0.3;
+    if (char_code == '\t') return font_size * 1.2;
+    if (char_code == '\n' || char_code == '\r') return 0.0;
+    return font_size * 0.6;
+}
+
+// Calculate intrinsic content width for text (unwrapped)
 float text_width(uint text_length, float font_size) {
     // Approximation: average character width is ~0.6 * font_size
     return float(text_length) * font_size * 0.6;
 }
 
-// Calculate intrinsic content height for text
+// Calculate intrinsic content height for single line of text
 float text_height(float font_size, float line_height) {
     return font_size * line_height;
+}
+
+// Calculate multi-line text height based on container width and text content
+float text_height_wrapped(
+    device const uint8_t* text,
+    uint text_start,
+    uint text_length,
+    float font_size,
+    float line_height,
+    float container_width
+) {
+    if (text_length == 0) return 0.0;
+    if (container_width <= 0) container_width = 10000.0;
+
+    float line_height_px = font_size * line_height;
+    uint line_count = 1;
+    float current_width = 0.0;
+
+    for (uint i = 0; i < text_length; i++) {
+        uint char_code = text[text_start + i];
+
+        // Newline forces new line
+        if (char_code == '\n') {
+            line_count++;
+            current_width = 0.0;
+            continue;
+        }
+
+        float advance = glyph_advance(char_code, font_size);
+        current_width += advance;
+
+        // Check for wrap
+        if (current_width > container_width && i > 0) {
+            line_count++;
+            current_width = advance;
+        }
+    }
+
+    return float(line_count) * line_height_px;
 }
 
 // Pass 1: Compute intrinsic sizes (bottom-up)
