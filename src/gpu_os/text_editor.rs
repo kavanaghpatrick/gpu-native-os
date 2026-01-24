@@ -459,6 +459,46 @@ kernel void text_editor_kernel(
             while (pos < count && chars[pos] != 10) pos++;
             doc->cursor_pos = pos;
         }}
+        else if (edit == EDIT_MOVE_UP) {{
+            // Find start of current line and calculate column
+            uint line_start = cursor;
+            while (line_start > 0 && chars[line_start - 1] != 10) line_start--;
+            uint col = cursor - line_start;
+
+            // Find start of previous line
+            if (line_start > 0) {{
+                uint prev_line_end = line_start - 1; // newline char
+                uint prev_line_start = prev_line_end;
+                while (prev_line_start > 0 && chars[prev_line_start - 1] != 10) prev_line_start--;
+
+                // Move to same column or end of previous line
+                uint prev_line_len = prev_line_end - prev_line_start;
+                if (col > prev_line_len) col = prev_line_len;
+                doc->cursor_pos = prev_line_start + col;
+            }}
+        }}
+        else if (edit == EDIT_MOVE_DOWN) {{
+            // Find start of current line and calculate column
+            uint line_start = cursor;
+            while (line_start > 0 && chars[line_start - 1] != 10) line_start--;
+            uint col = cursor - line_start;
+
+            // Find end of current line (newline char)
+            uint line_end = cursor;
+            while (line_end < count && chars[line_end] != 10) line_end++;
+
+            // If there's a next line
+            if (line_end < count) {{
+                uint next_line_start = line_end + 1;
+                uint next_line_end = next_line_start;
+                while (next_line_end < count && chars[next_line_end] != 10) next_line_end++;
+
+                // Move to same column or end of next line
+                uint next_line_len = next_line_end - next_line_start;
+                if (col > next_line_len) col = next_line_len;
+                doc->cursor_pos = next_line_start + col;
+            }}
+        }}
     }}
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -963,6 +1003,112 @@ impl TextEditor {
 
     pub fn newline(&mut self) {
         self.pending_edit = EDIT_NEWLINE;
+    }
+
+    /// Load file contents into the editor
+    pub fn load_file(&mut self, path: &str) -> Result<(), String> {
+        use std::fs;
+
+        let content = fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read file: {}", e))?;
+
+        // Truncate to MAX_CHARS if needed
+        let content: String = content.chars().take(MAX_CHARS - 1).collect();
+        let char_count = content.len();
+
+        unsafe {
+            // Update document state
+            let doc_ptr = self.doc_buffer.contents() as *mut Document;
+            (*doc_ptr).char_count = char_count as u32;
+            (*doc_ptr).cursor_pos = 0;
+            (*doc_ptr).selection_start = 0;
+            (*doc_ptr).selection_end = 0;
+            (*doc_ptr).scroll_line = 0;
+            (*doc_ptr).target_column = 0;
+            (*doc_ptr).dirty = 0;
+
+            // Copy characters to GPU buffer
+            let chars_ptr = self.chars_buffer.contents() as *mut u32;
+            for (i, c) in content.chars().enumerate() {
+                *chars_ptr.add(i) = c as u32;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Clear the editor content
+    pub fn clear(&mut self) {
+        unsafe {
+            let doc_ptr = self.doc_buffer.contents() as *mut Document;
+            (*doc_ptr).char_count = 0;
+            (*doc_ptr).cursor_pos = 0;
+            (*doc_ptr).selection_start = 0;
+            (*doc_ptr).selection_end = 0;
+            (*doc_ptr).scroll_line = 0;
+            (*doc_ptr).target_column = 0;
+            (*doc_ptr).dirty = 0;
+        }
+    }
+
+    /// Load file using GPU-Direct Storage (Metal 3 MTLIOCommandQueue)
+    ///
+    /// This bypasses CPU for the file read - data goes directly from disk to GPU buffer.
+    /// UTF-8 decoding still happens on CPU (future: GPU UTF-8 decoder kernel).
+    pub fn load_file_gpu_direct(
+        &mut self,
+        device: &metal::Device,
+        path: &str,
+    ) -> Result<(), String> {
+        use crate::gpu_os::gpu_io::{GpuIOQueue, GpuIOBuffer, IOPriority, IOQueueType};
+
+        // Create GPU I/O queue
+        let io_queue = GpuIOQueue::new(device, IOPriority::Normal, IOQueueType::Concurrent)
+            .ok_or_else(|| "GPU-Direct I/O not supported (requires Metal 3)".to_string())?;
+
+        // Load file directly to GPU buffer
+        let gpu_buffer = GpuIOBuffer::load_file(&io_queue, path)
+            .ok_or_else(|| format!("Failed to load file via GPU-Direct: {}", path))?;
+
+        let file_size = gpu_buffer.file_size() as usize;
+        if file_size == 0 {
+            self.clear();
+            return Ok(());
+        }
+
+        // Read bytes from GPU buffer (shared memory - zero-copy access)
+        let bytes: &[u8] = unsafe {
+            let ptr = gpu_buffer.metal_buffer().contents() as *const u8;
+            std::slice::from_raw_parts(ptr, file_size)
+        };
+
+        // Convert UTF-8 to string (CPU - future: GPU UTF-8 decoder)
+        let content = std::str::from_utf8(bytes)
+            .map_err(|e| format!("Invalid UTF-8: {}", e))?;
+
+        // Truncate to MAX_CHARS if needed
+        let content: String = content.chars().take(MAX_CHARS - 1).collect();
+        let char_count = content.len();
+
+        unsafe {
+            // Update document state
+            let doc_ptr = self.doc_buffer.contents() as *mut Document;
+            (*doc_ptr).char_count = char_count as u32;
+            (*doc_ptr).cursor_pos = 0;
+            (*doc_ptr).selection_start = 0;
+            (*doc_ptr).selection_end = 0;
+            (*doc_ptr).scroll_line = 0;
+            (*doc_ptr).target_column = 0;
+            (*doc_ptr).dirty = 0;
+
+            // Copy characters to GPU buffer
+            let chars_ptr = self.chars_buffer.contents() as *mut u32;
+            for (i, c) in content.chars().enumerate() {
+                *chars_ptr.add(i) = c as u32;
+            }
+        }
+
+        Ok(())
     }
 }
 
