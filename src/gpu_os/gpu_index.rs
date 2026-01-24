@@ -10,7 +10,7 @@
 
 use metal::*;
 use std::fs::File;
-use std::io::{BufWriter, Write, BufReader, Read};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::mem;
 
@@ -422,6 +422,89 @@ impl GpuResidentIndex {
     /// Get memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
         self.mmap.aligned_size()
+    }
+
+    // ========================================================================
+    // GPU-Direct I/O Integration
+    // ========================================================================
+    //
+    // These methods bridge the GPU-resident index to GPU batch loading.
+    // Path resolution happens in GPU memory, then files load via MTLIOCommandQueue.
+
+    /// Get file paths matching an extension filter (for GPU batch loading).
+    ///
+    /// This reads from the GPU-resident index (fast) and returns PathBufs
+    /// that can be passed directly to GpuBatchLoader.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let index = GpuResidentIndex::load(&device, "index.bin")?;
+    /// let rust_files = index.files_with_extension("rs");
+    /// let batch_result = loader.load_batch(&rust_files);
+    /// ```
+    pub fn files_with_extension(&self, ext: &str) -> Vec<std::path::PathBuf> {
+        let ext_with_dot = format!(".{}", ext);
+        self.iter()
+            .filter(|e| !e.is_dir())
+            .filter(|e| e.path_str().ends_with(&ext_with_dot))
+            .map(|e| std::path::PathBuf::from(e.path_str()))
+            .collect()
+    }
+
+    /// Get file paths matching any of the given extensions.
+    pub fn files_with_extensions(&self, extensions: &[&str]) -> Vec<std::path::PathBuf> {
+        self.iter()
+            .filter(|e| !e.is_dir())
+            .filter(|e| {
+                let path = e.path_str();
+                extensions.iter().any(|ext| path.ends_with(&format!(".{}", ext)))
+            })
+            .map(|e| std::path::PathBuf::from(e.path_str()))
+            .collect()
+    }
+
+    /// Get all file paths (non-directories) from the index.
+    pub fn all_files(&self) -> Vec<std::path::PathBuf> {
+        self.iter()
+            .filter(|e| !e.is_dir())
+            .map(|e| std::path::PathBuf::from(e.path_str()))
+            .collect()
+    }
+
+    /// Get files in a specific directory (non-recursive).
+    pub fn files_in_directory(&self, dir: &str) -> Vec<std::path::PathBuf> {
+        let dir_prefix = if dir.ends_with('/') {
+            dir.to_string()
+        } else {
+            format!("{}/", dir)
+        };
+
+        self.iter()
+            .filter(|e| !e.is_dir())
+            .filter(|e| {
+                let path = e.path_str();
+                if !path.starts_with(&dir_prefix) {
+                    return false;
+                }
+                // Check it's directly in this dir, not a subdirectory
+                let remainder = &path[dir_prefix.len()..];
+                !remainder.contains('/')
+            })
+            .map(|e| std::path::PathBuf::from(e.path_str()))
+            .collect()
+    }
+
+    /// Get total size of files matching a filter (useful for progress estimation).
+    pub fn total_size_of_files(&self, paths: &[std::path::PathBuf]) -> u64 {
+        let path_set: std::collections::HashSet<&str> = paths
+            .iter()
+            .filter_map(|p| p.to_str())
+            .collect();
+
+        self.iter()
+            .filter(|e| path_set.contains(e.path_str()))
+            .map(|e| e.size)
+            .sum()
     }
 }
 
