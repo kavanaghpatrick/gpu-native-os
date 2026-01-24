@@ -57,45 +57,31 @@ Each frame, `GpuRuntime` executes:
 
 ## Demo Applications
 
-### Game of Life
+### Simulations
 
-Conway's Game of Life running entirely on GPU. The compute kernel:
-- Updates cell state (alive/dead) based on neighbor count
-- Generates colored quads for each living cell
-- All 1024 threads process cells in parallel
+| Demo | Description | Command |
+|------|-------------|---------|
+| **Waves** | 256x256 wave simulation with ripple effects | `cargo run --release --example waves` |
+| **Boids** | 1024-boid flocking (separation, alignment, cohesion) | `cargo run --release --example boids` |
+| **Particles** | 10K+ particle physics with mouse interaction | `cargo run --release --example particles` |
+| **Metaballs** | Organic blob animation with implicit surfaces | `cargo run --release --example metaballs` |
+| **Game of Life** | Conway's cellular automaton (32x32 grid) | `cargo run --release --example game_of_life` |
 
-```bash
-cargo run --example game_of_life
-```
+### Interactive Apps
 
-**Controls:** Click to toggle cells, watch patterns evolve.
+| Demo | Description | Command |
+|------|-------------|---------|
+| **Mandelbrot** | Fractal viewer with 10 preset locations | `cargo run --release --example mandelbrot` |
+| **Text Editor** | Full text editor with GPU-rendered font | `cargo run --release --example text_editor` |
 
-### Text Editor
+### Mandelbrot Controls
+- **Scroll** - Zoom in/out at cursor
+- **Click + drag** - Pan
+- **1-9, 0** - Jump to preset locations (Seahorse Valley, Double Spiral, Mini Mandelbrot, etc.)
+- **R** - Reset view
 
-A complete text editor running on the GPU. Features:
-- Document buffer in unified memory (64K chars max)
-- GPU-computed line layout and cursor positioning
-- 5x7 bitmap font rendered in fragment shader
-- Parallel character shifting for O(1) insert/delete
-
-```bash
-cargo run --example text_editor
-```
-
-**Controls:**
-- Type to insert characters
-- Arrow keys to move cursor
-- Backspace/Delete to remove characters
-- Enter for newlines
-- Home/End for line navigation
-
-### Ball Physics (Legacy)
-
-1024-ball physics simulation with collision detection.
-
-```bash
-cargo run --example ball_physics
-```
+### Text Editor Controls
+- Type to insert, arrow keys to move, Backspace/Delete, Enter for newlines
 
 ## Architecture
 
@@ -129,6 +115,71 @@ cargo run --example ball_physics
 
 **Branchless SIMD** keeps all threads executing the same instructions, avoiding warp divergence that kills GPU performance.
 
+## Benchmarks
+
+Measured on Apple M4 Pro. The GPU-Native OS thesis: **"1024 threads doing UI logic together beats 1 CPU thread."**
+
+### Key Finding: GPU Wins on Architecture, Not Raw Speed
+
+| Scenario | Traditional (3 dispatches) | GPU-Native (1 dispatch) | Speedup |
+|----------|---------------------------|------------------------|---------|
+| 10 widgets | 313 μs | 99 μs | **3.2x GPU** |
+| 50 widgets | 270 μs | 99 μs | **2.7x GPU** |
+| 200 widgets | 284 μs | 89 μs | **3.2x GPU** |
+| 500 widgets | 319 μs | 121 μs | **2.6x GPU** |
+| 1000 widgets | 348 μs | 110 μs | **3.2x GPU** |
+
+The win comes from **eliminating CPU→GPU sync points**, not raw compute speed.
+
+### Frame Pipelining: 6.75x Throughput
+
+| Mode | 1000 Frames | FPS |
+|------|-------------|-----|
+| Serial (wait each frame) | 104.6 ms | 9,562 |
+| Pipelined (overlap frames) | 15.5 ms | 64,584 |
+| **Speedup** | | **6.75x** |
+
+### Raw GPU Dispatch Overhead
+
+GPU dispatch has ~80-150μs fixed overhead regardless of work size:
+
+| Operation | GPU (μs) | CPU (μs) | Notes |
+|-----------|----------|----------|-------|
+| Sort 1024 widgets | 117 | 12 | CPU wins raw compute |
+| HitTest 2048 widgets | 89 | 1.2 | CPU wins raw compute |
+
+**Conclusion:** GPU-Native wins on *architecture* (fewer sync points, frame pipelining), not raw compute. For real apps with rendering, the compute work is essentially free since the GPU is already busy.
+
+### Run Benchmarks
+
+```bash
+# Automated benchmark suite
+cargo run --release --example benchmark_auto -- --iterations 100
+
+# Visual real-time comparison
+cargo run --release --example benchmark_visual
+
+# Full frame pipeline comparison
+cargo run --release --example benchmark_realistic
+```
+
+## Pipeline Modes
+
+Apps can choose their latency/throughput tradeoff:
+
+```rust
+fn pipeline_mode(&self) -> PipelineMode {
+    PipelineMode::HighThroughput  // Simulations: allow frame overlap
+    // or
+    PipelineMode::LowLatency      // Text editors: minimize input delay
+}
+```
+
+| Mode | Behavior | Best For |
+|------|----------|----------|
+| `LowLatency` | Wait for previous frame | Text editors, interactive UI |
+| `HighThroughput` | Allow frames to overlap | Simulations, animations, games |
+
 ## Requirements
 
 - macOS with Apple Silicon (M1/M2/M3/M4) or AMD GPU
@@ -141,10 +192,17 @@ cargo run --example ball_physics
 # Build all examples
 cargo build --release
 
-# Run demos
-cargo run --example game_of_life --release
-cargo run --example text_editor --release
-cargo run --example ball_physics --release
+# Run demos (pick your favorite)
+cargo run --release --example waves          # Beautiful ripple effects
+cargo run --release --example boids          # Mesmerizing flocking
+cargo run --release --example particles      # 10K particle physics
+cargo run --release --example mandelbrot     # Fractal exploration
+cargo run --release --example metaballs      # Organic blobs
+cargo run --release --example game_of_life   # Classic cellular automaton
+cargo run --release --example text_editor    # GPU-powered text editing
+
+# Run benchmarks
+cargo run --release --example benchmark_auto
 
 # Run tests
 cargo test
@@ -157,28 +215,33 @@ src/
 ├── lib.rs                    # Library entry
 └── gpu_os/
     ├── mod.rs                # Module exports
-    ├── app.rs                # GpuApp trait + GpuRuntime
-    ├── kernel.rs             # Compute kernel management
+    ├── app.rs                # GpuApp trait + GpuRuntime + PipelineMode
     ├── memory.rs             # GPU buffer allocation
     ├── input.rs              # Input event handling
-    ├── layout.rs             # Constraint-based layout
-    ├── widget.rs             # Widget state & types
-    ├── text.rs               # Text rendering
-    ├── render.rs             # Hybrid compute+fragment pipeline
     ├── vsync.rs              # Frame timing & sync
-    ├── game_of_life.rs       # Game of Life app
-    ├── text_editor.rs        # Text Editor app
-    └── ball_physics.rs       # Ball Physics demo
+    │
+    ├── # Apps
+    ├── waves.rs              # Wave simulation
+    ├── boids.rs              # Flocking simulation
+    ├── particles.rs          # Particle system
+    ├── mandelbrot.rs         # Fractal viewer
+    ├── metaballs.rs          # Organic blobs
+    ├── game_of_life.rs       # Cellular automaton
+    ├── text_editor.rs        # Text editor
+    └── benchmark_visual.rs   # Visual benchmark
 
 examples/
+├── waves.rs                  # Wave demo runner
+├── boids.rs                  # Boids demo runner
+├── particles.rs              # Particles demo runner
+├── mandelbrot.rs             # Mandelbrot demo runner
+├── metaballs.rs              # Metaballs demo runner
 ├── game_of_life.rs           # Game of Life demo runner
 ├── text_editor.rs            # Text Editor demo runner
-├── ball_physics.rs           # Ball Physics demo runner
-└── gpu_os_demo.rs            # Legacy OS demo
-
-docs/
-├── GPU_NATIVE_OS_V2_PRD.md   # OS design document
-└── TEXT_EDITOR_PRD.md        # Text editor design
+├── benchmark_visual.rs       # Visual benchmark
+├── benchmark_auto.rs         # Automated benchmarks
+├── benchmark_realistic.rs    # Pipeline comparison
+└── benchmark_frame.rs        # Frame throughput test
 ```
 
 ## Creating a New App
@@ -206,14 +269,15 @@ impl GpuApp for MyApp {
 }
 ```
 
-## Performance
+## Performance (M4 Pro)
 
-| Metric | Target |
-|--------|--------|
-| Frame time | < 8ms (120 FPS) |
-| Compute dispatch | < 1ms |
-| Input latency | 1 frame |
-| Memory | Unified (no copies) |
+| Metric | Measured |
+|--------|----------|
+| Frame time | ~0.1-0.3 ms (compute only) |
+| GPU dispatch overhead | ~80-150 μs |
+| Simulations | 3,000-10,000+ FPS potential |
+| Input latency | 1 frame (LowLatency mode) |
+| Memory | Unified (zero copies) |
 
 ## License
 
