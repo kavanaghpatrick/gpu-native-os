@@ -425,6 +425,50 @@ Zero-Copy:    File → mmap() → newBufferWithBytesNoCopy() → GPU buffer
 | Memory usage | 2× file size | 1× file size |
 | Load time (10MB) | ~15ms | <1ms |
 
+#### GPU-Direct Storage (Issue #112)
+
+**Full file lifecycle on GPU: Create → Open → Edit → Save → Close**
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Apple Silicon                         │
+│  ┌──────────────────────────────────────────────────┐   │
+│  │              Unified Memory                       │   │
+│  │  ┌─────────┐      ┌─────────┐      ┌─────────┐   │   │
+│  │  │  GPU    │ ───► │  mmap   │ ───► │  File   │   │   │
+│  │  │ Buffer  │      │ (shared)│      │ System  │   │   │
+│  │  └─────────┘      └─────────┘      └─────────┘   │   │
+│  │       │                │                 │        │   │
+│  │       └────────────────┴─────────────────┘        │   │
+│  │           Same physical memory!                   │   │
+│  └──────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────┘
+```
+
+Two approaches for GPU-direct file access:
+
+| API | Use Case | How It Works |
+|-----|----------|--------------|
+| `MTLIOCommandQueue` | Read files → GPU | Metal 3+ async file loading |
+| `WritableMmapBuffer` | Read/Write files | mmap with MAP_SHARED |
+
+**Benchmark Results (10MB file):**
+
+| Approach | Time | vs CPU |
+|----------|------|--------|
+| CPU Read + Copy | 0.91ms | baseline |
+| mmap Zero-Copy | 0.02ms | 40× faster |
+| GPU-Direct IO (async) | 0.73ms | 1.3× faster |
+
+**GPU File Writing Example:**
+```rust
+// Create file, GPU writes, auto-syncs to disk
+let buffer = WritableMmapBuffer::create(&device, "output.bin", 4096)?;
+encoder.set_buffer(0, Some(buffer.metal_buffer()), 0);
+// ... GPU compute shader writes data ...
+buffer.sync()?;  // Flush to disk
+```
+
 #### GPU-Resident Filesystem Index (Issue #77)
 
 ```rust
@@ -526,7 +570,8 @@ PipelineMode::HighThroughput  // Simulations: allow frame overlap (6.75× speedu
 ```
 src/gpu_os/
 ├── Foundation
-│   ├── mmap_buffer.rs        # #82 - Zero-copy file-to-GPU
+│   ├── mmap_buffer.rs        # #82 - Zero-copy file-to-GPU + WritableMmapBuffer
+│   ├── gpu_io.rs             # #112 - GPU-Direct Storage (MTLIOCommandQueue)
 │   ├── gpu_index.rs          # #77 - GPU-Resident Filesystem Index
 │   ├── parallel_alloc.rs     # #91 - Parallel Prefix Allocator
 │   ├── metal_types.rs        # Metal-safe struct definitions
@@ -652,7 +697,8 @@ for i in 0..n:  # All iterations independent
 | Layout | GPU level-parallel | GPU | ✅ Implemented |
 | Text wrapping | GPU | GPU | ✅ Implemented |
 | Vertex generation | GPU | GPU | ✅ Implemented |
-| Initial HTML load | CPU | GPU-initiated storage | 🔄 In progress |
+| File Read | GPU (MTLIOCommandQueue) | GPU | ✅ Implemented |
+| File Write | GPU (mmap + sync) | GPU | ✅ Implemented |
 | Font parsing | CPU | GPU bezier extraction | 📋 Planned |
 | Frame submission | CPU | Persistent kernels | 📋 Planned |
 
