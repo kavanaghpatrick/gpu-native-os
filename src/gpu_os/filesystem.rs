@@ -1,0 +1,1999 @@
+// GPU-Native Filesystem
+//
+// Issue #19: Core Filesystem Data Structures
+// Implements filesystem as a GpuApp that performs all operations on GPU
+//
+// Key reuse from existing framework:
+// - Same parent/child/sibling pattern as WidgetCompact
+// - Uses AppBuilder for shader compilation
+// - Leverages APP_SHADER_HEADER
+// - Implements GpuApp trait for integration with GpuRuntime
+
+use super::app::{AppBuilder, GpuApp, PipelineMode, APP_SHADER_HEADER};
+use super::memory::{FrameState, GpuMemory, InputEvent, InputEventType};
+use super::vsync::FrameTiming;
+use metal::*;
+use std::cell::Cell;
+use std::mem;
+
+// ============================================================================
+// Constants (matching existing framework)
+// ============================================================================
+
+/// Block size (4KB - standard for filesystems)
+pub const BLOCK_SIZE: usize = 4096;
+
+/// Root inode ID (like ROOT widget)
+pub const ROOT_INODE_ID: u32 = 0;
+
+/// Invalid inode (like INVALID widget)
+pub const INVALID_INODE: u32 = 0xFFFFFFFF;
+
+/// Maximum path depth
+pub const MAX_PATH_DEPTH: usize = 16;
+
+/// Maximum filename length
+pub const MAX_FILENAME_LEN: usize = 255;
+
+// ============================================================================
+// Data Structures (following WidgetCompact pattern)
+// ============================================================================
+
+/// Compact inode structure - 64 bytes (cache-line aligned)
+/// Mirrors WidgetCompact's parent/child/sibling pattern
+/// Fields ordered for optimal packing: u64s first, then u32s, then u16s
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+#[allow(dead_code)] // Some fields accessed via unsafe pointers
+pub struct InodeCompact {
+    // u64 fields first (24 bytes)
+    pub inode_id: u64,          // Unique inode number
+    pub size: u64,              // File size in bytes
+    pub timestamps: u64,        // Packed: created|modified|accessed
+
+    // u32 fields (32 bytes = 8 fields)
+    pub parent_id: u32,         // Parent directory (like widget.parent_id)
+    pub first_child: u32,       // First child inode (like widget.first_child)
+    pub next_sibling: u32,      // Next sibling (like widget.next_sibling)
+    pub prev_sibling: u32,      // Previous sibling
+    pub blocks: u32,            // Number of 4KB blocks allocated
+    pub block_ptr: u32,         // Offset in block map table
+    pub uid_gid: u32,           // Packed: uid(16) | gid(16)
+    pub checksum: u32,          // CRC32 of file content
+
+    // u16 fields (8 bytes)
+    pub mode: u16,              // Permissions (rwxrwxrwx)
+    pub flags: u16,             // Type, compression, encryption flags
+    pub refcount: u16,          // Hard link count
+    pub _padding: u16,          // Alignment to 64 bytes
+}
+// Total: 24 + 32 + 8 = 64 bytes exactly
+
+/// Directory entry - 32 bytes (like DirEntryCompact, half cache line)
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct DirEntryCompact {
+    pub inode_id: u32,          // Target inode
+    pub name_hash: u32,         // xxHash3 of filename
+    pub name_len: u16,          // Filename length
+    pub file_type: u8,          // Cached from inode
+    pub _padding: u8,
+    pub name: [u8; 20],         // Short filename (inline for <20 chars)
+}
+// Total: 4 + 4 + 2 + 1 + 1 + 20 = 32 bytes
+
+/// Block map entry - 8 bytes
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct BlockMapEntry {
+    pub physical_block: u32,    // Physical block number on disk
+    pub flags: u16,             // Sparse, compressed, encrypted, CoW
+    pub refcount: u16,          // For deduplication/CoW
+}
+
+/// File types
+#[repr(u8)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FileType {
+    Regular = 0,
+    Directory = 1,
+    Symlink = 2,
+    BlockDevice = 3,
+    CharDevice = 4,
+    Fifo = 5,
+    Socket = 6,
+    Unknown = 7,
+}
+
+impl FileType {
+    pub fn from_u8(value: u8) -> Self {
+        match value & 0x0F {
+            0 => Self::Regular,
+            1 => Self::Directory,
+            2 => Self::Symlink,
+            3 => Self::BlockDevice,
+            4 => Self::CharDevice,
+            5 => Self::Fifo,
+            6 => Self::Socket,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+// ============================================================================
+// Helper implementations (like WidgetCompact helpers)
+// ============================================================================
+
+impl Default for InodeCompact {
+    fn default() -> Self {
+        Self {
+            inode_id: 0,
+            size: 0,
+            timestamps: 0,
+            parent_id: 0,
+            first_child: INVALID_INODE,
+            next_sibling: INVALID_INODE,
+            prev_sibling: INVALID_INODE,
+            blocks: 0,
+            block_ptr: 0,
+            uid_gid: 0,
+            checksum: 0,
+            mode: 0o644,
+            flags: 0,
+            refcount: 1,
+            _padding: 0,
+        }
+    }
+}
+
+impl InodeCompact {
+    pub fn new(inode_id: u64, parent_id: u32, file_type: FileType) -> Self {
+        let mut inode = Self::default();
+        inode.inode_id = inode_id;
+        inode.parent_id = parent_id;
+        inode.set_file_type(file_type);
+        inode
+    }
+
+    // Flag manipulation (like WidgetCompact flags)
+    pub fn set_file_type(&mut self, file_type: FileType) {
+        self.flags = (self.flags & 0xFFF0) | (file_type as u16 & 0x0F);
+    }
+
+    pub fn get_file_type(&self) -> FileType {
+        FileType::from_u8((self.flags & 0x0F) as u8)
+    }
+
+    pub fn set_compressed(&mut self, enabled: bool) {
+        if enabled {
+            self.flags |= 0x0010;
+        } else {
+            self.flags &= !0x0010;
+        }
+    }
+
+    pub fn is_compressed(&self) -> bool {
+        (self.flags & 0x0010) != 0
+    }
+
+    pub fn is_directory(&self) -> bool {
+        self.get_file_type() == FileType::Directory
+    }
+}
+
+impl Default for DirEntryCompact {
+    fn default() -> Self {
+        Self {
+            inode_id: 0,
+            name_hash: 0,
+            name_len: 0,
+            file_type: 0,
+            _padding: 0,
+            name: [0; 20],
+        }
+    }
+}
+
+impl DirEntryCompact {
+    pub fn new(inode_id: u32, name: &str) -> Self {
+        let mut entry = Self::default();
+        entry.inode_id = inode_id;
+        entry.name_len = name.len().min(20) as u16;
+        entry.name_hash = xxhash3(name.as_bytes());
+        entry.name[..entry.name_len as usize].copy_from_slice(&name.as_bytes()[..entry.name_len as usize]);
+        entry
+    }
+}
+
+// Simple xxHash3 (placeholder - use real implementation in production)
+fn xxhash3(data: &[u8]) -> u32 {
+    let mut hash: u32 = 0x9E3779B1;
+    for &byte in data {
+        hash ^= byte as u32;
+        hash = hash.wrapping_mul(0x85EBCA77);
+    }
+    hash ^ (hash >> 16)
+}
+
+// ============================================================================
+// Metal Shader (uses APP_SHADER_HEADER from framework)
+// ============================================================================
+
+const FILESYSTEM_SHADER: &str = r#"
+{{APP_SHADER_HEADER}}
+
+// ============================================================================
+// Filesystem Structures (must match Rust)
+// ============================================================================
+
+struct InodeCompact {
+    // u64 fields first (24 bytes)
+    uint64_t inode_id;
+    uint64_t size;
+    uint64_t timestamps;
+    // u32 fields (32 bytes = 8 fields)
+    uint32_t parent_id;
+    uint32_t first_child;
+    uint32_t next_sibling;
+    uint32_t prev_sibling;
+    uint32_t blocks;
+    uint32_t block_ptr;
+    uint32_t uid_gid;
+    uint32_t checksum;
+    // u16 fields (8 bytes)
+    uint16_t mode;
+    uint16_t flags;
+    uint16_t refcount;
+    uint16_t _padding;
+};
+// Total: 24 + 32 + 8 = 64 bytes
+
+struct DirEntryCompact {
+    uint32_t inode_id;
+    uint32_t name_hash;
+    uint16_t name_len;
+    uint8_t file_type;
+    uint8_t _padding;
+    char name[20];
+};
+// Total: 32 bytes
+
+struct FsParams {
+    uint32_t current_directory;
+    uint32_t total_inodes;
+    uint32_t total_entries;
+    uint32_t selected_file;
+};
+
+struct Vertex {
+    float4 position [[position]];
+    float4 color;
+};
+
+// Path lookup structures
+struct PathComponent {
+    uint32_t hash;
+    char name[20];
+    uint16_t len;
+    uint16_t _padding;
+};
+
+struct PathLookupParams {
+    uint32_t start_inode;     // Starting inode (usually ROOT or current dir)
+    uint32_t component_count; // Number of path components
+    uint32_t total_entries;   // Total directory entries in filesystem
+    uint32_t _padding;
+};
+
+// Simple hash function (matches Rust xxhash3)
+uint32_t xxhash3(constant char* data, uint16_t len) {
+    uint32_t hash = 0x9E3779B1;
+    for (uint16_t i = 0; i < len; i++) {
+        hash ^= (uint32_t)data[i];
+        hash *= 0x85EBCA77;
+    }
+    return hash ^ (hash >> 16);
+}
+
+// ============================================================================
+// Path Lookup Kernel (Issue #21)
+// Resolves "/foo/bar/file.txt" to inode ID using parallel hash lookup
+// ============================================================================
+
+kernel void path_lookup_kernel(
+    device InodeCompact* inodes [[buffer(0)]],           // All inodes
+    device DirEntryCompact* entries [[buffer(1)]],       // All directory entries
+    constant PathLookupParams& params [[buffer(2)]],     // Lookup params
+    constant PathComponent* components [[buffer(3)]],    // Path components to resolve
+    device atomic_uint& result_inode [[buffer(4)]],      // Output: found inode ID
+    device atomic_uint& result_status [[buffer(5)]],     // Output: 0=success, 1=not_found
+    uint tid [[thread_index_in_threadgroup]]
+)
+{
+    const uint32_t INVALID_INODE = 0xFFFFFFFF;
+    const uint32_t STATUS_SUCCESS = 0;
+    const uint32_t STATUS_NOT_FOUND = 1;
+
+    // Initialize result (thread 0 only)
+    if (tid == 0) {
+        atomic_store_explicit(&result_inode, INVALID_INODE, memory_order_relaxed);
+        atomic_store_explicit(&result_status, STATUS_NOT_FOUND, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Walk path components sequentially (can't parallelize tree traversal)
+    // But we can parallelize the search within each directory
+    uint32_t current_inode = params.start_inode;
+
+    for (uint32_t comp_idx = 0; comp_idx < params.component_count; comp_idx++) {
+        PathComponent component = components[comp_idx];
+
+        // Parallel search: find entry with matching parent_id and hash
+        threadgroup uint32_t found_inode;
+        threadgroup atomic_uint found_flag;
+
+        if (tid == 0) {
+            found_inode = INVALID_INODE;
+            atomic_store_explicit(&found_flag, 0, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Each thread searches different entries
+        for (uint32_t i = tid; i < params.total_entries; i += 1024) {
+            uint32_t entry_inode = entries[i].inode_id;
+
+            // Check if this entry is in the current directory
+            if (inodes[entry_inode].parent_id == current_inode) {
+                // Check if hash matches
+                if (entries[i].name_hash == component.hash) {
+                    // Verify name (in case of hash collision)
+                    bool name_matches = true;
+                    if (entries[i].name_len == component.len) {
+                        for (uint16_t j = 0; j < component.len; j++) {
+                            if (entries[i].name[j] != component.name[j]) {
+                                name_matches = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        name_matches = false;
+                    }
+
+                    if (name_matches) {
+                        // Found it! (First thread to find wins)
+                        uint32_t old_flag = atomic_exchange_explicit(&found_flag, 1, memory_order_relaxed);
+                        if (old_flag == 0) {
+                            found_inode = entry_inode;
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Check if we found the component
+        if (found_inode == INVALID_INODE) {
+            // Path component not found - abort
+            if (tid == 0) {
+                atomic_store_explicit(&result_status, STATUS_NOT_FOUND, memory_order_relaxed);
+            }
+            return;
+        }
+
+        // Move to next level
+        current_inode = found_inode;
+    }
+
+    // Success - we resolved all components
+    if (tid == 0) {
+        atomic_store_explicit(&result_inode, current_inode, memory_order_relaxed);
+        atomic_store_explicit(&result_status, STATUS_SUCCESS, memory_order_relaxed);
+    }
+}
+
+// ============================================================================
+// Batch Path Lookup Kernel (Issue #26)
+// Multiple paths processed in parallel, one threadgroup per path
+// ============================================================================
+
+struct PathMetadata {
+    uint32_t start_idx;      // Index into components buffer
+    uint32_t component_count;// Number of components in this path
+    uint32_t start_inode;    // Starting inode (ROOT or current_dir)
+    uint32_t _padding;
+};
+
+struct BatchResult {
+    uint32_t inode_id;  // Result inode (or INVALID_INODE)
+    uint32_t status;    // 0=success, 1=not_found
+};
+
+// GPU Cache Entry (Issue #29)
+struct PathCacheEntry {
+    uint64_t path_hash;
+    uint32_t inode_id;
+    uint32_t access_count;
+    uint64_t timestamp;
+    uint32_t path_len;
+    uint32_t _padding;
+    char path[32];  // 32 bytes for 64-byte total
+};
+
+constant uint32_t CACHE_SIZE = 1024;
+constant uint64_t CACHE_MASK = 1023;
+
+// Compute hash of full path from components
+uint64_t compute_full_path_hash(
+    device PathComponent* components,
+    uint32_t start_idx,
+    uint32_t count
+) {
+    uint64_t hash = 0x9E3779B185EBCA87UL;
+
+    for (uint32_t i = 0; i < count; i++) {
+        PathComponent comp = components[start_idx + i];
+        hash ^= comp.hash;
+        hash *= 0x9E3779B185EBCA87UL;
+    }
+
+    return hash;
+}
+
+kernel void batch_path_lookup_kernel(
+    device InodeCompact* inodes [[buffer(0)]],
+    device DirEntryCompact* entries [[buffer(1)]],
+    constant uint32_t& total_inodes [[buffer(2)]],
+    constant uint32_t& total_entries [[buffer(3)]],
+    device PathComponent* all_components [[buffer(4)]],
+    device PathMetadata* path_metadata [[buffer(5)]],
+    device BatchResult* results [[buffer(6)]],
+    constant uint32_t& batch_size [[buffer(7)]],
+    device PathCacheEntry* cache [[buffer(8)]],           // GPU cache
+    device atomic_uint* cache_hits [[buffer(9)]],         // Hit counter
+    device atomic_uint* cache_misses [[buffer(10)]],      // Miss counter
+    constant uint32_t& frame_number [[buffer(11)]],       // Frame counter
+    uint gid [[thread_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]
+)
+{
+    const uint32_t INVALID_INODE = 0xFFFFFFFF;
+    const uint32_t STATUS_SUCCESS = 0;
+    const uint32_t STATUS_NOT_FOUND = 1;
+
+    // Calculate which path this threadgroup is processing
+    uint path_idx = gid / 1024;
+
+    if (path_idx >= batch_size) return;
+
+    // Load this path's metadata
+    PathMetadata meta = path_metadata[path_idx];
+
+    // === GPU CACHE CHECK (Issue #29) ===
+    threadgroup bool cache_hit_flag;
+    threadgroup uint32_t cached_inode;
+
+    if (tid == 0) {
+        cache_hit_flag = false;
+
+        // Compute full path hash
+        uint64_t full_path_hash = compute_full_path_hash(
+            all_components, meta.start_idx, meta.component_count
+        );
+
+        // Probe cache (direct-mapped)
+        uint32_t cache_slot = (uint32_t)(full_path_hash & CACHE_MASK);
+        PathCacheEntry entry = cache[cache_slot];
+
+        // Check if entry matches our path
+        if (entry.path_hash == full_path_hash) {
+            cache_hit_flag = true;
+            cached_inode = entry.inode_id;
+
+            // Update statistics
+            atomic_fetch_add_explicit(cache_hits, 1u, memory_order_relaxed);
+            cache[cache_slot].access_count++;
+            cache[cache_slot].timestamp = frame_number;
+        }
+
+        if (!cache_hit_flag) {
+            atomic_fetch_add_explicit(cache_misses, 1u, memory_order_relaxed);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // === CACHE HIT - Fast return ===
+    if (cache_hit_flag) {
+        if (tid == 0) {
+            results[path_idx].inode_id = cached_inode;
+            results[path_idx].status = STATUS_SUCCESS;
+        }
+        return;  // Done! ~50ns
+    }
+
+    // === CACHE MISS - Full lookup ===
+    uint32_t current_inode = meta.start_inode;
+
+    // Walk through each component of the path
+    for (uint32_t comp_idx = 0; comp_idx < meta.component_count; comp_idx++) {
+        PathComponent component = all_components[meta.start_idx + comp_idx];
+
+        // Shared variables for this threadgroup
+        threadgroup uint32_t found_inode;
+        threadgroup atomic_uint found_flag;
+
+        if (tid == 0) {
+            found_inode = INVALID_INODE;
+            atomic_store_explicit(&found_flag, 0, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Parallel search: each thread checks different entries
+        for (uint32_t i = tid; i < total_entries; i += 1024) {
+            uint32_t entry_inode = entries[i].inode_id;
+
+            // Check if this entry is in the current directory
+            if (inodes[entry_inode].parent_id == current_inode) {
+                // Check hash match
+                if (entries[i].name_hash == component.hash) {
+                    // Verify name (handle hash collisions)
+                    bool name_matches = true;
+                    if (entries[i].name_len == component.len) {
+                        for (uint16_t j = 0; j < component.len; j++) {
+                            if (entries[i].name[j] != component.name[j]) {
+                                name_matches = false;
+                                break;
+                            }
+                        }
+                    } else {
+                        name_matches = false;
+                    }
+
+                    if (name_matches) {
+                        // Found it! First thread to find wins
+                        uint32_t old = atomic_exchange_explicit(&found_flag, 1,
+                            memory_order_relaxed);
+                        if (old == 0) {
+                            found_inode = entry_inode;
+                        }
+                    }
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Check if component was found
+        if (found_inode == INVALID_INODE) {
+            // Path component not found - mark as error and exit
+            if (tid == 0) {
+                results[path_idx].inode_id = INVALID_INODE;
+                results[path_idx].status = STATUS_NOT_FOUND;
+            }
+            return;
+        }
+
+        // Move to next level
+        current_inode = found_inode;
+    }
+
+    // All components resolved successfully
+    if (tid == 0) {
+        results[path_idx].inode_id = current_inode;
+        results[path_idx].status = STATUS_SUCCESS;
+
+        // === UPDATE GPU CACHE (Issue #29) ===
+        if (current_inode != INVALID_INODE) {
+            // Compute full path hash
+            uint64_t full_path_hash = compute_full_path_hash(
+                all_components, meta.start_idx, meta.component_count
+            );
+
+            uint32_t cache_slot = (uint32_t)(full_path_hash & CACHE_MASK);
+
+            // Store in cache
+            cache[cache_slot].path_hash = full_path_hash;
+            cache[cache_slot].inode_id = current_inode;
+            cache[cache_slot].access_count = 1;
+            cache[cache_slot].timestamp = frame_number;
+            cache[cache_slot].path_len = 0; // TODO: store actual path
+        }
+    }
+}
+
+// ============================================================================
+// Compute Kernel (lists current directory, renders as UI)
+// ============================================================================
+
+kernel void filesystem_compute_kernel(
+    device FrameState& frame_state [[buffer(0)]],      // OS-provided
+    device InputQueue& input_queue [[buffer(1)]],      // OS-provided
+    constant FsParams& params [[buffer(2)]],           // App params
+    device InodeCompact* inodes [[buffer(3)]],         // Filesystem inodes
+    device DirEntryCompact* entries [[buffer(4)]],     // Filesystem entries
+    device Vertex* vertices [[buffer(5)]],             // Output vertices
+    device atomic_uint& vertex_count [[buffer(6)]],    // Output vertex count
+    uint tid [[thread_index_in_threadgroup]]
+)
+{
+    // Phase 1: Filter directory entries for current directory
+    threadgroup uint32_t local_matches[1024];
+    threadgroup atomic_uint match_count;
+
+    if (tid == 0) {
+        atomic_store_explicit(&match_count, 0, memory_order_relaxed);
+        atomic_store_explicit(&vertex_count, 0, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each thread checks different entries
+    for (uint32_t i = tid; i < params.total_entries; i += 1024) {
+        uint32_t entry_inode = entries[i].inode_id;
+        if (inodes[entry_inode].parent_id == params.current_directory) {
+            uint32_t idx = atomic_fetch_add_explicit(&match_count, 1, memory_order_relaxed);
+            local_matches[idx] = i;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint32_t count = atomic_load_explicit(&match_count, memory_order_relaxed);
+
+    // Phase 2: Generate vertices for file list UI
+    if (tid < count) {
+        uint32_t entry_idx = local_matches[tid];
+        DirEntryCompact entry = entries[entry_idx];
+
+        // Position: Each file is a rectangle at y = tid * 0.05
+        float y = -0.9 + float(tid) * 0.05;
+        float height = 0.04;
+        float width = 0.8;
+
+        // Color: Selected file is highlighted
+        float3 color = (entry_idx == params.selected_file)
+            ? float3(0.3, 0.5, 0.8)  // Blue (selected)
+            : float3(0.2, 0.2, 0.2); // Gray (normal)
+
+        // Generate 6 vertices (2 triangles) for this file entry
+        uint32_t base = atomic_fetch_add_explicit(&vertex_count, 6, memory_order_relaxed);
+
+        Vertex v0; v0.position = float4(-width, y, 0, 1); v0.color = float4(color, 1);
+        Vertex v1; v1.position = float4(width, y, 0, 1); v1.color = float4(color, 1);
+        Vertex v2; v2.position = float4(-width, y + height, 0, 1); v2.color = float4(color, 1);
+        Vertex v3; v3.position = float4(width, y, 0, 1); v3.color = float4(color, 1);
+        Vertex v4; v4.position = float4(width, y + height, 0, 1); v4.color = float4(color, 1);
+        Vertex v5; v5.position = float4(-width, y + height, 0, 1); v5.color = float4(color, 1);
+
+        vertices[base + 0] = v0;
+        vertices[base + 1] = v1;
+        vertices[base + 2] = v2;
+        vertices[base + 3] = v3;
+        vertices[base + 4] = v4;
+        vertices[base + 5] = v5;
+    }
+}
+
+// ============================================================================
+// Vertex Shader (pass-through)
+// ============================================================================
+
+vertex Vertex filesystem_vertex_shader(
+    uint vertex_id [[vertex_id]],
+    const device Vertex* vertices [[buffer(0)]]
+) {
+    return vertices[vertex_id];
+}
+
+// ============================================================================
+// Fragment Shader (simple color)
+// ============================================================================
+
+fragment float4 filesystem_fragment_shader(Vertex in [[stage_in]]) {
+    return in.color;
+}
+
+// ============================================================================
+// GPU Fuzzy Search Kernel (for filesystem browser)
+// ============================================================================
+
+constant uint32_t MAX_PATH_LEN = 256;
+constant uint32_t MAX_QUERY_WORDS = 8;
+constant uint32_t MAX_WORD_LEN = 32;
+
+struct SearchParams {
+    uint32_t path_count;
+    uint32_t word_count;
+    uint32_t _padding[2];
+};
+
+struct SearchWord {
+    char chars[32];   // Word characters (lowercase)
+    uint16_t len;
+    uint16_t _padding;
+};
+
+// Fuzzy match: all characters of needle appear in haystack in order
+bool fuzzy_match_gpu(device const char* haystack, uint16_t haystack_len,
+                     constant char* needle, uint16_t needle_len) {
+    uint16_t h_idx = 0;
+
+    for (uint16_t n_idx = 0; n_idx < needle_len; n_idx++) {
+        char needle_char = needle[n_idx];
+        bool found = false;
+
+        while (h_idx < haystack_len) {
+            char h_char = haystack[h_idx];
+            h_idx++;
+
+            // Convert to lowercase for comparison
+            if (h_char >= 'A' && h_char <= 'Z') {
+                h_char = h_char + 32;
+            }
+
+            if (h_char == needle_char) {
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) return false;
+    }
+
+    return true;
+}
+
+// Check if haystack contains needle as substring (case-insensitive)
+bool contains_substring_gpu(device const char* haystack, uint16_t haystack_len,
+                           constant char* needle, uint16_t needle_len) {
+    if (needle_len > haystack_len) return false;
+
+    for (uint16_t i = 0; i <= haystack_len - needle_len; i++) {
+        bool match = true;
+        for (uint16_t j = 0; j < needle_len; j++) {
+            char h_char = haystack[i + j];
+            char n_char = needle[j];
+
+            // Convert to lowercase
+            if (h_char >= 'A' && h_char <= 'Z') h_char += 32;
+
+            if (h_char != n_char) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+// Extract filename from path (find last '/')
+uint16_t find_filename_start(device const char* path, uint16_t path_len) {
+    for (int16_t i = path_len - 1; i >= 0; i--) {
+        if (path[i] == '/') {
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+kernel void fuzzy_search_kernel(
+    device const char* paths [[buffer(0)]],           // All paths (packed, MAX_PATH_LEN each)
+    device const uint16_t* path_lengths [[buffer(1)]], // Length of each path
+    constant SearchParams& params [[buffer(2)]],       // Search parameters
+    constant SearchWord* words [[buffer(3)]],          // Query words (lowercase)
+    device int32_t* scores [[buffer(4)]],              // Output: match scores (-1 = no match)
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.path_count) return;
+
+    // Get this thread's path
+    device const char* path = paths + (gid * MAX_PATH_LEN);
+    uint16_t path_len = path_lengths[gid];
+
+    // Find filename start
+    uint16_t filename_start = find_filename_start(path, path_len);
+    device const char* filename = path + filename_start;
+    uint16_t filename_len = path_len - filename_start;
+
+    // Check if ALL words match (fuzzy)
+    int32_t score = 0;
+
+    for (uint32_t w = 0; w < params.word_count; w++) {
+        constant char* word = words[w].chars;
+        uint16_t word_len = words[w].len;
+
+        // Check for exact substring in filename (best match)
+        if (contains_substring_gpu(filename, filename_len, word, word_len)) {
+            score += 100;
+            // Bonus for matching at start of filename
+            bool starts_with = true;
+            for (uint16_t i = 0; i < word_len && i < filename_len; i++) {
+                char f_char = filename[i];
+                if (f_char >= 'A' && f_char <= 'Z') f_char += 32;
+                if (f_char != word[i]) {
+                    starts_with = false;
+                    break;
+                }
+            }
+            if (starts_with) score += 50;
+        }
+        // Check for exact substring in full path
+        else if (contains_substring_gpu(path, path_len, word, word_len)) {
+            score += 30;
+        }
+        // Check fuzzy match in filename
+        else if (fuzzy_match_gpu(filename, filename_len, word, word_len)) {
+            score += 20;
+        }
+        // Check fuzzy match in full path
+        else if (fuzzy_match_gpu(path, path_len, word, word_len)) {
+            score += 5;
+        }
+        // Word doesn't match at all - reject this path
+        else {
+            scores[gid] = -1;
+            return;
+        }
+    }
+
+    // Penalty for deeper paths (count slashes)
+    int32_t depth = 0;
+    for (uint16_t i = 0; i < path_len; i++) {
+        if (path[i] == '/') depth++;
+    }
+    score -= min(depth, 10);
+
+    scores[gid] = score;
+}
+"#;
+
+// Replace placeholder with actual header
+fn get_filesystem_shader() -> String {
+    FILESYSTEM_SHADER.replace("{{APP_SHADER_HEADER}}", APP_SHADER_HEADER)
+}
+
+// ============================================================================
+// Filesystem Parameters
+// ============================================================================
+
+#[repr(C)]
+struct FsParams {
+    current_directory: u32,
+    total_inodes: u32,
+    total_entries: u32,
+    selected_file: u32,
+}
+
+// ============================================================================
+// Path Lookup Structures (Issue #21)
+// ============================================================================
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct PathComponent {
+    hash: u32,
+    name: [u8; 20],
+    len: u16,
+    _padding: u16,
+}
+// Total: 4 + 20 + 2 + 2 = 28 bytes
+
+#[repr(C)]
+struct PathLookupParams {
+    start_inode: u32,
+    component_count: u32,
+    total_entries: u32,
+    _padding: u32,
+}
+
+// ============================================================================
+// Batch Lookup Structures (Issue #26)
+// ============================================================================
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct PathMetadata {
+    start_idx: u32,       // Index into components buffer
+    component_count: u32, // Number of components in this path
+    start_inode: u32,     // Starting inode (ROOT or current_dir)
+    _padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct BatchResult {
+    inode_id: u32,   // Result inode (or INVALID_INODE)
+    status: u32,     // 0=success, 1=not_found
+}
+
+#[repr(C)]
+struct BatchParams {
+    total_inodes: u32,
+    total_entries: u32,
+    batch_size: u32,
+    frame_number: u32,  // For cache timestamps
+}
+
+// ============================================================================
+// GPU Cache Structures (Issue #29)
+// ============================================================================
+
+/// GPU-side cache entry - 64 bytes (cache-line aligned)
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+pub struct PathCacheEntry {
+    pub path_hash: u64,      // xxHash3 of full path
+    pub inode_id: u32,       // Cached inode result
+    pub access_count: u32,   // Statistics
+    pub timestamp: u64,      // Last access (frame number)
+    pub path_len: u32,       // Path length
+    pub _padding: u32,
+    pub path: [u8; 32],      // Inline path for verification (32 bytes for 64-byte total)
+}
+// Total: 64 bytes (8+4+4+8+4+4+32)
+
+impl PathCacheEntry {
+    pub fn is_valid(&self) -> bool {
+        self.path_hash != 0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PathCacheStats {
+    pub hits: u32,
+    pub misses: u32,
+    pub hit_rate: f64,
+    pub total_entries: usize,
+}
+
+const CACHE_SIZE: usize = 1024;
+const CACHE_MASK: u64 = 1023; // CACHE_SIZE - 1
+
+// ============================================================================
+// GpuFilesystem - implements GpuApp
+// ============================================================================
+
+pub struct GpuFilesystem {
+    device: Device,
+    command_queue: CommandQueue,  // Reusable queue to avoid context leaks
+
+    // Pipelines (reusing AppBuilder pattern)
+    compute_pipeline: ComputePipelineState,
+    render_pipeline: RenderPipelineState,
+    path_lookup_pipeline: ComputePipelineState,  // Issue #21
+    batch_lookup_pipeline: ComputePipelineState, // Issue #26
+
+    // Filesystem buffers (slots 3-6)
+    inode_buffer: Buffer,           // Slot 3
+    dir_entry_buffer: Buffer,       // Slot 4
+    vertices_buffer: Buffer,        // Slot 5
+    vertex_count_buffer: Buffer,    // Slot 6
+
+    // Path lookup buffers (Issue #21)
+    path_components_buffer: Buffer,
+    path_lookup_params_buffer: Buffer,
+    path_result_inode_buffer: Buffer,
+    path_result_status_buffer: Buffer,
+
+    // Batch lookup buffers (Issue #26)
+    batch_components_buffer: Buffer,   // All PathComponents (flattened)
+    batch_metadata_buffer: Buffer,     // PathMetadata array
+    batch_results_buffer: Buffer,      // BatchResult array
+    batch_params_buffer: Buffer,       // BatchParams
+
+    // GPU cache buffers (Issue #29)
+    cache_buffer: Buffer,              // PathCacheEntry array (1024 entries)
+    cache_hits_buffer: Buffer,         // Atomic hit counter
+    cache_misses_buffer: Buffer,       // Atomic miss counter
+
+    // App params
+    params_buffer: Buffer,
+
+    // State
+    current_directory: u32,
+    selected_file: u32,
+    max_inodes: usize,
+    max_entries: usize,
+    current_inode_count: usize,
+    current_entry_count: usize,
+    max_batch_size: usize,  // Issue #26
+    frame_number: Cell<u32>, // Issue #29 - for cache timestamps (interior mutability)
+}
+
+impl GpuFilesystem {
+    pub fn new(device: &Device, max_inodes: usize) -> Result<Self, String> {
+        let builder = AppBuilder::new(device, "GpuFilesystem");
+
+        // Create reusable command queue (avoid context leaks from creating many queues)
+        let command_queue = device.new_command_queue();
+
+        // Compile shaders using AppBuilder
+        let library = builder.compile_library(&get_filesystem_shader())?;
+
+        let compute_pipeline = builder.create_compute_pipeline(
+            &library,
+            "filesystem_compute_kernel"
+        )?;
+
+        let render_pipeline = builder.create_render_pipeline(
+            &library,
+            "filesystem_vertex_shader",
+            "filesystem_fragment_shader"
+        )?;
+
+        let path_lookup_pipeline = builder.create_compute_pipeline(
+            &library,
+            "path_lookup_kernel"
+        )?;
+
+        let batch_lookup_pipeline = builder.create_compute_pipeline(
+            &library,
+            "batch_path_lookup_kernel"
+        )?;
+
+        // Allocate buffers (following GpuMemory pattern)
+        let max_entries = max_inodes * 10; // Assume avg 10 entries per directory
+
+        let inode_buffer = builder.create_buffer(max_inodes * mem::size_of::<InodeCompact>());
+        let dir_entry_buffer = builder.create_buffer(max_entries * mem::size_of::<DirEntryCompact>());
+        let vertices_buffer = builder.create_buffer(max_entries * 6 * mem::size_of::<f32>() * 8);
+        let vertex_count_buffer = builder.create_buffer(mem::size_of::<u32>());
+        let params_buffer = builder.create_buffer(mem::size_of::<FsParams>());
+
+        // Path lookup buffers (Issue #21)
+        let path_components_buffer = builder.create_buffer(MAX_PATH_DEPTH * mem::size_of::<PathComponent>());
+        let path_lookup_params_buffer = builder.create_buffer(mem::size_of::<PathLookupParams>());
+        let path_result_inode_buffer = builder.create_buffer(mem::size_of::<u32>());
+        let path_result_status_buffer = builder.create_buffer(mem::size_of::<u32>());
+
+        // Batch lookup buffers (Issue #26)
+        let max_batch_size = 256; // Support up to 256 concurrent paths
+        let batch_components_buffer = builder.create_buffer(
+            max_batch_size * MAX_PATH_DEPTH * mem::size_of::<PathComponent>()
+        );
+        let batch_metadata_buffer = builder.create_buffer(
+            max_batch_size * mem::size_of::<PathMetadata>()
+        );
+        let batch_results_buffer = builder.create_buffer(
+            max_batch_size * mem::size_of::<BatchResult>()
+        );
+        let batch_params_buffer = builder.create_buffer(mem::size_of::<BatchParams>());
+
+        // GPU cache buffers (Issue #29)
+        let cache_buffer = builder.create_buffer(CACHE_SIZE * mem::size_of::<PathCacheEntry>());
+        let cache_hits_buffer = builder.create_buffer(mem::size_of::<u32>());
+        let cache_misses_buffer = builder.create_buffer(mem::size_of::<u32>());
+
+        // Initialize root directory inode
+        let root = InodeCompact::new(ROOT_INODE_ID as u64, 0, FileType::Directory);
+        unsafe {
+            let ptr = inode_buffer.contents() as *mut InodeCompact;
+            *ptr = root;
+        }
+
+        // Initialize GPU cache (Issue #29)
+        unsafe {
+            let ptr = cache_buffer.contents() as *mut PathCacheEntry;
+            for i in 0..CACHE_SIZE {
+                *ptr.add(i) = PathCacheEntry {
+                    path_hash: 0,
+                    inode_id: 0,
+                    access_count: 0,
+                    timestamp: 0,
+                    path_len: 0,
+                    _padding: 0,
+                    path: [0; 32],
+                };
+            }
+
+            // Initialize statistics
+            *(cache_hits_buffer.contents() as *mut u32) = 0;
+            *(cache_misses_buffer.contents() as *mut u32) = 0;
+        }
+
+        Ok(Self {
+            device: device.clone(),
+            command_queue,
+            compute_pipeline,
+            render_pipeline,
+            path_lookup_pipeline,
+            batch_lookup_pipeline,
+            inode_buffer,
+            dir_entry_buffer,
+            vertices_buffer,
+            vertex_count_buffer,
+            path_components_buffer,
+            path_lookup_params_buffer,
+            path_result_inode_buffer,
+            path_result_status_buffer,
+            batch_components_buffer,
+            batch_metadata_buffer,
+            batch_results_buffer,
+            batch_params_buffer,
+            params_buffer,
+            current_directory: ROOT_INODE_ID,
+            selected_file: 0,
+            max_inodes,
+            max_entries,
+            current_inode_count: 1, // Root inode
+            current_entry_count: 0,
+            max_batch_size,
+            cache_buffer,
+            cache_hits_buffer,
+            cache_misses_buffer,
+            frame_number: Cell::new(0),
+        })
+    }
+
+    /// Add a file to the filesystem (for testing)
+    pub fn add_file(&mut self, parent_id: u32, name: &str, file_type: FileType) -> Result<u32, String> {
+        if self.current_inode_count >= self.max_inodes {
+            return Err("Too many inodes".to_string());
+        }
+
+        let inode_id = self.current_inode_count as u32;
+        let inode = InodeCompact::new(inode_id as u64, parent_id, file_type);
+
+        // Write inode
+        unsafe {
+            let ptr = self.inode_buffer.contents() as *mut InodeCompact;
+            *ptr.add(inode_id as usize) = inode;
+        }
+
+        // Create directory entry
+        let entry = DirEntryCompact::new(inode_id, name);
+        unsafe {
+            let ptr = self.dir_entry_buffer.contents() as *mut DirEntryCompact;
+            *ptr.add(self.current_entry_count) = entry;
+        }
+
+        self.current_inode_count += 1;
+        self.current_entry_count += 1;
+
+        Ok(inode_id)
+    }
+
+    /// Lookup a path using GPU parallel hash search (Issue #21)
+    ///
+    /// Examples:
+    ///   lookup_path("/foo/bar")        - absolute path from root
+    ///   lookup_path("foo/bar")         - relative from current_directory
+    ///   lookup_path("/")               - returns root inode
+    ///
+    /// Returns: Ok(inode_id) on success, Err(message) if not found
+    pub fn lookup_path(&self, path: &str) -> Result<u32, String> {
+        // Handle empty path
+        if path.is_empty() {
+            return Err("Empty path".to_string());
+        }
+
+        // Handle root path
+        if path == "/" {
+            return Ok(ROOT_INODE_ID);
+        }
+
+        // Determine starting inode (absolute vs relative)
+        let (start_inode, path_to_parse) = if path.starts_with('/') {
+            (ROOT_INODE_ID, &path[1..])  // Absolute path
+        } else {
+            (self.current_directory, path)  // Relative path
+        };
+
+        // Split path into components
+        let components: Vec<&str> = path_to_parse
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if components.is_empty() {
+            return Ok(start_inode);
+        }
+
+        if components.len() > MAX_PATH_DEPTH {
+            return Err(format!("Path too deep (max {})", MAX_PATH_DEPTH));
+        }
+
+        // Create PathComponent structs with hashes
+        let mut path_components = Vec::with_capacity(components.len());
+        for component in &components {
+            if component.len() > 20 {
+                return Err(format!("Component '{}' too long (max 20 chars)", component));
+            }
+
+            let mut pc = PathComponent {
+                hash: xxhash3(component.as_bytes()),
+                name: [0; 20],
+                len: component.len() as u16,
+                _padding: 0,
+            };
+            pc.name[..component.len()].copy_from_slice(component.as_bytes());
+            path_components.push(pc);
+        }
+
+        // Write components to GPU buffer
+        unsafe {
+            let ptr = self.path_components_buffer.contents() as *mut PathComponent;
+            for (i, component) in path_components.iter().enumerate() {
+                *ptr.add(i) = *component;
+            }
+        }
+
+        // Write lookup params
+        unsafe {
+            let params = self.path_lookup_params_buffer.contents() as *mut PathLookupParams;
+            *params = PathLookupParams {
+                start_inode,
+                component_count: path_components.len() as u32,
+                total_entries: self.current_entry_count as u32,
+                _padding: 0,
+            };
+        }
+
+        // Create command buffer
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.path_lookup_pipeline);
+        encoder.set_buffer(0, Some(&self.inode_buffer), 0);
+        encoder.set_buffer(1, Some(&self.dir_entry_buffer), 0);
+        encoder.set_buffer(2, Some(&self.path_lookup_params_buffer), 0);
+        encoder.set_buffer(3, Some(&self.path_components_buffer), 0);
+        encoder.set_buffer(4, Some(&self.path_result_inode_buffer), 0);
+        encoder.set_buffer(5, Some(&self.path_result_status_buffer), 0);
+
+        // Dispatch 1024 threads (1 threadgroup)
+        let threads = MTLSize::new(1024, 1, 1);
+        let threadgroups = MTLSize::new(1, 1, 1);
+        encoder.dispatch_thread_groups(threadgroups, threads);
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Read result
+        unsafe {
+            let status = *(self.path_result_status_buffer.contents() as *const u32);
+            if status == 0 {
+                let inode_id = *(self.path_result_inode_buffer.contents() as *const u32);
+                Ok(inode_id)
+            } else {
+                Err(format!("Path not found: {}", path))
+            }
+        }
+    }
+
+    /// Lookup multiple paths in a single GPU dispatch (Issue #26)
+    ///
+    /// # Example
+    /// ```
+    /// let paths = vec!["/src/main.rs", "/src/lib.rs", "/tests/test.rs"];
+    /// let results = fs.lookup_batch(&paths)?;
+    ///
+    /// for (path, result) in paths.iter().zip(results.iter()) {
+    ///     match result {
+    ///         Ok(inode_id) => println!("{} → {}", path, inode_id),
+    ///         Err(e) => println!("{} → Error: {}", path, e),
+    ///     }
+    /// }
+    /// ```
+    pub fn lookup_batch(&self, paths: &[&str]) -> Result<Vec<Result<u32, String>>, String> {
+        // 1. Validate input
+        if paths.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let batch_size = paths.len();
+        if batch_size > self.max_batch_size {
+            return Err(format!(
+                "Batch size {} exceeds max {}",
+                batch_size, self.max_batch_size
+            ));
+        }
+
+        // 2. Parse all paths into components
+        let mut all_components = Vec::new();
+        let mut metadata = Vec::new();
+
+        for path in paths.iter() {
+            // Handle empty path
+            if path.is_empty() {
+                return Err("Empty path in batch".to_string());
+            }
+
+            // Handle root path
+            if *path == "/" {
+                metadata.push(PathMetadata {
+                    start_idx: all_components.len() as u32,
+                    component_count: 0,
+                    start_inode: ROOT_INODE_ID,
+                    _padding: 0,
+                });
+                continue;
+            }
+
+            // Determine starting inode (absolute vs relative)
+            let (start_inode, path_to_parse) = if path.starts_with('/') {
+                (ROOT_INODE_ID, &path[1..])
+            } else {
+                (self.current_directory, *path)
+            };
+
+            // Split path into components
+            let components: Vec<&str> = path_to_parse
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if components.is_empty() {
+                metadata.push(PathMetadata {
+                    start_idx: all_components.len() as u32,
+                    component_count: 0,
+                    start_inode,
+                    _padding: 0,
+                });
+                continue;
+            }
+
+            if components.len() > MAX_PATH_DEPTH {
+                return Err(format!("Path too deep (max {}): {}", MAX_PATH_DEPTH, path));
+            }
+
+            // Create PathComponent structs
+            let start_idx = all_components.len() as u32;
+
+            for component in &components {
+                if component.len() > 20 {
+                    return Err(format!("Component '{}' too long (max 20 chars)", component));
+                }
+
+                let mut pc = PathComponent {
+                    hash: xxhash3(component.as_bytes()),
+                    name: [0; 20],
+                    len: component.len() as u16,
+                    _padding: 0,
+                };
+                pc.name[..component.len()].copy_from_slice(component.as_bytes());
+                all_components.push(pc);
+            }
+
+            metadata.push(PathMetadata {
+                start_idx,
+                component_count: components.len() as u32,
+                start_inode,
+                _padding: 0,
+            });
+        }
+
+        // 3. Write to GPU buffers
+        unsafe {
+            // Write components
+            let comp_ptr = self.batch_components_buffer.contents() as *mut PathComponent;
+            for (i, comp) in all_components.iter().enumerate() {
+                *comp_ptr.add(i) = *comp;
+            }
+
+            // Write metadata
+            let meta_ptr = self.batch_metadata_buffer.contents() as *mut PathMetadata;
+            for (i, meta) in metadata.iter().enumerate() {
+                *meta_ptr.add(i) = *meta;
+            }
+
+            // Write batch parameters
+            let current_frame = self.frame_number.get();
+            let params = self.batch_params_buffer.contents() as *mut BatchParams;
+            *params = BatchParams {
+                total_inodes: self.current_inode_count as u32,
+                total_entries: self.current_entry_count as u32,
+                batch_size: batch_size as u32,
+                frame_number: current_frame,
+            };
+        }
+
+        // Increment frame number for next batch
+        self.frame_number.set(self.frame_number.get().wrapping_add(1));
+
+        // 4. Dispatch GPU kernel
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.batch_lookup_pipeline);
+        encoder.set_buffer(0, Some(&self.inode_buffer), 0);
+        encoder.set_buffer(1, Some(&self.dir_entry_buffer), 0);
+        encoder.set_buffer(2, Some(&self.batch_params_buffer), 0);  // total_inodes
+        encoder.set_buffer(3, Some(&self.batch_params_buffer), 4);  // total_entries
+        encoder.set_buffer(4, Some(&self.batch_components_buffer), 0);
+        encoder.set_buffer(5, Some(&self.batch_metadata_buffer), 0);
+        encoder.set_buffer(6, Some(&self.batch_results_buffer), 0);
+        encoder.set_buffer(7, Some(&self.batch_params_buffer), 8);  // batch_size
+        encoder.set_buffer(8, Some(&self.cache_buffer), 0);      // GPU cache (Issue #29)
+        encoder.set_buffer(9, Some(&self.cache_hits_buffer), 0);  // Cache hit counter
+        encoder.set_buffer(10, Some(&self.cache_misses_buffer), 0); // Cache miss counter
+        encoder.set_buffer(11, Some(&self.batch_params_buffer), 12); // frame_number
+
+        // One threadgroup per path, 1024 threads per group
+        let threadgroups = MTLSize::new(batch_size as u64, 1, 1);
+        let threads_per_group = MTLSize::new(1024, 1, 1);
+        encoder.dispatch_thread_groups(threadgroups, threads_per_group);
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // 5. Read results
+        let mut results = Vec::with_capacity(batch_size);
+        unsafe {
+            let result_ptr = self.batch_results_buffer.contents() as *const BatchResult;
+
+            for i in 0..batch_size {
+                let result = *result_ptr.add(i);
+
+                if result.status == 0 {
+                    results.push(Ok(result.inode_id));
+                } else {
+                    results.push(Err(format!("Path not found: {}", paths[i])));
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Get GPU cache statistics (Issue #29)
+    pub fn cache_stats(&self) -> PathCacheStats {
+        unsafe {
+            let hits = *(self.cache_hits_buffer.contents() as *const u32);
+            let misses = *(self.cache_misses_buffer.contents() as *const u32);
+            let total = hits + misses;
+            let hit_rate = if total > 0 {
+                hits as f64 / total as f64
+            } else {
+                0.0
+            };
+
+            // Count non-zero entries in cache
+            let cache_ptr = self.cache_buffer.contents() as *const PathCacheEntry;
+            let mut total_entries = 0;
+            for i in 0..CACHE_SIZE {
+                let entry = *cache_ptr.add(i);
+                if entry.path_hash != 0 {
+                    total_entries += 1;
+                }
+            }
+
+            PathCacheStats {
+                hits,
+                misses,
+                hit_rate,
+                total_entries,
+            }
+        }
+    }
+
+    /// Clear GPU cache and reset statistics (Issue #29)
+    pub fn clear_cache(&mut self) {
+        unsafe {
+            // Clear cache entries
+            let ptr = self.cache_buffer.contents() as *mut PathCacheEntry;
+            for i in 0..CACHE_SIZE {
+                *ptr.add(i) = PathCacheEntry {
+                    path_hash: 0,
+                    inode_id: 0,
+                    access_count: 0,
+                    timestamp: 0,
+                    path_len: 0,
+                    _padding: 0,
+                    path: [0; 32],
+                };
+            }
+
+            // Reset statistics
+            *(self.cache_hits_buffer.contents() as *mut u32) = 0;
+            *(self.cache_misses_buffer.contents() as *mut u32) = 0;
+        }
+
+        // Reset frame number
+        self.frame_number.set(0);
+    }
+}
+
+// ============================================================================
+// GpuApp Implementation
+// ============================================================================
+
+impl GpuApp for GpuFilesystem {
+    fn name(&self) -> &str {
+        "GPU-Native Filesystem"
+    }
+
+    fn compute_pipeline(&self) -> &ComputePipelineState {
+        &self.compute_pipeline
+    }
+
+    fn render_pipeline(&self) -> &RenderPipelineState {
+        &self.render_pipeline
+    }
+
+    fn vertices_buffer(&self) -> &Buffer {
+        &self.vertices_buffer
+    }
+
+    fn vertex_count(&self) -> usize {
+        // Read from GPU buffer
+        unsafe {
+            *(self.vertex_count_buffer.contents() as *const u32) as usize
+        }
+    }
+
+    fn app_buffers(&self) -> Vec<&Buffer> {
+        vec![
+            &self.inode_buffer,         // Slot 3
+            &self.dir_entry_buffer,     // Slot 4
+            &self.vertices_buffer,      // Slot 5
+            &self.vertex_count_buffer,  // Slot 6
+        ]
+    }
+
+    fn params_buffer(&self) -> &Buffer {
+        &self.params_buffer
+    }
+
+    fn update_params(&mut self, _frame_state: &FrameState, _delta_time: f32) {
+        // Update filesystem parameters
+        unsafe {
+            let params = self.params_buffer.contents() as *mut FsParams;
+            (*params) = FsParams {
+                current_directory: self.current_directory,
+                total_inodes: self.current_inode_count as u32,
+                total_entries: self.current_entry_count as u32,
+                selected_file: self.selected_file,
+            };
+        }
+    }
+
+    fn handle_input(&mut self, event: &InputEvent) {
+        // Handle keyboard navigation
+        if event.event_type == InputEventType::KeyDown as u16 {
+            match event.keycode {
+                0x7D => { // Down arrow
+                    self.selected_file = (self.selected_file + 1) % self.current_entry_count as u32;
+                }
+                0x7E => { // Up arrow
+                    if self.selected_file > 0 {
+                        self.selected_file -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn clear_color(&self) -> MTLClearColor {
+        MTLClearColor::new(0.1, 0.1, 0.12, 1.0)
+    }
+}
+
+// ============================================================================
+// GPU Path Search (for filesystem browser fuzzy search)
+// ============================================================================
+
+const GPU_MAX_PATH_LEN: usize = 256;
+const GPU_MAX_QUERY_WORDS: usize = 8;
+const GPU_MAX_WORD_LEN: usize = 32;
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SearchParams {
+    path_count: u32,
+    word_count: u32,
+    _padding: [u32; 2],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+struct SearchWord {
+    chars: [u8; 32],
+    len: u16,
+    _padding: u16,
+}
+
+/// GPU-accelerated fuzzy path search
+///
+/// Searches millions of paths in parallel using Metal compute shaders.
+/// Each GPU thread checks one path against all query words.
+pub struct GpuPathSearch {
+    device: Device,
+    command_queue: CommandQueue,
+    search_pipeline: ComputePipelineState,
+
+    // Path storage
+    paths_buffer: Buffer,        // All paths (packed, 256 bytes each)
+    path_lengths_buffer: Buffer, // Length of each path (u16)
+
+    // Query
+    params_buffer: Buffer,       // SearchParams
+    words_buffer: Buffer,        // Query words
+
+    // Results
+    scores_buffer: Buffer,       // Match scores (i32, -1 = no match)
+
+    // State
+    max_paths: usize,
+    current_path_count: usize,
+    paths: Vec<String>,          // Original paths for result lookup
+}
+
+impl GpuPathSearch {
+    pub fn new(device: &Device, max_paths: usize) -> Result<Self, String> {
+        let builder = AppBuilder::new(device, "GpuPathSearch");
+        let command_queue = device.new_command_queue();
+
+        // Compile shader
+        let library = builder.compile_library(&get_filesystem_shader())?;
+        let search_pipeline = builder.create_compute_pipeline(&library, "fuzzy_search_kernel")?;
+
+        // Allocate buffers
+        let paths_buffer = builder.create_buffer(max_paths * GPU_MAX_PATH_LEN);
+        let path_lengths_buffer = builder.create_buffer(max_paths * mem::size_of::<u16>());
+        let params_buffer = builder.create_buffer(mem::size_of::<SearchParams>());
+        let words_buffer = builder.create_buffer(GPU_MAX_QUERY_WORDS * mem::size_of::<SearchWord>());
+        let scores_buffer = builder.create_buffer(max_paths * mem::size_of::<i32>());
+
+        Ok(Self {
+            device: device.clone(),
+            command_queue,
+            search_pipeline,
+            paths_buffer,
+            path_lengths_buffer,
+            params_buffer,
+            words_buffer,
+            scores_buffer,
+            max_paths,
+            current_path_count: 0,
+            paths: Vec::with_capacity(max_paths),
+        })
+    }
+
+    /// Add paths to the search index (call once after scanning filesystem)
+    pub fn add_paths(&mut self, paths: &[String]) -> Result<(), String> {
+        if paths.len() > self.max_paths {
+            return Err(format!("Too many paths: {} > {}", paths.len(), self.max_paths));
+        }
+
+        self.paths = paths.to_vec();
+        self.current_path_count = paths.len();
+
+        // Write paths to GPU buffer
+        unsafe {
+            let path_ptr = self.paths_buffer.contents() as *mut u8;
+            let len_ptr = self.path_lengths_buffer.contents() as *mut u16;
+
+            for (i, path) in paths.iter().enumerate() {
+                let bytes = path.as_bytes();
+                let len = bytes.len().min(GPU_MAX_PATH_LEN - 1);
+
+                // Copy path (truncated if necessary)
+                let dest = path_ptr.add(i * GPU_MAX_PATH_LEN);
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest, len);
+                // Zero-terminate
+                *dest.add(len) = 0;
+
+                // Store length
+                *len_ptr.add(i) = len as u16;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Perform GPU fuzzy search
+    ///
+    /// Returns: Vec of (path_index, score) for matching paths, sorted by score descending
+    pub fn search(&self, query: &str, max_results: usize) -> Vec<(usize, i32)> {
+        if query.is_empty() || self.current_path_count == 0 {
+            return vec![];
+        }
+
+        // Parse query into words (lowercase)
+        let words: Vec<&str> = query.split_whitespace().collect();
+        if words.is_empty() || words.len() > GPU_MAX_QUERY_WORDS {
+            return vec![];
+        }
+
+        // Write search params
+        unsafe {
+            let params = self.params_buffer.contents() as *mut SearchParams;
+            *params = SearchParams {
+                path_count: self.current_path_count as u32,
+                word_count: words.len() as u32,
+                _padding: [0; 2],
+            };
+
+            // Write query words
+            let words_ptr = self.words_buffer.contents() as *mut SearchWord;
+            for (i, word) in words.iter().enumerate() {
+                let lower = word.to_lowercase();
+                let bytes = lower.as_bytes();
+                let len = bytes.len().min(GPU_MAX_WORD_LEN - 1);
+
+                let mut sw = SearchWord {
+                    chars: [0; 32],
+                    len: len as u16,
+                    _padding: 0,
+                };
+                sw.chars[..len].copy_from_slice(&bytes[..len]);
+                *words_ptr.add(i) = sw;
+            }
+        }
+
+        // Dispatch GPU search
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        encoder.set_compute_pipeline_state(&self.search_pipeline);
+        encoder.set_buffer(0, Some(&self.paths_buffer), 0);
+        encoder.set_buffer(1, Some(&self.path_lengths_buffer), 0);
+        encoder.set_buffer(2, Some(&self.params_buffer), 0);
+        encoder.set_buffer(3, Some(&self.words_buffer), 0);
+        encoder.set_buffer(4, Some(&self.scores_buffer), 0);
+
+        // Dispatch: one thread per path
+        let threads_per_group = 256;
+        let thread_groups = (self.current_path_count + threads_per_group - 1) / threads_per_group;
+
+        encoder.dispatch_thread_groups(
+            MTLSize::new(thread_groups as u64, 1, 1),
+            MTLSize::new(threads_per_group as u64, 1, 1),
+        );
+
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Read results
+        let mut results: Vec<(usize, i32)> = Vec::new();
+        unsafe {
+            let scores = self.scores_buffer.contents() as *const i32;
+
+            for i in 0..self.current_path_count {
+                let score = *scores.add(i);
+                if score >= 0 {
+                    results.push((i, score));
+                }
+            }
+        }
+
+        // Sort by score (descending)
+        results.sort_by(|a, b| b.1.cmp(&a.1));
+
+        // Limit results
+        results.truncate(max_results);
+
+        results
+    }
+
+    /// Get path by index
+    pub fn get_path(&self, index: usize) -> Option<&str> {
+        self.paths.get(index).map(|s| s.as_str())
+    }
+
+    /// Get total path count
+    pub fn path_count(&self) -> usize {
+        self.current_path_count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_structure_sizes() {
+        assert_eq!(mem::size_of::<InodeCompact>(), 64);
+        assert_eq!(mem::size_of::<DirEntryCompact>(), 32);
+        assert_eq!(mem::size_of::<BlockMapEntry>(), 8);
+    }
+
+    #[test]
+    fn test_inode_flags() {
+        let mut inode = InodeCompact::new(1, 0, FileType::Regular);
+        assert_eq!(inode.get_file_type(), FileType::Regular);
+
+        inode.set_compressed(true);
+        assert!(inode.is_compressed());
+        assert_eq!(inode.get_file_type(), FileType::Regular); // Unchanged
+    }
+
+    #[test]
+    #[ignore]  // Requires Metal device
+    fn test_path_lookup_root() {
+        let device = Device::system_default().unwrap();
+        let fs = GpuFilesystem::new(&device, 128).unwrap();
+
+        // Root lookup
+        assert_eq!(fs.lookup_path("/").unwrap(), ROOT_INODE_ID);
+    }
+
+    #[test]
+    #[ignore]  // Requires Metal device
+    fn test_path_lookup_simple() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 128).unwrap();
+
+        // Create: /src
+        let src_id = fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).unwrap();
+
+        // Lookup absolute
+        assert_eq!(fs.lookup_path("/src").unwrap(), src_id);
+    }
+
+    #[test]
+    #[ignore]  // Requires Metal device
+    fn test_path_lookup_nested() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 128).unwrap();
+
+        // Create: /src/main.rs
+        let src_id = fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).unwrap();
+        let main_id = fs.add_file(src_id, "main.rs", FileType::Regular).unwrap();
+
+        // Lookup nested path
+        assert_eq!(fs.lookup_path("/src/main.rs").unwrap(), main_id);
+    }
+
+    #[test]
+    #[ignore]  // Requires Metal device
+    fn test_path_lookup_deep() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 128).unwrap();
+
+        // Create: /foo/bar/baz/file.txt
+        let foo_id = fs.add_file(ROOT_INODE_ID, "foo", FileType::Directory).unwrap();
+        let bar_id = fs.add_file(foo_id, "bar", FileType::Directory).unwrap();
+        let baz_id = fs.add_file(bar_id, "baz", FileType::Directory).unwrap();
+        let file_id = fs.add_file(baz_id, "file.txt", FileType::Regular).unwrap();
+
+        // Lookup deep path
+        assert_eq!(fs.lookup_path("/foo/bar/baz/file.txt").unwrap(), file_id);
+    }
+
+    #[test]
+    #[ignore]  // Requires Metal device
+    fn test_path_lookup_not_found() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 128).unwrap();
+
+        fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).unwrap();
+
+        // Non-existent path
+        assert!(fs.lookup_path("/nonexistent").is_err());
+        assert!(fs.lookup_path("/src/missing").is_err());
+    }
+
+    // ========================================================================
+    // Batch Lookup Tests (Issue #26)
+    // ========================================================================
+
+    #[test]
+    #[ignore]
+    fn test_batch_lookup_empty() {
+        let device = Device::system_default().unwrap();
+        let fs = GpuFilesystem::new(&device, 1024).unwrap();
+
+        let results = fs.lookup_batch(&[]).unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_batch_lookup_single() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 1024).unwrap();
+
+        let src_id = fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).unwrap();
+
+        let results = fs.lookup_batch(&["/src"]).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].as_ref().unwrap(), &src_id);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_batch_lookup_multiple() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 1024).unwrap();
+
+        let src_id = fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).unwrap();
+        let docs_id = fs.add_file(ROOT_INODE_ID, "docs", FileType::Directory).unwrap();
+        let tests_id = fs.add_file(ROOT_INODE_ID, "tests", FileType::Directory).unwrap();
+
+        let paths = vec!["/src", "/docs", "/tests"];
+        let results = fs.lookup_batch(&paths).unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap(), &src_id);
+        assert_eq!(results[1].as_ref().unwrap(), &docs_id);
+        assert_eq!(results[2].as_ref().unwrap(), &tests_id);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_batch_lookup_large() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 2048).unwrap();
+
+        // Create 100 files
+        let mut expected_ids = Vec::new();
+        let mut paths = Vec::new();
+
+        for i in 0..100 {
+            let name = format!("file{:03}", i);
+            let id = fs.add_file(ROOT_INODE_ID, &name, FileType::Regular).unwrap();
+            expected_ids.push(id);
+            paths.push(format!("/file{:03}", i));
+        }
+
+        // Batch lookup all 100
+        let path_refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let results = fs.lookup_batch(&path_refs).unwrap();
+
+        assert_eq!(results.len(), 100);
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(result.as_ref().unwrap(), &expected_ids[i],
+                "Path {} should resolve to inode {}", paths[i], expected_ids[i]);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn test_batch_lookup_mixed_success_fail() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 1024).unwrap();
+
+        let src_id = fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).unwrap();
+
+        let paths = vec!["/src", "/missing", "/src", "/also_missing"];
+        let results = fs.lookup_batch(&paths).unwrap();
+
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0].as_ref().unwrap(), &src_id);
+        assert!(results[1].is_err());
+        assert_eq!(results[2].as_ref().unwrap(), &src_id);
+        assert!(results[3].is_err());
+    }
+
+    #[test]
+    #[ignore]
+    fn test_batch_lookup_nested_paths() {
+        let device = Device::system_default().unwrap();
+        let mut fs = GpuFilesystem::new(&device, 1024).unwrap();
+
+        let src_id = fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).unwrap();
+        let gpu_os_id = fs.add_file(src_id, "gpu_os", FileType::Directory).unwrap();
+        let main_id = fs.add_file(src_id, "main.rs", FileType::Regular).unwrap();
+        let fs_id = fs.add_file(gpu_os_id, "filesystem.rs", FileType::Regular).unwrap();
+
+        let paths = vec![
+            "/src/main.rs",
+            "/src/gpu_os",
+            "/src/gpu_os/filesystem.rs",
+        ];
+        let results = fs.lookup_batch(&paths).unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap(), &main_id);
+        assert_eq!(results[1].as_ref().unwrap(), &gpu_os_id);
+        assert_eq!(results[2].as_ref().unwrap(), &fs_id);
+    }
+
+    #[test]
+    #[ignore]
+    fn test_batch_lookup_root_paths() {
+        let device = Device::system_default().unwrap();
+        let fs = GpuFilesystem::new(&device, 1024).unwrap();
+
+        let paths = vec!["/", "/", "/"];
+        let results = fs.lookup_batch(&paths).unwrap();
+
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert_eq!(result.as_ref().unwrap(), &ROOT_INODE_ID);
+        }
+    }
+}

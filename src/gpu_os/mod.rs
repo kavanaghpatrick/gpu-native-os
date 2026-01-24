@@ -10,6 +10,7 @@ pub mod text;        // #16 - Text Rendering (MSDF - partial)
 pub mod text_render; // Simple bitmap font text rendering
 pub mod render;      // #17 - Hybrid Rendering
 pub mod vsync;       // #18 - VSync Execution
+pub mod sdf_text;    // #33 - SDF Text Engine (new)
 
 // Application framework
 pub mod app;         // GpuApp trait and GpuRuntime
