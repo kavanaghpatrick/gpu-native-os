@@ -88,3 +88,7 @@ ureq = "2.9"
 ttf-parser = "0.25"  # TrueType/OpenType font parsing for SDF text
 dispatch = "0.2"     # GCD dispatch queues for SharedEvent callbacks
 block = "0.1"        # Objective-C blocks for Metal callbacks
+libc = "0.2"         # mmap syscalls for zero-copy buffers (#82)
+
+[dev-dependencies]
+tempfile = "3"       # Temporary files for tests
