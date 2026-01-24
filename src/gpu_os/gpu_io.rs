@@ -179,12 +179,13 @@ impl GpuIOFileHandle {
     /// Returns None if the file doesn't exist or can't be opened.
     pub fn open(device: &Device, path: impl AsRef<Path>) -> Option<Self> {
         let path_str = path.as_ref().to_str()?;
+        let path_cstring = std::ffi::CString::new(path_str).ok()?;
 
         unsafe {
             // Create NSURL from path
             let nsstring_class = class!(NSString);
             let path_ns: *mut Object = msg_send![nsstring_class,
-                stringWithUTF8String: path_str.as_ptr() as *const i8
+                stringWithUTF8String: path_cstring.as_ptr()
             ];
             if path_ns.is_null() {
                 return None;

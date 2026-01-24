@@ -6,7 +6,12 @@
 // Traditional: CPU scans → copies paths → GPU searches → repeat every search
 // GPU-Resident: CPU scans ONCE → mmap index → GPU owns data forever
 //
+// Loading methods:
+// 1. mmap (current) - OS maps file pages, GPU accesses via unified memory
+// 2. GPU-direct - MTLIOCommandQueue loads directly into GPU buffer (bypasses CPU entirely)
+//
 // Uses #82 (MmapBuffer) for zero-copy file-to-GPU access.
+// Uses #125 (GpuIOQueue) for GPU-direct file loading.
 
 use metal::*;
 use std::fs::File;
@@ -15,6 +20,7 @@ use std::path::Path;
 use std::mem;
 
 use super::mmap_buffer::{MmapBuffer, MmapError, PAGE_SIZE, align_to_page};
+use super::gpu_io::{GpuIOQueue, GpuIOFileHandle, IOPriority, IOQueueType};
 
 // ============================================================================
 // Constants
@@ -182,12 +188,67 @@ impl Default for IndexHeader {
 const _: () = assert!(mem::size_of::<IndexHeader>() == PAGE_SIZE);
 
 // ============================================================================
+// Index Storage - Either mmap or GPU-direct loaded
+// ============================================================================
+
+/// Storage backend for the GPU-resident index.
+///
+/// - Mmap: CPU mmaps file, GPU accesses via unified memory (traditional)
+/// - GpuDirect: MTLIOCommandQueue loads directly into GPU buffer (bypasses CPU)
+enum IndexStorage {
+    /// Traditional mmap-based storage (zero-copy via unified memory)
+    Mmap(MmapBuffer),
+    /// GPU-direct I/O storage (MTLIOCommandQueue, bypasses CPU entirely)
+    GpuDirect {
+        buffer: Buffer,
+        file_size: usize,
+    },
+}
+
+impl IndexStorage {
+    /// Get the Metal buffer
+    fn metal_buffer(&self) -> &Buffer {
+        match self {
+            IndexStorage::Mmap(mmap) => mmap.metal_buffer(),
+            IndexStorage::GpuDirect { buffer, .. } => buffer,
+        }
+    }
+
+    /// Get raw pointer to data
+    fn as_ptr(&self) -> *const u8 {
+        match self {
+            IndexStorage::Mmap(mmap) => mmap.as_ptr(),
+            IndexStorage::GpuDirect { buffer, .. } => buffer.contents() as *const u8,
+        }
+    }
+
+    /// Get file size
+    fn file_size(&self) -> usize {
+        match self {
+            IndexStorage::Mmap(mmap) => mmap.file_size(),
+            IndexStorage::GpuDirect { file_size, .. } => *file_size,
+        }
+    }
+
+    /// Get aligned buffer size
+    fn aligned_size(&self) -> usize {
+        match self {
+            IndexStorage::Mmap(mmap) => mmap.aligned_size(),
+            IndexStorage::GpuDirect { buffer, .. } => buffer.length() as usize,
+        }
+    }
+}
+
+// ============================================================================
 // GPU-Resident Index
 // ============================================================================
 
 /// A filesystem index that lives permanently in GPU memory.
 ///
-/// Uses mmap + newBufferWithBytesNoCopy for zero-copy access.
+/// Supports two loading methods:
+/// - `load()` - mmap + newBufferWithBytesNoCopy (zero-copy via unified memory)
+/// - `load_gpu_direct()` - MTLIOCommandQueue (GPU loads file directly, CPU never touches bytes)
+///
 /// Once loaded, the GPU owns this data - no CPU copies ever.
 ///
 /// # Example
@@ -195,15 +256,18 @@ const _: () = assert!(mem::size_of::<IndexHeader>() == PAGE_SIZE);
 /// // Build index once (slow, ~30s for 3M files)
 /// GpuResidentIndex::build_and_save("/", "index.bin")?;
 ///
-/// // Load index (instant via mmap)
+/// // Load via mmap (traditional zero-copy)
 /// let index = GpuResidentIndex::load(&device, "index.bin")?;
+///
+/// // OR: Load via GPU-direct I/O (CPU never touches bytes)
+/// let index = GpuResidentIndex::load_gpu_direct(&device, "index.bin")?;
 ///
 /// // GPU now owns the data - search without copies
 /// let results = search.search_with_index(&index, "query");
 /// ```
 pub struct GpuResidentIndex {
-    /// Memory-mapped index file (keeps mmap alive)
-    mmap: MmapBuffer,
+    /// Storage backend (mmap or GPU-direct)
+    storage: IndexStorage,
 
     /// Number of entries in the index
     entry_count: u32,
@@ -248,10 +312,94 @@ impl GpuResidentIndex {
         mmap.advise_willneed();
 
         Ok(Self {
-            mmap,
+            storage: IndexStorage::Mmap(mmap),
             entry_count: header.entry_count,
             entries_offset: PAGE_SIZE,
         })
+    }
+
+    /// Load an index using GPU-direct I/O (MTLIOCommandQueue).
+    ///
+    /// **THE GPU IS THE COMPUTER**: This method bypasses CPU entirely.
+    /// - Data flows: Disk → SSD Controller → GPU Memory
+    /// - CPU never touches the bytes
+    /// - Uses Metal 3 MTLIOCommandQueue for async file loading
+    ///
+    /// Best for: Large index files, cold cache scenarios, bandwidth-bound workloads.
+    /// mmap may be faster for frequently-accessed hot data due to page caching.
+    pub fn load_gpu_direct(device: &Device, path: impl AsRef<Path>) -> Result<Self, IndexError> {
+        let path = path.as_ref();
+
+        // Get file size
+        let file_size = std::fs::metadata(path)
+            .map_err(IndexError::IoError)?
+            .len() as usize;
+
+        if file_size < PAGE_SIZE {
+            return Err(IndexError::InvalidFormat("File too small for header".into()));
+        }
+
+        // Create IO queue for GPU-direct loading
+        let io_queue = GpuIOQueue::new(device, IOPriority::High, IOQueueType::Concurrent)
+            .ok_or_else(|| IndexError::InvalidFormat("Failed to create GPU I/O queue".into()))?;
+
+        // Open file for GPU I/O
+        let file_handle = GpuIOFileHandle::open(device, path)
+            .ok_or_else(|| IndexError::InvalidFormat("Failed to open file for GPU I/O".into()))?;
+
+        // Allocate GPU buffer (page-aligned)
+        let aligned_size = align_to_page(file_size);
+        let buffer = device.new_buffer(
+            aligned_size as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Create I/O command buffer
+        let cmd_buffer = io_queue.command_buffer()
+            .ok_or_else(|| IndexError::InvalidFormat("Failed to create I/O command buffer".into()))?;
+
+        // Issue GPU-direct load command
+        cmd_buffer.load_buffer(
+            &buffer,
+            0,               // Destination offset in buffer
+            file_size as u64, // Size to load
+            &file_handle,
+            0,               // Source offset in file
+        );
+
+        // Commit and wait for GPU to complete load
+        cmd_buffer.commit();
+        cmd_buffer.wait_until_completed();
+
+        // Validate header
+        let header = unsafe { &*(buffer.contents() as *const IndexHeader) };
+
+        if header.magic != INDEX_MAGIC {
+            return Err(IndexError::InvalidFormat("Invalid magic number".into()));
+        }
+
+        if header.version != INDEX_VERSION {
+            return Err(IndexError::InvalidFormat(format!(
+                "Version mismatch: expected {}, got {}",
+                INDEX_VERSION, header.version
+            )));
+        }
+
+        let expected_size = PAGE_SIZE + (header.entry_count as usize * GPU_ENTRY_SIZE);
+        if file_size < expected_size {
+            return Err(IndexError::InvalidFormat("File truncated".into()));
+        }
+
+        Ok(Self {
+            storage: IndexStorage::GpuDirect { buffer, file_size },
+            entry_count: header.entry_count,
+            entries_offset: PAGE_SIZE,
+        })
+    }
+
+    /// Returns true if this index was loaded via GPU-direct I/O.
+    pub fn is_gpu_direct(&self) -> bool {
+        matches!(self.storage, IndexStorage::GpuDirect { .. })
     }
 
     /// Build an index from a directory tree and save to disk.
@@ -382,7 +530,7 @@ impl GpuResidentIndex {
     /// Use this with GPU compute shaders for searching.
     #[inline]
     pub fn entries_buffer(&self) -> &Buffer {
-        self.mmap.metal_buffer()
+        self.storage.metal_buffer()
     }
 
     /// Get the number of entries in the index.
@@ -404,12 +552,12 @@ impl GpuResidentIndex {
         }
 
         let offset = self.entries_offset + index * GPU_ENTRY_SIZE;
-        if offset + GPU_ENTRY_SIZE > self.mmap.file_size() {
+        if offset + GPU_ENTRY_SIZE > self.storage.file_size() {
             return None;
         }
 
         unsafe {
-            let ptr = self.mmap.as_ptr().add(offset) as *const GpuPathEntry;
+            let ptr = self.storage.as_ptr().add(offset) as *const GpuPathEntry;
             Some(&*ptr)
         }
     }
@@ -421,7 +569,7 @@ impl GpuResidentIndex {
 
     /// Get memory usage in bytes.
     pub fn memory_usage(&self) -> usize {
-        self.mmap.aligned_size()
+        self.storage.aligned_size()
     }
 
     // ========================================================================
