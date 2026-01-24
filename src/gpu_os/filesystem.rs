@@ -9,12 +9,14 @@
 // - Leverages APP_SHADER_HEADER
 // - Implements GpuApp trait for integration with GpuRuntime
 
-use super::app::{AppBuilder, GpuApp, PipelineMode, APP_SHADER_HEADER};
-use super::memory::{FrameState, GpuMemory, InputEvent, InputEventType};
-use super::vsync::FrameTiming;
+use super::app::{AppBuilder, GpuApp, APP_SHADER_HEADER};
+use super::memory::{FrameState, InputEvent, InputEventType};
 use metal::*;
 use std::cell::Cell;
 use std::mem;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use dispatch::{Queue, QueueAttribute};
 
 // ============================================================================
 // Constants (matching existing framework)
@@ -1673,6 +1675,82 @@ struct SearchResult {
     score: i32,
 }
 
+// ============================================================================
+// SearchHandle - Async Search Result (Issue #76)
+// ============================================================================
+
+/// Handle to a pending async search operation.
+///
+/// Allows non-blocking check of search completion and result retrieval.
+///
+/// # Example
+/// ```ignore
+/// let handle = search.search_async("query");
+///
+/// // Do other work while GPU processes...
+///
+/// // Check if ready (non-blocking)
+/// if let Some(results) = handle.try_get_results() {
+///     for (path_idx, score) in results {
+///         println!("Found: {} (score: {})", path_idx, score);
+///     }
+/// }
+///
+/// // Or wait for results (blocking)
+/// let results = handle.wait_and_get_results();
+/// ```
+pub struct SearchHandle {
+    shared_event: SharedEvent,
+    signal_value: u64,
+    results_buffer: Buffer,
+    result_count_buffer: Buffer,
+    max_results: usize,
+}
+
+impl SearchHandle {
+    /// Check if search is complete (non-blocking)
+    pub fn is_complete(&self) -> bool {
+        self.shared_event.signaled_value() >= self.signal_value
+    }
+
+    /// Get results if ready, None if still processing (non-blocking)
+    pub fn try_get_results(&self) -> Option<Vec<(usize, i32)>> {
+        if self.is_complete() {
+            Some(self.read_results())
+        } else {
+            None
+        }
+    }
+
+    /// Block until complete and return results
+    pub fn wait_and_get_results(self) -> Vec<(usize, i32)> {
+        // Spin-wait with yield (could use more sophisticated waiting)
+        while !self.is_complete() {
+            std::hint::spin_loop();
+        }
+        self.read_results()
+    }
+
+    /// Get the signal value for this search (for debugging/tracking)
+    pub fn signal_value(&self) -> u64 {
+        self.signal_value
+    }
+
+    fn read_results(&self) -> Vec<(usize, i32)> {
+        let mut results = Vec::new();
+        unsafe {
+            let count = (*(self.result_count_buffer.contents() as *const u32) as usize)
+                .min(self.max_results);
+            let ptr = self.results_buffer.contents() as *const SearchResult;
+            for i in 0..count {
+                let r = *ptr.add(i);
+                results.push((r.path_index as usize, r.score));
+            }
+        }
+        results
+    }
+}
+
 /// GPU-accelerated fuzzy path search
 ///
 /// Searches millions of paths in parallel using Metal compute shaders.
@@ -1709,6 +1787,12 @@ pub struct GpuPathSearch {
     max_paths: usize,
     current_path_count: usize,
     paths: Vec<String>,          // Original paths for result lookup (only for legacy API)
+
+    // Async search support (Issue #76)
+    shared_event: SharedEvent,
+    shared_event_listener: SharedEventListener,
+    next_signal_value: Arc<AtomicU64>,
+    _callback_queue: Queue,
 }
 
 impl GpuPathSearch {
@@ -1740,6 +1824,14 @@ impl GpuPathSearch {
         let text_params_buffer = builder.create_buffer(8); // start_y, line_height (f32 each)
         let max_sort_buffer = builder.create_buffer(mem::size_of::<u32>()); // max_to_sort
 
+        // Async search support (Issue #76)
+        let shared_event = device.new_shared_event();
+        let callback_queue = Queue::create(
+            "com.gpu-native-os.search-callback",
+            QueueAttribute::Serial,
+        );
+        let shared_event_listener = SharedEventListener::from_queue(&callback_queue);
+
         Ok(Self {
             device: device.clone(),
             command_queue,
@@ -1759,6 +1851,10 @@ impl GpuPathSearch {
             max_paths,
             current_path_count: 0,
             paths: Vec::with_capacity(max_paths),
+            shared_event,
+            shared_event_listener,
+            next_signal_value: Arc::new(AtomicU64::new(1)),
+            _callback_queue: callback_queue,
         })
     }
 
@@ -1937,6 +2033,152 @@ impl GpuPathSearch {
     /// Get total path count
     pub fn path_count(&self) -> usize {
         self.current_path_count
+    }
+
+    // ========================================================================
+    // Async Search API (Issue #76)
+    // ========================================================================
+
+    /// Perform async GPU fuzzy search - returns immediately with a handle.
+    ///
+    /// The GPU processes the search in the background. Use the returned
+    /// `SearchHandle` to check completion and retrieve results without blocking.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let handle = search.search_async("query", 100);
+    ///
+    /// // Do other work while GPU processes...
+    ///
+    /// // Non-blocking check
+    /// if let Some(results) = handle.try_get_results() {
+    ///     // Process results
+    /// }
+    ///
+    /// // Or block until done
+    /// let results = handle.wait_and_get_results();
+    /// ```
+    pub fn search_async(&self, query: &str, max_results: usize) -> SearchHandle {
+        let signal_value = self.next_signal_value.fetch_add(1, Ordering::SeqCst);
+
+        // Handle empty/invalid queries
+        if query.is_empty() || self.current_path_count == 0 {
+            // Return a handle that's immediately complete with no results
+            unsafe {
+                *(self.result_count_buffer.contents() as *mut u32) = 0;
+            }
+            // Set signal to complete
+            self.shared_event.set_signaled_value(signal_value);
+
+            return SearchHandle {
+                shared_event: self.shared_event.clone(),
+                signal_value,
+                results_buffer: self.results_buffer.clone(),
+                result_count_buffer: self.result_count_buffer.clone(),
+                max_results,
+            };
+        }
+
+        let words: Vec<&str> = query.split_whitespace().collect();
+        if words.is_empty() || words.len() > GPU_MAX_QUERY_WORDS {
+            unsafe {
+                *(self.result_count_buffer.contents() as *mut u32) = 0;
+            }
+            self.shared_event.set_signaled_value(signal_value);
+
+            return SearchHandle {
+                shared_event: self.shared_event.clone(),
+                signal_value,
+                results_buffer: self.results_buffer.clone(),
+                result_count_buffer: self.result_count_buffer.clone(),
+                max_results,
+            };
+        }
+
+        let max_results = GPU_MAX_RESULTS.min(max_results);
+
+        // Reset counters
+        unsafe {
+            *(self.result_count_buffer.contents() as *mut u32) = 0;
+        }
+
+        // Write params
+        unsafe {
+            let params = self.params_buffer.contents() as *mut SearchParams;
+            *params = SearchParams {
+                path_count: self.current_path_count as u32,
+                word_count: words.len() as u32,
+                max_results: max_results as u32,
+                _padding: 0,
+            };
+
+            let words_ptr = self.words_buffer.contents() as *mut SearchWord;
+            for (i, word) in words.iter().enumerate() {
+                let lower = word.to_lowercase();
+                let bytes = lower.as_bytes();
+                let len = bytes.len().min(GPU_MAX_WORD_LEN - 1);
+                let mut sw = SearchWord { chars: [0; 32], len: len as u16, _padding: 0 };
+                sw.chars[..len].copy_from_slice(&bytes[..len]);
+                *words_ptr.add(i) = sw;
+            }
+
+            // max_sort as u32
+            let ms = self.max_sort_buffer.contents() as *mut u32;
+            *ms = max_results.min(100) as u32;
+        }
+
+        let command_buffer = self.command_queue.new_command_buffer();
+
+        // Pass 1: Search
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.search_pipeline);
+            enc.set_buffer(0, Some(&self.paths_buffer), 0);
+            enc.set_buffer(1, Some(&self.path_lengths_buffer), 0);
+            enc.set_buffer(2, Some(&self.params_buffer), 0);
+            enc.set_buffer(3, Some(&self.words_buffer), 0);
+            enc.set_buffer(4, Some(&self.results_buffer), 0);
+            enc.set_buffer(5, Some(&self.result_count_buffer), 0);
+            let tpg = 256;
+            let tg = (self.current_path_count + tpg - 1) / tpg;
+            enc.dispatch_thread_groups(MTLSize::new(tg as u64, 1, 1), MTLSize::new(tpg as u64, 1, 1));
+            enc.end_encoding();
+        }
+
+        // Pass 2: Sort
+        {
+            let enc = command_buffer.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.sort_pipeline);
+            enc.set_buffer(0, Some(&self.results_buffer), 0);
+            enc.set_buffer(1, Some(&self.result_count_buffer), 0);
+            enc.set_buffer(2, Some(&self.max_sort_buffer), 0);
+            enc.dispatch_thread_groups(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+            enc.end_encoding();
+        }
+
+        // Signal SharedEvent when complete (Issue #76 - async notification)
+        command_buffer.encode_signal_event(&self.shared_event, signal_value);
+
+        // Commit without waiting - returns immediately!
+        command_buffer.commit();
+
+        SearchHandle {
+            shared_event: self.shared_event.clone(),
+            signal_value,
+            results_buffer: self.results_buffer.clone(),
+            result_count_buffer: self.result_count_buffer.clone(),
+            max_results,
+        }
+    }
+
+    /// Get the current signal value (for debugging/tracking)
+    pub fn current_signal_value(&self) -> u64 {
+        self.shared_event.signaled_value()
+    }
+
+    /// Check if a specific search is complete
+    pub fn is_search_complete(&self, signal_value: u64) -> bool {
+        self.shared_event.signaled_value() >= signal_value
     }
 }
 

@@ -11,6 +11,8 @@ use super::vsync::FrameTiming;
 use metal::*;
 use std::time::Instant;
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicU64, Ordering};
+use dispatch::{Queue, QueueAttribute};
 
 // Re-export text rendering types for convenience
 pub use super::text_render::{BitmapFont as Font, TextRenderer as Text, TextChar, colors};
@@ -163,6 +165,13 @@ pub struct GpuRuntime {
     // Pipeline tracking
     previous_command_buffer: Option<CommandBuffer>,
     gpu_timing_queue: Arc<Mutex<Vec<GpuTiming>>>,
+
+    // Async GPU synchronization (Issue #76)
+    shared_event: SharedEvent,
+    shared_event_listener: SharedEventListener,
+    next_signal_value: Arc<AtomicU64>,
+    /// Dispatch queue for SharedEvent callbacks
+    _callback_queue: Queue,
 }
 
 impl GpuRuntime {
@@ -177,6 +186,14 @@ impl GpuRuntime {
         let text_renderer = TextRenderer::new(&device, 10000)
             .expect("Failed to create global text renderer");
 
+        // Create SharedEvent for async GPU synchronization (Issue #76)
+        let shared_event = device.new_shared_event();
+        let callback_queue = Queue::create(
+            "com.gpu-native-os.callback-queue",
+            QueueAttribute::Serial,
+        );
+        let shared_event_listener = SharedEventListener::from_queue(&callback_queue);
+
         Self {
             device,
             command_queue,
@@ -189,7 +206,31 @@ impl GpuRuntime {
             last_frame: Instant::now(),
             frame_count: 0,
             delta_time: 1.0 / 120.0,
+            shared_event,
+            shared_event_listener,
+            next_signal_value: Arc::new(AtomicU64::new(1)),
+            _callback_queue: callback_queue,
         }
+    }
+
+    /// Get the SharedEvent for external async operations (e.g., filesystem search)
+    pub fn shared_event(&self) -> &SharedEvent {
+        &self.shared_event
+    }
+
+    /// Get the SharedEventListener for registering callbacks
+    pub fn shared_event_listener(&self) -> &SharedEventListener {
+        &self.shared_event_listener
+    }
+
+    /// Allocate the next signal value for async operations
+    pub fn next_signal_value(&self) -> u64 {
+        self.next_signal_value.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Check if a signal value has been reached (non-blocking)
+    pub fn is_signal_complete(&self, signal_value: u64) -> bool {
+        self.shared_event.signaled_value() >= signal_value
     }
 
     /// Get the Metal device
@@ -355,6 +396,31 @@ impl GpuRuntime {
             }
         }
 
+        // === ASYNC SIGNALING (Issue #76) ===
+        // Signal SharedEvent when frame completes for async tracking
+        let frame_signal = self.next_signal_value.fetch_add(1, Ordering::SeqCst);
+        command_buffer.encode_signal_event(&self.shared_event, frame_signal);
+
+        // For HighThroughput mode, register completion callback to track timing
+        if app.pipeline_mode() == PipelineMode::HighThroughput {
+            let timing_queue = self.gpu_timing_queue.clone();
+            let frame_num = self.frame_count;
+            let submit_time = Instant::now();
+
+            let handler = block::ConcreteBlock::new(move |_cmd_buf: &CommandBufferRef| {
+                let elapsed = submit_time.elapsed();
+                let timing = GpuTiming {
+                    frame_number: frame_num,
+                    gpu_time_ms: elapsed.as_secs_f64() * 1000.0,
+                    total_time_ms: elapsed.as_secs_f64() * 1000.0,
+                };
+                if let Ok(mut queue) = timing_queue.lock() {
+                    queue.push(timing);
+                }
+            });
+            command_buffer.add_completed_handler(&handler.copy());
+        }
+
         // Present and commit
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
@@ -371,6 +437,21 @@ impl GpuRuntime {
             ..Default::default()
         };
         app.post_frame(&timing);
+    }
+
+    /// Drain completed GPU frame timings (for HighThroughput mode)
+    /// Returns timing info for frames that have actually finished on GPU
+    pub fn drain_gpu_timings(&mut self) -> Vec<GpuTiming> {
+        if let Ok(mut queue) = self.gpu_timing_queue.lock() {
+            std::mem::take(&mut *queue)
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Get the current GPU signal value (how many operations have completed)
+    pub fn current_signal_value(&self) -> u64 {
+        self.shared_event.signaled_value()
     }
 }
 
