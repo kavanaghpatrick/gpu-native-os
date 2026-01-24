@@ -2,16 +2,202 @@
 
 A research sandbox proving that GPUs can replace CPUs as the primary compute substrate. All application logic—input handling, state updates, layout, text rendering, and painting—runs entirely on the GPU via Metal compute shaders.
 
+---
+
 ## The Thesis: The GPU Is The Computer
 
-Modern GPUs are general-purpose parallel computers artificially constrained to "graphics acceleration" by legacy software. This project demonstrates:
+### The Fundamental Question
 
-1. **GPU waves replace CPU threads** — A single wavefront (32-64 threads) replaces traditional CPU threading
-2. **Compute shaders are programs** — Metal/CUDA kernels are Turing-complete; they run any algorithm
-3. **The CPU is a bottleneck** — Every CPU touchpoint is technical debt we're eliminating
-4. **Unified memory changes everything** — Apple Silicon shares memory; the CPU/GPU distinction is artificial
+**Why does a computing unit need to ask the host processor for permission to continue working?**
+
+A CPU doesn't:
+- Stop after every function and ask "should I continue?"
+- Need external "dispatch" to run the next instruction
+- Return control to some other processor between operations
+
+The GPU shouldn't either.
+
+### The Problem: GPUs Are Treated as "Graphics Cards"
+
+The current programming model treats GPUs as passive accelerators:
+
+```
+┌────────────────────────────────────────┐
+│         "GRAPHICS CARD" MODEL          │
+├────────────────────────────────────────┤
+│  HOST:  Create command buffer          │
+│  HOST:  Encode work                    │
+│  HOST:  Submit to GPU                  │
+│  GPU:   Execute commands               │
+│  GPU:   Signal completion              │
+│  HOST:  Read results                   │
+│  HOST:  GOTO 1                         │
+└────────────────────────────────────────┘
+
+GPU is PASSIVE. Host drives everything.
+GPU cannot decide to do more work.
+```
+
+### The Vision: GPU as the Primary Computer
+
+```
+┌────────────────────────────────────────┐
+│         GPU AS COMPUTER MODEL          │
+├────────────────────────────────────────┤
+│  STARTUP:                              │
+│    Host: Load program into GPU memory  │
+│    Host: Set up I/O buffers            │
+│    Host: Start GPU execution           │
+│                                        │
+│  STEADY STATE (GPU runs alone):        │
+│    GPU: Read work queue from memory    │
+│    GPU: Execute work                   │
+│    GPU: Write results to memory        │
+│    GPU: Check for new work             │
+│    GPU: GOTO "Read work queue"         │
+│                                        │
+│  I/O (minimal host involvement):       │
+│    Host: Push input events to buffer   │
+│    Host: Read display buffer           │
+│    (GPU never stops for this)          │
+└────────────────────────────────────────┘
+
+GPU is ACTIVE. GPU drives itself.
+Host is just I/O handler.
+```
 
 **Goal**: Zero CPU involvement in steady-state operation. CPU boots the system, then hands control to GPU.
+
+---
+
+## Why This Works: GPU Waves vs CPU Threads
+
+### The Execution Model Difference
+
+**CPU Threading** (MIMD - Multiple Instruction, Multiple Data):
+- Each core runs independent instruction streams
+- Threads can diverge freely—different code paths, different timing
+- Context switching between threads is expensive (~1-10μs)
+- Typical: 8-16 cores, each running 1-2 threads efficiently
+
+**GPU Waves/Warps** (SIMT - Single Instruction, Multiple Threads):
+- 32-64 threads execute the **same instruction** simultaneously
+- All threads in a wave are in lockstep—same program counter
+- Context switching is essentially free (registers are partitioned)
+- Typical: 30-80 compute units, each running thousands of threads
+
+```
+CPU Model:                          GPU Model:
+┌────────┐ ┌────────┐              ┌────────────────────────────────┐
+│Thread 1│ │Thread 2│              │ Wave: 32 threads, SAME instruction │
+│ inst A │ │ inst X │              │ T0  T1  T2  T3 ... T31         │
+│ inst B │ │ inst Y │              │ All execute inst A together    │
+│ inst C │ │ inst Z │              │ All execute inst B together    │
+└────────┘ └────────┘              └────────────────────────────────┘
+  ↑ Different instructions           ↑ Same instruction, different data
+```
+
+### Why GPUs Win on Parallel Workloads
+
+| Workload Type | GPU Time | CPU Time | Winner | Why |
+|--------------|----------|----------|--------|-----|
+| Parallel compute (10M elements) | 3.8ms | 80.4ms | **GPU 21x** | Perfect for SIMT |
+| Random memory access | 31.4ms | 273.1ms | **GPU 8.7x** | GPU hides latency with threads |
+| String processing | 0.5ms | 0.6ms | **GPU 1.2x** | Parallel hashing |
+| Sequential chains | 6.3ms | 1.7ms | CPU 3.8x | Dependencies hurt GPU |
+| Branch-heavy | 2.6ms | 1.5ms | CPU 1.7x | Divergence serializes waves |
+
+**Key insight**: CPU wins more categories, but GPU wins on the *heaviest* workloads. Total: GPU is **4x faster** overall.
+
+### Unified Memory: The Game Changer
+
+Traditional discrete GPUs require explicit data copies:
+```
+CPU Memory ──copy──> GPU Memory ──copy back──> CPU Memory
+              │                       │
+           ~10GB/s                 ~10GB/s
+```
+
+Apple Silicon unified memory:
+```
+┌─────────────────────────────────────┐
+│        Unified Memory Pool          │
+│   (Same physical RAM for both)      │
+│                                     │
+│   CPU ◄────────────────────► GPU    │
+│         No copies needed            │
+│         ~200GB/s bandwidth          │
+└─────────────────────────────────────┘
+```
+
+This means:
+- `buffer.contents()` returns a pointer both CPU and GPU can use
+- Changes are immediately visible (with proper synchronization)
+- Data can live on GPU permanently—no round-trips needed
+
+### What GPUs Excel At
+
+| GPU Wins | CPU Wins |
+|----------|----------|
+| Millions of independent operations | Few operations with dependencies |
+| Random memory access patterns | Sequential memory scan |
+| High compute-to-memory ratio | Memory-bound with small data |
+| Batch processing | Interactive/low-latency edge cases |
+| Data already on GPU | Data needs immediate CPU processing |
+
+### The Strategy
+
+1. **Make work parallel** — Most algorithms can be reformulated (e.g., level-parallel tree traversal)
+2. **Batch operations** — Amortize dispatch overhead across millions of elements
+3. **Keep data on GPU** — Never round-trip to CPU unless absolutely necessary
+4. **Use CPU only for I/O** — Input events, display, file loading
+
+---
+
+## Overcoming API Barriers
+
+### The Limitation Is Software, Not Hardware
+
+Metal/CUDA/Vulkan APIs assume the "graphics card" model because:
+1. **Historical**: GPUs started as fixed-function graphics hardware
+2. **Safety**: Runaway GPU code could hang the display
+3. **Scheduling**: OS needs to share GPU between apps
+4. **Power**: Letting GPU idle saves battery
+
+But the **hardware** can do more:
+- GPU has its own instruction memory and program counters
+- GPU can loop indefinitely and read/write all device memory
+- Apple Silicon: GPU shares memory with CPU (no copy needed)
+
+### What Actually Limits Persistence?
+
+| Level | Limitation | Our Workaround |
+|-------|------------|----------------|
+| Hardware | Watchdog timer (2-5s) | Checkpoint before timeout |
+| Hardware | Scheduler preemption | Accept minimal interruption |
+| API | Command buffer is one-shot | Pre-encode, minimize overhead |
+| API | No GPU-to-host interrupts | SharedEvent callbacks |
+
+### What's NOT a Limit
+
+- ✅ **Memory persistence**: Device memory survives between kernel executions
+- ✅ **State preservation**: Atomics, buffers all persist across dispatches
+- ✅ **Continuous loops**: Kernel can loop millions of times internally
+
+### Our Strategy: Minimize Host Interruption
+
+```
+Measured overhead per cycle:
+  - Host encoding:     8μs
+  - GPU execution:    ~50μs (minimal work)
+  - Synchronization:  75μs
+  - Total:           133μs per cycle
+
+At 1M iterations per cycle = 7.5 BILLION iterations/second
+The CPU overhead is noise.
+```
+
+The GPU does real work. The host just keeps it alive.
 
 ---
 
@@ -130,7 +316,26 @@ Each GPU thread processes one element:
 
 #### Layout Engine: Level-Parallel Algorithm (Issue #89)
 
-Traditional recursive descent is CPU-friendly but GPU-hostile. The level-parallel algorithm processes the tree by depth level in parallel.
+**The Problem**: Traditional layout uses recursive descent:
+```
+layout(node):
+    for child in node.children:
+        layout(child)           # Sequential! Must wait for children
+    node.height = sum(child.heights)
+```
+
+This is inherently sequential—each node depends on its children. GPUs hate this.
+
+**The Solution**: Level-parallel processing. Instead of recursing, process all nodes at the same tree depth simultaneously:
+
+```
+Depth 0:  [root]                    ← Process all depth-0 nodes in parallel
+Depth 1:  [header] [main] [footer]  ← Process all depth-1 nodes in parallel
+Depth 2:  [nav] [article] [aside]   ← Process all depth-2 nodes in parallel
+...
+```
+
+Each level can be processed in parallel because nodes at the same depth don't depend on each other—only on their parent (already computed) and children (computed in previous pass).
 
 **Five GPU Kernels**:
 
@@ -395,6 +600,46 @@ The win: **eliminating CPU-GPU sync points**, not raw compute speed.
 | Threads per search | 3M (one per path) |
 | CPU work per search | 1 memcpy |
 | Memory usage | ~24MB fixed |
+
+---
+
+## What Runs on GPU (And Why It Works)
+
+Every component was chosen because it maps well to the GPU execution model:
+
+| Component | Why It's GPU-Friendly | Parallelization Strategy |
+|-----------|----------------------|--------------------------|
+| **HTML Tokenization** | Each byte can be classified independently | 1 thread per character |
+| **DOM Parsing** | Token→element is mostly independent | Parallel allocation, sequential tree build |
+| **CSS Matching** | Each element × each rule is independent | 1 thread per element, loop over rules |
+| **Style Cascade** | Per-element property resolution | 1 thread per element |
+| **Layout** | Tree structure seems sequential, but... | Level-parallel: all nodes at same depth together |
+| **Text Wrapping** | Each character's width is independent | Parallel prefix sum for cumulative widths |
+| **Vertex Generation** | Each element's geometry is independent | 1 thread per element, atomic allocation |
+| **Filesystem Search** | Each path match is independent | 1 thread per path (3M threads) |
+
+### The Pattern: Find Independence
+
+For any algorithm, ask: "What can be computed without knowing other results?"
+
+**Sequential** (bad for GPU):
+```
+for i in 1..n:
+    result[i] = result[i-1] + data[i]  # Each depends on previous
+```
+
+**Parallel** (good for GPU):
+```
+for i in 0..n:  # All iterations independent
+    result[i] = compute(data[i])
+```
+
+**Parallel with reduction** (good for GPU with right algorithm):
+```
+# Parallel prefix sum (Blelloch algorithm)
+# O(log n) steps instead of O(n)
+# Each step processes half the remaining elements
+```
 
 ---
 
