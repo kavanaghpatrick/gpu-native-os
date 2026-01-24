@@ -215,15 +215,23 @@ The GPU does real work. The host just keeps it alive.
 |                        GPU (Metal Compute)                             |
 |                                                                        |
 |  +------------------------+    +----------------------------------+    |
-|  |   Document Pipeline    |    |    Filesystem Search             |    |
-|  |   Tokenizer → Parser   |    |    3M parallel threads           |    |
-|  |   Style → Layout       |    |    Fuzzy matching                |    |
-|  |   Paint → Render       |    |    GPU sorting                   |    |
+|  |   Document Pipeline    |    |    Filesystem Operations         |    |
+|  |   Tokenizer → Parser   |    |    - Path search (3M threads)    |    |
+|  |   Style → Layout       |    |    - Content search (60K+ files) |    |
+|  |   Paint → Render       |    |    - Duplicate detection         |    |
+|  +------------------------+    +----------------------------------+    |
+|                                                                        |
+|  +------------------------+    +----------------------------------+    |
+|  |    Text Editor         |    |    GPU Simulations               |    |
+|  |    - GPU text buffer   |    |    - Game of Life, Particles     |    |
+|  |    - GPU cursor/select |    |    - Boids, Waves, Mandelbrot    |    |
+|  |    - GPU line wrap     |    |    - Metaballs, Ball Physics     |    |
 |  +------------------------+    +----------------------------------+    |
 |                                                                        |
 |  +------------------------------------------------------------------+  |
-|  |  GPU-Resident Data (Zero-Copy via mmap)                          |  |
-|  |  - Filesystem Index: mmap → Metal buffer (never copied)          |  |
+|  |  GPU-Resident Data (Zero-Copy via mmap or GPU-Direct I/O)        |  |
+|  |  - Filesystem Index: cached, loaded via mmap or MTLIOCommandQueue|  |
+|  |  - File Contents: loaded via mmap (hot) or GPU-Direct (cold)     |  |
 |  |  - HTML/CSS: raw bytes → GPU tokenizes/parses                    |  |
 |  |  - All results: GPU writes → GPU renders                         |  |
 |  +------------------------------------------------------------------+  |
@@ -409,6 +417,45 @@ Pass 3: generate_results_text_kernel
 
 ---
 
+### 3. GPU Content Search (Experimental)
+
+GPU-accelerated text search across file contents—an experimental alternative to tools like ripgrep.
+
+```
+Phase 1: GPU-Resident Index
+  → Build/load filesystem index (cached between searches)
+
+Phase 2: Path Filtering
+  → GPU filters paths by extension/pattern
+
+Phase 3: File Loading
+  → Three modes: CPU read, mmap zero-copy, or GPU-Direct (MTLIOCommandQueue)
+
+Phase 4: GPU Parallel Search
+  → Boyer-Moore-Horspool on GPU, 60K+ threads searching in parallel
+```
+
+**Current Status**: Work in progress. The GPU approach shows promise at scale but isn't universally faster:
+
+| Scale | Files | Data | GPU | ripgrep | Notes |
+|-------|-------|------|-----|---------|-------|
+| Small | 234 | 6.7 MB | 17ms | 9ms | ripgrep faster |
+| Medium | 10K | 134 MB | 283ms | 167ms | ripgrep faster |
+| Large | 61K | 657 MB | 1,853ms | 5,500ms | GPU faster |
+
+**Where GPU wins**: Large directories (50K+ files) where I/O dominates and the GPU can amortize setup costs.
+
+**Where ripgrep wins**: Small-to-medium directories where its highly optimized parallel I/O and SIMD search are hard to beat.
+
+**Key Insight**: The GPU search kernel itself achieves 60-78 GB/s throughput. The bottleneck is file I/O (~70% of total time), not compute. Future work focuses on better I/O pipelining.
+
+```bash
+# Try it
+cargo run --release --example gpu_ripgrep -- --batch "pattern" /path/to/search
+```
+
+---
+
 ### 3. Zero-Copy Infrastructure
 
 #### mmap Buffer (Issue #82)
@@ -573,9 +620,14 @@ src/gpu_os/
 │   ├── mmap_buffer.rs        # #82 - Zero-copy file-to-GPU + WritableMmapBuffer
 │   ├── gpu_io.rs             # #112 - GPU-Direct Storage (MTLIOCommandQueue)
 │   ├── gpu_index.rs          # #77 - GPU-Resident Filesystem Index
+│   ├── gpu_cache.rs          # GPU-resident caching system
+│   ├── batch_io.rs           # Batched file loading via MTLIOCommandQueue
 │   ├── parallel_alloc.rs     # #91 - Parallel Prefix Allocator
+│   ├── parallel_compact.rs   # GPU stream compaction
+│   ├── gpu_string.rs         # GPU string operations
 │   ├── metal_types.rs        # Metal-safe struct definitions
-│   └── profiler.rs           # GPU profiling
+│   ├── profiler.rs           # GPU profiling
+│   └── work_queue.rs         # GPU work queue system
 │
 ├── Core Framework
 │   ├── app.rs                # GpuApp trait, GpuRuntime
@@ -583,6 +635,7 @@ src/gpu_os/
 │   ├── memory.rs             # #12 - Memory Architecture
 │   ├── input.rs              # #13 - Input Pipeline (HID → GPU)
 │   ├── render.rs             # #17 - Hybrid Rendering
+│   ├── text_render.rs        # Reusable GPU text rendering library
 │   └── vsync.rs              # #18 - VSync Execution
 │
 ├── Document Pipeline
@@ -593,24 +646,51 @@ src/gpu_os/
 │   │   ├── layout.rs/.metal      # #89 - Level-parallel layout
 │   │   ├── paint.rs/.metal       # Layout → vertices
 │   │   ├── text.rs/.metal        # #90 - GPU text containers
-│   │   ├── hit_test.rs           # GPU hit testing
+│   │   ├── hit_test.rs/.metal    # GPU hit testing
 │   │   ├── image.rs              # GPU image atlas
+│   │   ├── link.rs               # Link extraction
 │   │   └── navigation.rs         # Link handling
 │   └── document_app.rs           # GpuApp implementation
 │
 ├── Applications
 │   ├── filesystem.rs         # GPU filesystem search (3M+ paths)
-│   ├── content_search.rs     # GPU content search
-│   ├── duplicate_finder.rs   # GPU duplicate detection
-│   └── text_editor.rs        # GPU text editor
+│   ├── content_search.rs     # GPU content search (ripgrep alternative)
+│   ├── duplicate_finder.rs   # GPU duplicate file detection
+│   ├── text_editor.rs        # GPU text editor
+│   ├── streaming_search.rs   # Streaming search with persistent kernels
+│   └── persistent_search.rs  # Persistent GPU search state
+│
+├── Vector Graphics (experimental)
+│   └── vector/
+│       ├── path.rs           # GPU vector paths
+│       └── rasterizer.rs     # GPU rasterization
 │
 └── Demos
     ├── game_of_life.rs       # Cellular automaton
+    ├── ball_physics.rs       # Physics simulation
     ├── particles.rs          # 10K+ particle physics
     ├── boids.rs              # 1024-boid flocking
     ├── mandelbrot.rs         # Fractal viewer
     ├── metaballs.rs          # Organic blobs
     └── waves.rs              # Wave simulation
+
+examples/
+├── Main Applications
+│   ├── filesystem_browser.rs     # Interactive GPU file browser
+│   ├── gpu_ripgrep.rs            # GPU content search tool
+│   ├── document_viewer.rs        # GPU HTML renderer
+│   ├── text_editor.rs            # GPU text editor
+│   └── file_editor.rs            # GPU file editor
+│
+├── Demos & Visualizations
+│   ├── game_of_life.rs, boids.rs, particles.rs, waves.rs
+│   ├── mandelbrot.rs, metaballs.rs, ball_physics.rs
+│   └── vector_demo.rs            # Vector graphics demo
+│
+└── Benchmarks & Profiling (14 files)
+    ├── benchmark_*.rs            # Performance benchmarks
+    ├── profile_*.rs              # Profiling tools
+    └── fast_search_kernel.rs     # Search kernel optimization testbed
 ```
 
 ---
@@ -662,6 +742,8 @@ Every component was chosen because it maps well to the GPU execution model:
 | **Text Wrapping** | Each character's width is independent | Parallel prefix sum for cumulative widths |
 | **Vertex Generation** | Each element's geometry is independent | 1 thread per element, atomic allocation |
 | **Filesystem Search** | Each path match is independent | 1 thread per path (3M threads) |
+| **Content Search** | Each file chunk searched independently | 1 thread per 4KB chunk, SIMD matching |
+| **Duplicate Detection** | Each file hash is independent | 1 thread per file, parallel hashing |
 
 ### The Pattern: Find Independence
 
@@ -699,6 +781,8 @@ for i in 0..n:  # All iterations independent
 | Vertex generation | GPU | GPU | ✅ Implemented |
 | File Read | GPU (MTLIOCommandQueue) | GPU | ✅ Implemented |
 | File Write | GPU (mmap + sync) | GPU | ✅ Implemented |
+| Content Search | GPU (Boyer-Moore) | GPU | ✅ Implemented |
+| Duplicate Detection | GPU (parallel hash) | GPU | ✅ Implemented |
 | Font parsing | CPU | GPU bezier extraction | 📋 Planned |
 | Frame submission | CPU | Persistent kernels | 📋 Planned |
 
@@ -710,12 +794,23 @@ for i in 0..n:  # All iterations independent
 # Build
 cargo build --release
 
-# Run demos
-cargo run --release --example filesystem_browser   # Main: GPU file search
+# Main applications
+cargo run --release --example filesystem_browser   # Interactive GPU file browser
+cargo run --release --example gpu_ripgrep -- "fn " .   # GPU content search
 cargo run --release --example document_viewer      # GPU HTML rendering
+cargo run --release --example text_editor          # GPU text editor
+
+# GPU content search options
+cargo run --release --example gpu_ripgrep -- --help
+cargo run --release --example gpu_ripgrep -- --batch "pattern" /path  # GPU-Direct I/O
+cargo run --release --example gpu_ripgrep -- --mmap "pattern" /path   # Zero-copy mmap
+
+# Visual demos
 cargo run --release --example waves                # Wave simulation
 cargo run --release --example boids                # Flocking simulation
 cargo run --release --example mandelbrot           # Fractal viewer
+cargo run --release --example game_of_life         # Cellular automaton
+cargo run --release --example particles            # Particle physics
 
 # Run tests
 cargo test
@@ -732,6 +827,18 @@ cargo test --test test_gpu_native_document         # Document pipeline
 - **Up/Down**: Navigate results
 - **Enter**: Open file
 - **Escape**: Clear search
+
+### Controls (GPU Ripgrep)
+
+```bash
+gpu_ripgrep <pattern> [directory]
+
+Options:
+  --batch       GPU-Direct I/O (best for large/cold directories)
+  --mmap        Zero-copy mmap (best for hot cache)
+  --smart       Auto-detect (default)
+  --rebuild     Force rebuild filesystem index
+```
 
 ---
 
