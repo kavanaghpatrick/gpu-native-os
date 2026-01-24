@@ -37,9 +37,10 @@ const DOCUMENT_SHADER: &str = r#"
 using namespace metal;
 
 struct Vertex {
-    float2 position;
-    float4 color;
-};
+    float2 position;  // 8 bytes at offset 0
+    float2 _pad;      // 8 bytes padding for 16-byte alignment of color
+    float4 color;     // 16 bytes at offset 16
+};  // Total: 32 bytes
 
 struct VertexOut {
     float4 position [[position]];
@@ -47,8 +48,9 @@ struct VertexOut {
 };
 
 struct Uniforms {
-    float scroll_y;
-    float _pad[3];
+    float scroll_offset_pixels;  // Scroll offset in pixels
+    float screen_height;         // Screen height for NDC conversion
+    float _pad[2];
 };
 
 vertex VertexOut document_vertex(
@@ -58,7 +60,10 @@ vertex VertexOut document_vertex(
 ) {
     Vertex v = vertices[vid];
     VertexOut out;
-    out.position = float4(v.position.x, v.position.y + uniforms.scroll_y * 2.0, 0.0, 1.0);
+    // Convert pixel scroll offset to NDC offset: pixels / (height/2) = pixels * 2 / height
+    // SUBTRACT offset: when scroll_offset is negative (scrolled down), we want content to move UP (+Y in NDC)
+    float ndc_offset = uniforms.scroll_offset_pixels * 2.0 / uniforms.screen_height;
+    out.position = float4(v.position.x, v.position.y - ndc_offset, 0.0, 1.0);
     out.color = v.color;
     return out;
 }
@@ -73,18 +78,21 @@ fragment float4 document_fragment(VertexOut in [[stage_in]]) {
 // ============================================================================
 
 /// Simple vertex for document rendering
+/// NOTE: Metal's float4 requires 16-byte alignment, so we need padding after position
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 struct Vertex {
-    position: [f32; 2],
-    color: [f32; 4],
-}
+    position: [f32; 2],  // 8 bytes at offset 0
+    _pad: [f32; 2],      // 8 bytes padding to align color to 16-byte boundary
+    color: [f32; 4],     // 16 bytes at offset 16
+}  // Total: 32 bytes
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Default)]
 struct Uniforms {
-    scroll_y: f32,
-    _pad: [f32; 3],
+    scroll_offset_pixels: f32,  // Scroll offset in pixels
+    screen_height: f32,         // Screen height for NDC conversion
+    _pad: [f32; 2],
 }
 
 /// Text item to render
@@ -197,19 +205,23 @@ impl DocumentViewer {
     }
 
     fn render(&mut self, drawable: &MetalDrawableRef) {
+        // Calculate scroll offset in pixels
+        let scroll_offset_pixels = self.scroll_y * WINDOW_HEIGHT as f32;
+
         // Update uniforms
         unsafe {
             let ptr = self.uniform_buffer.contents() as *mut Uniforms;
             *ptr = Uniforms {
-                scroll_y: self.scroll_y,
-                _pad: [0.0; 3],
+                scroll_offset_pixels,
+                screen_height: WINDOW_HEIGHT as f32,
+                _pad: [0.0; 2],
             };
         }
 
-        // Prepare text with scroll offset
+        // Prepare text with scroll offset (same offset as backgrounds)
         self.text_renderer.clear();
         for item in &self.text_items {
-            let y = item.y + self.scroll_y * WINDOW_HEIGHT as f32;
+            let y = item.y + scroll_offset_pixels;
             // Only add visible text
             if y > -50.0 && y < WINDOW_HEIGHT as f32 + 50.0 {
                 self.text_renderer
@@ -386,11 +398,58 @@ fn process_document(device: &Device) -> (Vec<Vertex>, Vec<TextItem>, f32) {
     let (elements, text_buffer) = parser.parse(&tokens, html);
     let stylesheet = Stylesheet::parse(css);
     let styles = styler.resolve_styles(&elements, &tokens, html, &stylesheet);
-    let boxes = layout.compute_layout(&elements, &styles, viewport);
+    let boxes = layout.compute_layout(&elements, &styles, &text_buffer, viewport);
     let paint_vertices = paint.paint(&elements, &boxes, &styles, &text_buffer, viewport);
 
     let elapsed = start.elapsed();
     println!("Pipeline time: {:?}", elapsed);
+
+    // DEBUG: Count display modes
+    let mut display_counts = [0usize; 5]; // none, block, inline, flex, inline-block
+    for s in &styles {
+        if s.display < 5 { display_counts[s.display as usize] += 1; }
+    }
+    println!("\n=== DISPLAY MODE COUNTS ===");
+    println!("  display:none = {}", display_counts[0]);
+    println!("  display:block = {}", display_counts[1]);
+    println!("  display:inline = {}", display_counts[2]);
+    println!("  display:flex = {}", display_counts[3]);
+    println!("  display:inline-block = {}", display_counts[4]);
+    println!("  Total elements: {}", elements.len());
+
+    // Find elements with huge heights
+    let huge_height_count = boxes.iter().filter(|b| b.height > 1000.0).count();
+    println!("  Elements with height > 1000px: {}", huge_height_count);
+
+    // DEBUG: Print first 30 layout boxes to understand heights
+    println!("\n=== LAYOUT DEBUG (first 30 elements) ===");
+    for (i, (elem, (style, bbox))) in elements.iter().zip(styles.iter().zip(boxes.iter())).take(30).enumerate() {
+        let elem_name = match elem.element_type {
+            1 => "div",
+            2 => "span",
+            3 => "p",
+            4 => "h1",
+            5 => "h2",
+            6 => "h3",
+            7 => "ul",
+            8 => "li",
+            9 => "a",
+            10 => "body",
+            11 => "html",
+            100 => "TEXT",
+            _ => "???",
+        };
+        let text_preview: String = if elem.element_type == 100 && elem.text_length > 0 {
+            let start = elem.text_start as usize;
+            let end = (start + elem.text_length as usize).min(text_buffer.len());
+            String::from_utf8_lossy(&text_buffer[start..end.min(start+20)]).to_string()
+        } else {
+            String::new()
+        };
+        println!("[{:3}] {:5} h={:6.1} y={:6.1} parent={:3} display={} \"{}\"",
+            i, elem_name, bbox.height, bbox.y, elem.parent, style.display, text_preview);
+    }
+    println!("=== END DEBUG ===\n");
 
     // Verify paint vertices are valid (no uninitialized data)
     let mut flag_counts = std::collections::HashMap::new();
@@ -508,6 +567,7 @@ fn process_document(device: &Device) -> (Vec<Vertex>, Vec<TextItem>, f32) {
 
             let to_vertex = |pv: &PaintVertex| Vertex {
                 position: pv.position,
+                _pad: [0.0; 2],  // Initialize padding for Metal alignment
                 color: pv.color,
             };
 

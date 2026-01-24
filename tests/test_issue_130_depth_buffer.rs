@@ -312,15 +312,198 @@ fn test_cache_invalidation_concept() {
     assert_ne!(old_depth, new_depth, "Depth should change after reparenting");
 }
 
-// Placeholder for GPU implementation tests
+// GPU implementation tests
 #[test]
-#[ignore = "Requires GPU implementation"]
 fn test_gpu_depth_computation_kernel() {
-    // TODO: Test actual Metal kernel implementation
+    use rust_experiment::gpu_os::document::{
+        Element,
+        ComputedStyle,
+        GpuLayoutEngine, Viewport,
+    };
+
+    let device = Device::system_default().expect("No Metal device");
+    let mut layout = GpuLayoutEngine::new(&device).expect("Failed to create layout engine");
+
+    // Create a tree structure with known depths
+    // Root (depth 0) -> Child1 (depth 1) -> GrandChild (depth 2)
+    //                -> Child2 (depth 1)
+    let elements = vec![
+        Element {
+            element_type: 1, // div
+            parent: -1,
+            first_child: 1,
+            next_sibling: -1,
+            prev_sibling: -1,
+            text_start: 0,
+            text_length: 0,
+            token_index: 0,
+        },
+        Element {
+            element_type: 1,
+            parent: 0,
+            first_child: 3,  // Has grandchild
+            next_sibling: 2,
+            prev_sibling: -1,
+            text_start: 0,
+            text_length: 0,
+            token_index: 0,
+        },
+        Element {
+            element_type: 1,
+            parent: 0,
+            first_child: -1,
+            next_sibling: -1,
+            prev_sibling: 1,
+            text_start: 0,
+            text_length: 0,
+            token_index: 0,
+        },
+        Element {
+            element_type: 1,
+            parent: 1,
+            first_child: -1,
+            next_sibling: -1,
+            prev_sibling: -1,
+            text_start: 0,
+            text_length: 0,
+            token_index: 0,
+        },
+    ];
+
+    let styles: Vec<ComputedStyle> = (0..elements.len())
+        .map(|_| ComputedStyle {
+            display: 1, // DISPLAY_BLOCK
+            width: 100.0,
+            height: 50.0,
+            ..Default::default()
+        })
+        .collect();
+
+    let viewport = Viewport {
+        width: 800.0,
+        height: 600.0,
+        _padding: [0.0; 2],
+    };
+
+    // Run layout which computes depths
+    let _boxes = layout.compute_layout(&elements, &styles, &[], viewport);
+
+    // Get depths computed by GPU
+    let depths = layout.get_depths(elements.len());
+
+    println!("\nGPU depth computation test:");
+    for (idx, depth) in depths.iter().enumerate() {
+        println!("  Element {}: depth = {}", idx, depth);
+    }
+
+    // Verify depths
+    assert_eq!(depths[0], 0, "Root should be depth 0");
+    assert_eq!(depths[1], 1, "Child1 should be depth 1");
+    assert_eq!(depths[2], 1, "Child2 should be depth 1");
+    assert_eq!(depths[3], 2, "GrandChild should be depth 2");
+
+    // Verify cache is valid
+    assert!(layout.depths_valid(), "Depths should be marked valid");
 }
 
 #[test]
-#[ignore = "Requires GPU implementation"]
 fn benchmark_gpu_layout_with_depth_buffer() {
-    // TODO: Benchmark full layout pipeline with O(1) depth lookup
+    use rust_experiment::gpu_os::document::{
+        Element,
+        ComputedStyle,
+        GpuLayoutEngine, Viewport,
+    };
+
+    let device = Device::system_default().expect("No Metal device");
+    let mut layout = GpuLayoutEngine::new(&device).expect("Failed to create layout engine");
+
+    // Create a deep tree (worst case for O(depth) algorithm)
+    let depth = 50;
+    let children_per_level = 2;
+
+    let mut elements = Vec::new();
+    let mut styles = Vec::new();
+
+    // Root
+    elements.push(Element {
+        element_type: 1,
+        parent: -1,
+        first_child: 1,
+        next_sibling: -1,
+        prev_sibling: -1,
+        text_start: 0,
+        text_length: 0,
+        token_index: 0,
+    });
+    styles.push(ComputedStyle {
+        display: 1,
+        width: 800.0,
+        height: 0.0,
+        ..Default::default()
+    });
+
+    let mut current_idx = 1i32;
+    let mut parent_idx = 0i32;
+
+    for level in 0..depth {
+        let first_at_level = current_idx;
+
+        for child in 0..children_per_level {
+            let prev_sib = if child > 0 { current_idx - 1 } else { -1 };
+            elements.push(Element {
+                element_type: 1,
+                parent: parent_idx,
+                first_child: -1,
+                next_sibling: if child < children_per_level - 1 { current_idx + 1 } else { -1 },
+                prev_sibling: prev_sib,
+                text_start: 0,
+                text_length: 0,
+                token_index: 0,
+            });
+            styles.push(ComputedStyle {
+                display: 1,
+                width: 0.0,
+                height: 30.0,
+                ..Default::default()
+            });
+            current_idx += 1;
+        }
+
+        elements[parent_idx as usize].first_child = first_at_level;
+
+        if level < depth - 1 {
+            parent_idx = first_at_level;
+        }
+    }
+
+    let viewport = Viewport {
+        width: 800.0,
+        height: 600.0,
+        _padding: [0.0; 2],
+    };
+
+    println!("\n=== GPU Layout with O(1) Depth Buffer Benchmark ===");
+    println!("Tree depth: {}, Elements: {}", depth, elements.len());
+
+    // Warmup
+    let _ = layout.compute_layout(&elements, &styles, &[], viewport);
+
+    // Timed run
+    let iterations = 100;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = layout.compute_layout(&elements, &styles, &[], viewport);
+    }
+    let elapsed = start.elapsed();
+
+    let avg_time = elapsed.as_secs_f64() / iterations as f64;
+    println!("Average layout time: {:.3}ms ({} iterations)", avg_time * 1000.0, iterations);
+
+    // Verify depths are correct for deepest element
+    let depths = layout.get_depths(elements.len());
+    let deepest_idx = elements.len() - 1;
+    let deepest_depth = depths[deepest_idx];
+
+    println!("Deepest element depth: {}", deepest_depth);
+    assert_eq!(deepest_depth, depth as u32, "Deepest element should be at depth {}", depth);
 }

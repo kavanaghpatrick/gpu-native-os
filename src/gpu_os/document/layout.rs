@@ -10,6 +10,17 @@ use super::style::ComputedStyle;
 const THREAD_COUNT: u64 = 1024;
 const MAX_ELEMENTS: usize = 65536;
 
+/// Issue #128: Cumulative height info for O(1) sibling positioning
+/// Must match Metal struct layout
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CumulativeInfo {
+    pub y_offset: f32,           // Cumulative Y position
+    pub prev_margin_bottom: f32, // Previous sibling's bottom margin (for margin collapsing)
+    pub flags: u32,              // Bit 0: has_visible_sibling
+    pub _padding: f32,
+}
+
 /// Layout box containing position and dimensions for an element
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -73,10 +84,18 @@ pub struct GpuLayoutEngine {
     #[allow(dead_code)]
     finalize_pipeline: ComputePipelineState,  // Legacy - kept for fallback
     // New level-parallel pipelines (Issue #89)
-    compute_depths_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
+    compute_depths_pipeline: ComputePipelineState,  // Legacy O(depth) - kept for fallback
     sum_heights_pipeline: ComputePipelineState,
     position_siblings_pipeline: ComputePipelineState,
     finalize_level_pipeline: ComputePipelineState,
+    // Width propagation and text height calculation (fixes whitespace issue)
+    propagate_widths_text_pipeline: ComputePipelineState,
+    // O(1) depth buffer pipelines (Issue #130)
+    init_depths_pipeline: ComputePipelineState,
+    propagate_depths_pipeline: ComputePipelineState,
+    // Issue #128: O(1) cumulative heights pipeline
+    compute_cumulative_heights_pipeline: ComputePipelineState,
     // Buffers
     element_buffer: Buffer,
     style_buffer: Buffer,
@@ -87,6 +106,13 @@ pub struct GpuLayoutEngine {
     depth_buffer: Buffer,
     max_depth_buffer: Buffer,
     current_level_buffer: Buffer,
+    // O(1) depth buffer support (Issue #130)
+    changed_buffer: Buffer,  // Atomic counter for level propagation
+    depths_valid: bool,      // Cache invalidation flag
+    // Text buffer for wrapped height calculation
+    text_buffer: Buffer,
+    // Issue #128: O(1) cumulative heights buffer
+    cumulative_buffer: Buffer,
 }
 
 impl GpuLayoutEngine {
@@ -125,6 +151,22 @@ impl GpuLayoutEngine {
         let finalize_level_fn = library
             .get_function("layout_finalize_level", None)
             .map_err(|e| format!("Failed to get finalize_level function: {}", e))?;
+        let propagate_widths_text_fn = library
+            .get_function("propagate_widths_and_text", None)
+            .map_err(|e| format!("Failed to get propagate_widths_and_text function: {}", e))?;
+
+        // O(1) depth buffer pipelines (Issue #130)
+        let init_depths_fn = library
+            .get_function("init_depths", None)
+            .map_err(|e| format!("Failed to get init_depths function: {}", e))?;
+        let propagate_depths_fn = library
+            .get_function("propagate_depths", None)
+            .map_err(|e| format!("Failed to get propagate_depths function: {}", e))?;
+
+        // Issue #128: O(1) cumulative heights pipeline
+        let compute_cumulative_heights_fn = library
+            .get_function("compute_cumulative_heights", None)
+            .map_err(|e| format!("Failed to get compute_cumulative_heights function: {}", e))?;
 
         let intrinsic_pipeline = device
             .new_compute_pipeline_state_with_function(&intrinsic_fn)
@@ -151,6 +193,22 @@ impl GpuLayoutEngine {
         let finalize_level_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_level_fn)
             .map_err(|e| format!("Failed to create finalize_level pipeline: {}", e))?;
+        let propagate_widths_text_pipeline = device
+            .new_compute_pipeline_state_with_function(&propagate_widths_text_fn)
+            .map_err(|e| format!("Failed to create propagate_widths_text pipeline: {}", e))?;
+
+        // O(1) depth buffer pipelines (Issue #130)
+        let init_depths_pipeline = device
+            .new_compute_pipeline_state_with_function(&init_depths_fn)
+            .map_err(|e| format!("Failed to create init_depths pipeline: {}", e))?;
+        let propagate_depths_pipeline = device
+            .new_compute_pipeline_state_with_function(&propagate_depths_fn)
+            .map_err(|e| format!("Failed to create propagate_depths pipeline: {}", e))?;
+
+        // Issue #128: O(1) cumulative heights pipeline
+        let compute_cumulative_heights_pipeline = device
+            .new_compute_pipeline_state_with_function(&compute_cumulative_heights_fn)
+            .map_err(|e| format!("Failed to create compute_cumulative_heights pipeline: {}", e))?;
 
         let element_size = std::mem::size_of::<Element>();
         let style_size = std::mem::size_of::<ComputedStyle>();
@@ -191,6 +249,24 @@ impl GpuLayoutEngine {
             MTLResourceOptions::StorageModeShared,
         );
 
+        // Text buffer for wrapped height calculation (512KB max)
+        let text_buffer = device.new_buffer(
+            512 * 1024,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Changed counter for level-parallel depth propagation (Issue #130)
+        let changed_buffer = device.new_buffer(
+            std::mem::size_of::<u32>() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Issue #128: Cumulative heights buffer for O(1) sibling positioning
+        let cumulative_buffer = device.new_buffer(
+            (MAX_ELEMENTS * std::mem::size_of::<CumulativeInfo>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
         Ok(Self {
             device: device.clone(),
             command_queue,
@@ -202,6 +278,10 @@ impl GpuLayoutEngine {
             sum_heights_pipeline,
             position_siblings_pipeline,
             finalize_level_pipeline,
+            propagate_widths_text_pipeline,
+            init_depths_pipeline,
+            propagate_depths_pipeline,
+            compute_cumulative_heights_pipeline,
             element_buffer,
             style_buffer,
             layout_buffer,
@@ -210,6 +290,10 @@ impl GpuLayoutEngine {
             depth_buffer,
             max_depth_buffer,
             current_level_buffer,
+            changed_buffer,
+            depths_valid: false,
+            text_buffer,
+            cumulative_buffer,
         })
     }
 
@@ -218,6 +302,7 @@ impl GpuLayoutEngine {
         &mut self,
         elements: &[Element],
         styles: &[ComputedStyle],
+        text: &[u8],  // Text buffer for wrapped height calculation
         viewport: Viewport,
     ) -> Vec<LayoutBox> {
         let element_count = elements.len();
@@ -246,6 +331,17 @@ impl GpuLayoutEngine {
             );
         }
 
+        // Copy text buffer for wrapped height calculation
+        if !text.is_empty() {
+            let text_len = text.len().min(512 * 1024); // Cap at buffer size
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    text.as_ptr(),
+                    self.text_buffer.contents() as *mut u8,
+                    text_len,
+                );
+            }
+        }
 
         // Set element count
         unsafe {
@@ -293,6 +389,7 @@ impl GpuLayoutEngine {
 
 
         // Pass 2: Compute block layout (all threads)
+        // Now includes text buffer for wrapped height calculation
         {
             let command_buffer = self.command_queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
@@ -302,6 +399,7 @@ impl GpuLayoutEngine {
             encoder.set_buffer(2, Some(&self.layout_buffer), 0);
             encoder.set_buffer(3, Some(&self.element_count_buffer), 0);
             encoder.set_buffer(4, Some(&self.viewport_buffer), 0);
+            encoder.set_buffer(5, Some(&self.text_buffer), 0);  // Text for wrapped height
             encoder.dispatch_thread_groups(
                 MTLSize::new(threadgroups, 1, 1),
                 MTLSize::new(THREAD_COUNT, 1, 1),
@@ -311,15 +409,15 @@ impl GpuLayoutEngine {
             command_buffer.wait_until_completed();
         }
 
-        // Pass 3a: Compute tree depths (all threads)
+        // Pass 3a: Compute tree depths using O(1) level-parallel algorithm (Issue #130)
+        // Phase 1: Initialize depths (roots = 0, others = 0xFFFFFFFF)
         {
             let command_buffer = self.command_queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.compute_depths_pipeline);
+            encoder.set_compute_pipeline_state(&self.init_depths_pipeline);
             encoder.set_buffer(0, Some(&self.element_buffer), 0);
             encoder.set_buffer(1, Some(&self.depth_buffer), 0);
-            encoder.set_buffer(2, Some(&self.max_depth_buffer), 0);
-            encoder.set_buffer(3, Some(&self.element_count_buffer), 0);
+            encoder.set_buffer(2, Some(&self.element_count_buffer), 0);
             encoder.dispatch_thread_groups(
                 MTLSize::new(threadgroups, 1, 1),
                 MTLSize::new(THREAD_COUNT, 1, 1),
@@ -329,11 +427,78 @@ impl GpuLayoutEngine {
             command_buffer.wait_until_completed();
         }
 
-        // Read max_depth from depth buffer (atomic in GPU doesn't seem reliable)
-        let max_depth = unsafe {
-            let depth_ptr = self.depth_buffer.contents() as *const u32;
-            (0..element_count).map(|i| *depth_ptr.add(i)).max().unwrap_or(0)
+        // Phase 2: Propagate depths level by level
+        let mut level = 0u32;
+        let max_depth = loop {
+            // Reset changed counter
+            unsafe {
+                *(self.changed_buffer.contents() as *mut u32) = 0;
+            }
+
+            // Set current level
+            unsafe {
+                *(self.current_level_buffer.contents() as *mut u32) = level;
+            }
+
+            // Dispatch propagation for this level
+            {
+                let command_buffer = self.command_queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.propagate_depths_pipeline);
+                encoder.set_buffer(0, Some(&self.element_buffer), 0);
+                encoder.set_buffer(1, Some(&self.depth_buffer), 0);
+                encoder.set_buffer(2, Some(&self.current_level_buffer), 0);
+                encoder.set_buffer(3, Some(&self.element_count_buffer), 0);
+                encoder.set_buffer(4, Some(&self.changed_buffer), 0);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(threadgroups, 1, 1),
+                    MTLSize::new(THREAD_COUNT, 1, 1),
+                );
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+            }
+
+            // Check if any elements were updated
+            let changed = unsafe { *(self.changed_buffer.contents() as *const u32) };
+            if changed == 0 {
+                break level;  // All depths computed
+            }
+
+            level += 1;
+            if level > 256 {
+                panic!("Tree depth exceeds maximum (256)");
+            }
         };
+
+        // Mark depths as valid (for cache purposes)
+        self.depths_valid = true;
+
+        // Pass NEW: Propagate widths and calculate text heights (TOP-DOWN by level)
+        // This fixes the whitespace issue by calculating text heights AFTER parent widths are known
+        for level in 0..=max_depth {
+            unsafe {
+                *(self.current_level_buffer.contents() as *mut u32) = level;
+            }
+            let command_buffer = self.command_queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.propagate_widths_text_pipeline);
+            encoder.set_buffer(0, Some(&self.element_buffer), 0);
+            encoder.set_buffer(1, Some(&self.style_buffer), 0);
+            encoder.set_buffer(2, Some(&self.layout_buffer), 0);
+            encoder.set_buffer(3, Some(&self.depth_buffer), 0);
+            encoder.set_buffer(4, Some(&self.current_level_buffer), 0);
+            encoder.set_buffer(5, Some(&self.element_count_buffer), 0);
+            encoder.set_buffer(6, Some(&self.viewport_buffer), 0);
+            encoder.set_buffer(7, Some(&self.text_buffer), 0);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(threadgroups, 1, 1),
+                MTLSize::new(THREAD_COUNT, 1, 1),
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+        }
 
         // Pass 3b: Sum child heights (bottom-up, level by level)
         for level in (0..=max_depth).rev() {
@@ -359,13 +524,34 @@ impl GpuLayoutEngine {
         }
 
         // Pass 3c + 3d: Position siblings then finalize, level by level (top-down)
-        // Must interleave: finalize for level N needs level N-1's absolute positions
+        // Issue #128: First compute cumulative heights, then use O(1) lookup in position_siblings
         for level in 0..=max_depth {
             unsafe {
                 *(self.current_level_buffer.contents() as *mut u32) = level;
             }
 
-            // Position siblings at this level (relative coords)
+            // Issue #128: Compute cumulative heights for this level (O(1) per element)
+            {
+                let command_buffer = self.command_queue.new_command_buffer();
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.compute_cumulative_heights_pipeline);
+                encoder.set_buffer(0, Some(&self.element_buffer), 0);
+                encoder.set_buffer(1, Some(&self.style_buffer), 0);
+                encoder.set_buffer(2, Some(&self.layout_buffer), 0);
+                encoder.set_buffer(3, Some(&self.cumulative_buffer), 0);
+                encoder.set_buffer(4, Some(&self.depth_buffer), 0);
+                encoder.set_buffer(5, Some(&self.current_level_buffer), 0);
+                encoder.set_buffer(6, Some(&self.element_count_buffer), 0);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(threadgroups, 1, 1),
+                    MTLSize::new(THREAD_COUNT, 1, 1),
+                );
+                encoder.end_encoding();
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+            }
+
+            // Position siblings at this level using O(1) cumulative lookup
             {
                 let command_buffer = self.command_queue.new_command_buffer();
                 let encoder = command_buffer.new_compute_command_encoder();
@@ -374,8 +560,9 @@ impl GpuLayoutEngine {
                 encoder.set_buffer(1, Some(&self.style_buffer), 0);
                 encoder.set_buffer(2, Some(&self.layout_buffer), 0);
                 encoder.set_buffer(3, Some(&self.depth_buffer), 0);
-                encoder.set_buffer(4, Some(&self.current_level_buffer), 0);
-                encoder.set_buffer(5, Some(&self.element_count_buffer), 0);
+                encoder.set_buffer(4, Some(&self.cumulative_buffer), 0);  // Issue #128: O(1) lookup
+                encoder.set_buffer(5, Some(&self.current_level_buffer), 0);
+                encoder.set_buffer(6, Some(&self.element_count_buffer), 0);
                 encoder.dispatch_thread_groups(
                     MTLSize::new(threadgroups, 1, 1),
                     MTLSize::new(THREAD_COUNT, 1, 1),
@@ -412,22 +599,41 @@ impl GpuLayoutEngine {
             .map(|i| unsafe { *layout_ptr.add(i) })
             .collect()
     }
+
+    /// Invalidate the depth buffer cache.
+    /// Call this when the tree structure changes (elements added/removed/reparented).
+    #[allow(dead_code)]
+    pub fn invalidate_depths(&mut self) {
+        self.depths_valid = false;
+    }
+
+    /// Check if depth buffer is valid (for debugging/testing)
+    #[allow(dead_code)]
+    pub fn depths_valid(&self) -> bool {
+        self.depths_valid
+    }
+
+    /// Get a copy of the depth buffer (for testing)
+    #[allow(dead_code)]
+    pub fn get_depths(&self, count: usize) -> Vec<u32> {
+        let depth_ptr = self.depth_buffer.contents() as *const u32;
+        (0..count)
+            .map(|i| unsafe { *depth_ptr.add(i) })
+            .collect()
+    }
 }
 
 // Display constants re-exported from style module
-pub use super::style::{
-    DISPLAY_NONE, DISPLAY_BLOCK, DISPLAY_INLINE, DISPLAY_FLEX, DISPLAY_INLINE_BLOCK,
-    FLEX_ROW, FLEX_COLUMN,
-    JUSTIFY_START, JUSTIFY_CENTER, JUSTIFY_END, JUSTIFY_SPACE_BETWEEN, JUSTIFY_SPACE_AROUND,
-    ALIGN_START, ALIGN_CENTER, ALIGN_END, ALIGN_STRETCH,
-};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use super::super::tokenizer::GpuTokenizer;
     use super::super::parser::GpuParser;
-    use super::super::style::{GpuStyler, Stylesheet};
+    use super::super::style::{
+        GpuStyler, Stylesheet,
+        DISPLAY_BLOCK, DISPLAY_FLEX, FLEX_COLUMN,
+    };
 
     fn setup() -> (GpuTokenizer, GpuParser, GpuStyler, GpuLayoutEngine) {
         let device = Device::system_default().expect("No Metal device");
@@ -445,7 +651,7 @@ mod tests {
         let (elements, _) = parser.parse(&tokens, html);
         let stylesheet = Stylesheet::parse(css);
         let styles = styler.resolve_styles(&elements, &tokens, html, &stylesheet);
-        layout.compute_layout(&elements, &styles, viewport)
+        layout.compute_layout(&elements, &styles, html, viewport)
     }
 
     #[test]
@@ -525,7 +731,7 @@ mod tests {
                 i, s.width, s.height, s.padding[0], s.padding[1], s.padding[2], s.padding[3]);
         }
 
-        let boxes = layout.compute_layout(&elements, &styles, viewport);
+        let boxes = layout.compute_layout(&elements, &styles, html, viewport);
 
         println!("Layout boxes:");
         for (i, b) in boxes.iter().enumerate() {
@@ -621,10 +827,10 @@ mod tests {
             parent: -1,
             first_child: 1,
             next_sibling: -1,
+            prev_sibling: -1,  // Issue #128
             text_start: 0,
             text_length: 0,
             token_index: 0,
-            _padding: 0,
         });
         styles.push(ComputedStyle {
             display: DISPLAY_BLOCK,
@@ -640,10 +846,10 @@ mod tests {
                 parent: 0,
                 first_child: -1,
                 next_sibling: if i < element_count - 1 { (i + 1) as i32 } else { -1 },
+                prev_sibling: if i > 1 { (i - 1) as i32 } else { -1 },  // Issue #128
                 text_start: 0,
                 text_length: 0,
                 token_index: 0,
-                _padding: 0,
             });
             styles.push(ComputedStyle {
                 display: DISPLAY_BLOCK,
@@ -657,11 +863,11 @@ mod tests {
         let viewport = Viewport::default();
 
         // Warmup
-        let _ = layout.compute_layout(&elements, &styles, viewport);
+        let _ = layout.compute_layout(&elements, &styles, &[], viewport);
 
         // Timed run
         let start = std::time::Instant::now();
-        let boxes = layout.compute_layout(&elements, &styles, viewport);
+        let boxes = layout.compute_layout(&elements, &styles, &[], viewport);
         let elapsed = start.elapsed();
 
         println!("~1K elements layout: {} boxes in {:?}", boxes.len(), elapsed);
@@ -686,10 +892,10 @@ mod tests {
             parent: -1,
             first_child: 1,
             next_sibling: -1,
+            prev_sibling: -1,  // Issue #128
             text_start: 0,
             text_length: 0,
             token_index: 0,
-            _padding: 0,
         });
         styles.push(ComputedStyle {
             display: DISPLAY_FLEX,
@@ -706,10 +912,10 @@ mod tests {
                 parent: 0,
                 first_child: -1,
                 next_sibling: if i < element_count - 1 { (i + 1) as i32 } else { -1 },
+                prev_sibling: if i > 1 { (i - 1) as i32 } else { -1 },  // Issue #128
                 text_start: 0,
                 text_length: 0,
                 token_index: 0,
-                _padding: 0,
             });
             styles.push(ComputedStyle {
                 display: DISPLAY_BLOCK,
@@ -722,11 +928,11 @@ mod tests {
         let viewport = Viewport::default();
 
         // Warmup
-        let _ = layout.compute_layout(&elements, &styles, viewport);
+        let _ = layout.compute_layout(&elements, &styles, &[], viewport);
 
         // Timed run
         let start = std::time::Instant::now();
-        let boxes = layout.compute_layout(&elements, &styles, viewport);
+        let boxes = layout.compute_layout(&elements, &styles, &[], viewport);
         let elapsed = start.elapsed();
 
         println!("~5K elements layout: {} boxes in {:?}", boxes.len(), elapsed);

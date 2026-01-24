@@ -5,312 +5,56 @@
 use metal::*;
 use std::time::Instant;
 
-/// Line information computed in pass 1
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-struct LineInfo {
-    char_start: u32,
-    char_end: u32,
-    y_offset: f32,
-    width: f32,
-}
+// Import from the main crate
+use rust_experiment::gpu_os::document::{
+    Element,
+    ComputedStyle,
+    LayoutBox, Viewport,
+    GpuPaintEngine, PaintVertex, FLAG_TEXT,
+    LineInfo, TextLineDataHeader, MAX_LINES_PER_ELEMENT,
+};
 
-/// Per-element line data
-#[repr(C)]
-#[derive(Clone, Default)]
-struct TextLineData {
-    line_count: u32,
-    lines: Vec<LineInfo>,
-}
+const ELEM_TEXT: u32 = 100;
 
-/// Simulated glyph advance (monospace for simplicity)
-fn glyph_advance(_char: char, font_size: f32) -> f32 {
-    font_size * 0.6  // ~60% of font size for monospace
-}
-
-/// O(word_length) single-pass algorithm with lookback
-fn layout_text_single_pass(text: &str, container_width: f32, font_size: f32) -> Vec<(usize, f32, f32)> {
-    // Returns: [(char_index, x, y), ...]
-    let mut result: Vec<(usize, f32, f32)> = Vec::new();
-    let line_height = font_size * 1.2;
-
-    let mut x = 0.0f32;
-    let mut y = 0.0f32;
-    let mut word_start_idx = 0usize;
-    let mut word_start_x = 0.0f32;
-    let mut in_word = false;
-
-    for (i, c) in text.chars().enumerate() {
-        let advance = glyph_advance(c, font_size);
-        let is_space = c == ' ' || c == '\t';
-        let is_newline = c == '\n';
-
-        // Track word boundaries
-        if is_space && in_word {
-            in_word = false;
-        } else if !is_space && !is_newline && !in_word {
-            in_word = true;
-            word_start_idx = i;
-            word_start_x = x;
-        }
-
-        // Check for wrap
-        let needs_wrap = x + advance > container_width && x > 0.0;
-
-        if is_newline || needs_wrap {
-            if needs_wrap && in_word {
-                // O(word_length) LOOKBACK: reposition word characters
-                for j in word_start_idx..i {
-                    if let Some(entry) = result.get_mut(j) {
-                        entry.1 -= word_start_x;  // Adjust X
-                        entry.2 += line_height;   // Move to new line
-                    }
-                }
-                x = x - word_start_x;
-            } else {
-                x = 0.0;
-            }
-            y += line_height;
-
-            if is_newline {
-                result.push((i, x, y));
-                x = 0.0;
-                continue;
-            }
-        }
-
-        result.push((i, x, y));
-        x += advance;
-    }
-
-    result
-}
-
-/// Pass 1: Compute line breaks (no vertex generation)
-fn compute_line_breaks(text: &str, container_width: f32, font_size: f32) -> TextLineData {
-    let line_height = font_size * 1.2;
-    let mut lines = Vec::new();
-
-    let mut x = 0.0f32;
-    let mut y = 0.0f32;
-    let mut line_start = 0usize;
-    let mut word_start = 0usize;
-    let mut word_start_x = 0.0f32;
-    let mut in_word = false;
-
-    for (i, c) in text.chars().enumerate() {
-        let advance = glyph_advance(c, font_size);
-        let is_space = c == ' ' || c == '\t';
-        let is_newline = c == '\n';
-
-        if is_space && in_word {
-            in_word = false;
-        } else if !is_space && !is_newline && !in_word {
-            in_word = true;
-            word_start = i;
-            word_start_x = x;
-        }
-
-        let needs_wrap = x + advance > container_width && x > 0.0;
-
-        if is_newline || needs_wrap {
-            // Record this line
-            let char_end = if needs_wrap && in_word { word_start } else { i };
-            let line_width = if needs_wrap && in_word { word_start_x } else { x };
-
-            lines.push(LineInfo {
-                char_start: line_start as u32,
-                char_end: char_end as u32,
-                y_offset: y,
-                width: line_width,
-            });
-
-            // Start new line
-            if needs_wrap && in_word {
-                line_start = word_start;
-                x = x - word_start_x;
-            } else {
-                line_start = i + 1;
-                x = 0.0;
-            }
-            y += line_height;
-
-            if is_newline {
-                x = 0.0;
-                continue;
-            }
-        }
-
-        x += advance;
-    }
-
-    // Final line
-    if line_start < text.len() {
-        lines.push(LineInfo {
-            char_start: line_start as u32,
-            char_end: text.len() as u32,
-            y_offset: y,
-            width: x,
-        });
-    }
-
-    TextLineData {
-        line_count: lines.len() as u32,
-        lines,
+/// Helper to create a text element
+fn create_text_element(text_start: u32, text_length: u32) -> Element {
+    Element {
+        element_type: ELEM_TEXT,
+        parent: -1,
+        first_child: -1,
+        next_sibling: -1,
+        text_start,
+        text_length,
+        token_index: 0,
+        prev_sibling: -1,
     }
 }
 
-/// Pass 2: Generate positions using pre-computed line data - O(1) per character
-fn generate_positions_two_pass(text: &str, line_data: &TextLineData, font_size: f32) -> Vec<(usize, f32, f32)> {
-    let mut result = Vec::new();
-    let mut current_line = 0usize;
-    let mut x = 0.0f32;
-
-    for (i, c) in text.chars().enumerate() {
-        // O(1): Find which line this character is on
-        while current_line < line_data.lines.len() - 1
-            && i >= line_data.lines[current_line].char_end as usize {
-            current_line += 1;
-            x = 0.0;
-        }
-
-        // O(1): Y position from pre-computed line data
-        let y = line_data.lines[current_line].y_offset;
-
-        result.push((i, x, y));
-        x += glyph_advance(c, font_size);
-    }
-
-    result
-}
-
-#[test]
-fn test_two_pass_correctness() {
-    let text = "Hello world this is a test of text wrapping";
-    let container_width = 100.0;
-    let font_size = 16.0;
-
-    let single_pass = layout_text_single_pass(text, container_width, font_size);
-
-    let line_data = compute_line_breaks(text, container_width, font_size);
-    let two_pass = generate_positions_two_pass(text, &line_data, font_size);
-
-    println!("Two-pass correctness test:");
-    println!("  Text: {} chars", text.len());
-    println!("  Lines: {}", line_data.line_count);
-
-    // Compare positions (allowing small floating point differences)
-    assert_eq!(single_pass.len(), two_pass.len());
-
-    for i in 0..single_pass.len().min(10) {
-        let (_, sx, sy) = single_pass[i];
-        let (_, tx, ty) = two_pass[i];
-
-        // Note: There may be slight differences due to algorithm specifics
-        // The key is that the visual result is correct
-        println!("  Char {}: single=({:.1}, {:.1}), two=({:.1}, {:.1})", i, sx, sy, tx, ty);
+/// Helper to create default style for text
+fn create_text_style(font_size: f32, line_height: f32) -> ComputedStyle {
+    ComputedStyle {
+        display: 2,  // DISPLAY_INLINE
+        color: [0.0, 0.0, 0.0, 1.0],  // Black text
+        font_size,
+        line_height,
+        opacity: 1.0,
+        ..Default::default()
     }
 }
 
-#[test]
-fn test_line_break_detection() {
-    let text = "word1 word2 word3 word4 word5";
-    let container_width = 80.0;  // Forces wrapping
-    let font_size = 16.0;
-
-    let line_data = compute_line_breaks(text, container_width, font_size);
-
-    println!("\nLine break detection test:");
-    println!("  Container width: {}", container_width);
-    println!("  Lines detected: {}", line_data.line_count);
-
-    for (i, line) in line_data.lines.iter().enumerate() {
-        let line_text: String = text.chars()
-            .skip(line.char_start as usize)
-            .take((line.char_end - line.char_start) as usize)
-            .collect();
-        println!("  Line {}: chars {}..{} = \"{}\" (width={:.1})",
-            i, line.char_start, line.char_end, line_text, line.width);
+/// Helper to create layout box
+fn create_layout_box(width: f32, height: f32) -> LayoutBox {
+    LayoutBox {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        content_x: 0.0,
+        content_y: 0.0,
+        content_width: width,
+        content_height: height,
+        ..Default::default()
     }
-
-    assert!(line_data.line_count >= 2, "Should have multiple lines");
-}
-
-#[test]
-fn benchmark_single_vs_two_pass() {
-    // Create text with many line wraps
-    let text = "word ".repeat(500);  // 2500 chars, many wraps
-    let container_width = 200.0;
-    let font_size = 16.0;
-
-    println!("\n=== Single-Pass vs Two-Pass Benchmark ===\n");
-    println!("Text: {} chars", text.len());
-
-    let iterations = 100;
-
-    // Benchmark single-pass (with lookback)
-    let single_start = Instant::now();
-    for _ in 0..iterations {
-        let _ = layout_text_single_pass(&text, container_width, font_size);
-    }
-    let single_time = single_start.elapsed();
-
-    // Benchmark two-pass
-    let two_start = Instant::now();
-    for _ in 0..iterations {
-        let line_data = compute_line_breaks(&text, container_width, font_size);
-        let _ = generate_positions_two_pass(&text, &line_data, font_size);
-    }
-    let two_time = two_start.elapsed();
-
-    let speedup = single_time.as_secs_f64() / two_time.as_secs_f64();
-
-    println!("Single-pass: {:.2}ms ({} iterations)",
-        single_time.as_secs_f64() * 1000.0, iterations);
-    println!("Two-pass:    {:.2}ms ({} iterations)",
-        two_time.as_secs_f64() * 1000.0, iterations);
-    println!("Speedup:     {:.2}x", speedup);
-
-    // Two-pass may actually be slightly slower on CPU due to extra pass
-    // But on GPU, eliminating lookback is crucial for SIMD efficiency
-    println!("\nNote: GPU benefit is from eliminating SIMD divergence,");
-    println!("      not raw CPU performance.");
-}
-
-#[test]
-fn test_long_word_handling() {
-    // Test with a very long word that must wrap
-    let text = "x".repeat(100);  // 100 char "word"
-    let container_width = 200.0;
-    let font_size = 16.0;
-
-    let line_data = compute_line_breaks(&text, container_width, font_size);
-
-    println!("\nLong word handling test:");
-    println!("  Word length: {} chars", text.len());
-    println!("  Lines: {}", line_data.line_count);
-
-    // Long word should force character-level breaks
-    assert!(line_data.line_count >= 2, "Long word should wrap");
-}
-
-#[test]
-fn test_memory_overhead() {
-    let max_lines = 64;
-    let line_info_size = std::mem::size_of::<LineInfo>();
-    let text_line_data_size = 4 + max_lines * line_info_size;  // line_count + lines array
-
-    println!("\nMemory overhead test:");
-    println!("  LineInfo size: {} bytes", line_info_size);
-    println!("  Max lines per element: {}", max_lines);
-    println!("  TextLineData size: {} bytes ({:.1} KB)",
-        text_line_data_size, text_line_data_size as f64 / 1024.0);
-
-    // 16 bytes per LineInfo * 64 max lines = 1024 bytes + header
-    assert_eq!(line_info_size, 16, "LineInfo should be 16 bytes");
-
-    println!("\n  For 1000 text elements: {:.1} MB",
-        1000.0 * text_line_data_size as f64 / (1024.0 * 1024.0));
 }
 
 #[test]
@@ -318,35 +62,351 @@ fn test_gpu_struct_alignment() {
     // Verify structs are GPU-friendly
     assert_eq!(std::mem::size_of::<LineInfo>(), 16, "LineInfo must be 16 bytes");
     assert_eq!(std::mem::align_of::<LineInfo>(), 4, "LineInfo must be 4-byte aligned");
+    assert_eq!(std::mem::size_of::<TextLineDataHeader>(), 16, "TextLineDataHeader must be 16 bytes");
 
+    println!("GPU struct alignment test:");
+    println!("  LineInfo: {} bytes, {}-byte aligned",
+        std::mem::size_of::<LineInfo>(),
+        std::mem::align_of::<LineInfo>());
+    println!("  TextLineDataHeader: {} bytes",
+        std::mem::size_of::<TextLineDataHeader>());
+    println!("  MAX_LINES_PER_ELEMENT: {}", MAX_LINES_PER_ELEMENT);
+}
+
+#[test]
+fn test_memory_overhead() {
+    let line_info_size = std::mem::size_of::<LineInfo>();
+    let header_size = std::mem::size_of::<TextLineDataHeader>();
+    let per_element_size = header_size + MAX_LINES_PER_ELEMENT * line_info_size;
+
+    println!("\nMemory overhead test:");
+    println!("  LineInfo size: {} bytes", line_info_size);
+    println!("  Header size: {} bytes", header_size);
+    println!("  Max lines per element: {}", MAX_LINES_PER_ELEMENT);
+    println!("  Per-element overhead: {} bytes ({:.1} KB)",
+        per_element_size, per_element_size as f64 / 1024.0);
+
+    // Should be reasonable overhead
+    assert!(per_element_size < 2048, "Per-element overhead should be < 2KB");
+
+    println!("\n  For 1000 text elements: {:.1} MB",
+        1000.0 * per_element_size as f64 / (1024.0 * 1024.0));
+}
+
+#[test]
+fn test_two_pass_short_text() {
     let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
 
-    let max_lines = 64u64;
-    let buffer = device.new_buffer(
-        max_lines * 16,  // LineInfo array
-        MTLResourceOptions::StorageModeShared,
-    );
+    // Enable two-pass text (should be default)
+    assert!(paint.use_two_pass_text, "Two-pass text should be enabled by default");
 
-    println!("\nGPU struct alignment test:");
-    println!("  LineInfo: 16 bytes, 4-byte aligned");
-    println!("  Buffer: {} lines, {} bytes", max_lines, buffer.length());
+    let text = b"Hello";
+    let elements = vec![create_text_element(0, text.len() as u32)];
+    let styles = vec![create_text_style(16.0, 1.2)];
+    let boxes = vec![create_layout_box(200.0, 50.0)];
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    // First test with single-pass (should work)
+    paint.use_two_pass_text = false;
+    let single_pass_vertices = paint.paint(&elements, &boxes, &styles, text, viewport);
+    let single_pass_text: Vec<_> = single_pass_vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+    println!("\nShort text test (SINGLE-PASS):");
+    println!("  Total vertices: {}", single_pass_vertices.len());
+    println!("  Text vertices: {}", single_pass_text.len());
+
+    // Now test with two-pass
+    paint.use_two_pass_text = true;
+    let vertices = paint.paint(&elements, &boxes, &styles, text, viewport);
+    let text_vertices: Vec<_> = vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+
+    println!("\nShort text test (TWO-PASS):");
+    println!("  Text: \"{}\" ({} chars)", String::from_utf8_lossy(text), text.len());
+    println!("  Total vertices: {}", vertices.len());
+    println!("  Text vertices: {}", text_vertices.len());
+
+    // Print first few vertices for debug
+    for (i, v) in vertices.iter().take(10).enumerate() {
+        println!("  V{}: pos=({:.4}, {:.4}), flags={}, color=[{:.1},{:.1},{:.1},{:.1}]",
+            i, v.position[0], v.position[1], v.flags, v.color[0], v.color[1], v.color[2], v.color[3]);
+    }
+
+    // Should have text vertices (5 chars = 5 * 4 = 20 vertices)
+    assert!(text_vertices.len() >= 20, "Expected >= 20 text vertices, got {}", text_vertices.len());
 }
 
-// Placeholder for GPU implementation tests
 #[test]
-#[ignore = "Requires GPU implementation"]
-fn test_gpu_line_break_kernel() {
-    // TODO: Test compute_line_breaks Metal kernel
+fn test_two_pass_text_wrapping() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
+
+    // Text that should wrap in a narrow container
+    let text = b"Hello world this is a test of text wrapping";
+    let elements = vec![create_text_element(0, text.len() as u32)];
+    let styles = vec![create_text_style(16.0, 1.2)];
+    // Narrow container forces wrapping
+    let boxes = vec![create_layout_box(100.0, 200.0)];
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    let vertices = paint.paint(&elements, &boxes, &styles, text, viewport);
+
+    let text_vertices: Vec<_> = vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+
+    println!("\nText wrapping test:");
+    println!("  Text: \"{}\"", String::from_utf8_lossy(text));
+    println!("  Container width: 100px");
+    println!("  Text vertices: {}", text_vertices.len());
+
+    // Check that vertices exist and are positioned correctly
+    assert!(!text_vertices.is_empty(), "Should have text vertices");
+
+    // With wrapping, we should see different Y positions in the vertices
+    let unique_y: std::collections::HashSet<i32> = text_vertices.iter()
+        .map(|v| (v.position[1] * 1000.0) as i32)  // Convert to int for comparison
+        .collect();
+
+    println!("  Unique Y positions: {}", unique_y.len());
+    // With wrapping, we should have multiple Y positions (multiple lines)
+    assert!(unique_y.len() >= 2, "Should have multiple Y positions (lines) when wrapping");
 }
 
 #[test]
-#[ignore = "Requires GPU implementation"]
-fn test_gpu_vertex_generation_kernel() {
-    // TODO: Test generate_text_vertices_fast Metal kernel
+fn test_two_pass_vs_single_pass_correctness() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
+
+    let text = b"Hello world";
+    let elements = vec![create_text_element(0, text.len() as u32)];
+    let styles = vec![create_text_style(16.0, 1.2)];
+    let boxes = vec![create_layout_box(200.0, 50.0)];
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    // Test with two-pass enabled
+    paint.use_two_pass_text = true;
+    let two_pass_vertices = paint.paint(&elements, &boxes, &styles, text, viewport);
+
+    // Test with single-pass (old method)
+    paint.use_two_pass_text = false;
+    let single_pass_vertices = paint.paint(&elements, &boxes, &styles, text, viewport);
+
+    let two_pass_text: Vec<_> = two_pass_vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+    let single_pass_text: Vec<_> = single_pass_vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+
+    println!("\nTwo-pass vs single-pass correctness:");
+    println!("  Two-pass text vertices: {}", two_pass_text.len());
+    println!("  Single-pass text vertices: {}", single_pass_text.len());
+
+    assert_eq!(two_pass_text.len(), single_pass_text.len(),
+        "Both methods should produce same vertex count");
+
+    // Compare first few vertices (positions should be similar)
+    for i in 0..two_pass_text.len().min(8) {
+        let tp = two_pass_text[i];
+        let sp = single_pass_text[i];
+        let diff_x = (tp.position[0] - sp.position[0]).abs();
+        let diff_y = (tp.position[1] - sp.position[1]).abs();
+
+        if i < 4 {
+            println!("  Vertex {}: two_pass=({:.4}, {:.4}), single=({:.4}, {:.4})",
+                i, tp.position[0], tp.position[1], sp.position[0], sp.position[1]);
+        }
+
+        // Allow small floating point differences
+        assert!(diff_x < 0.01 && diff_y < 0.01,
+            "Vertex {} positions differ too much: two_pass=({}, {}), single=({}, {})",
+            i, tp.position[0], tp.position[1], sp.position[0], sp.position[1]);
+    }
+
+    // Re-enable two-pass
+    paint.use_two_pass_text = true;
 }
 
 #[test]
-#[ignore = "Requires GPU implementation"]
-fn benchmark_gpu_text_layout() {
-    // TODO: Benchmark full GPU text layout pipeline
+fn test_two_pass_long_text_performance() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
+
+    // 10K characters with spaces (will wrap many times)
+    let text: Vec<u8> = (0..10000).map(|i| {
+        if i % 10 == 9 { b' ' } else { b'a' }
+    }).collect();
+
+    let elements = vec![create_text_element(0, text.len() as u32)];
+    let styles = vec![create_text_style(14.0, 1.2)];
+    // Narrow container forces many wraps
+    let boxes = vec![create_layout_box(200.0, 5000.0)];
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    let iterations = 10;
+
+    // Warmup
+    let _ = paint.paint(&elements, &boxes, &styles, &text, viewport);
+
+    // Benchmark two-pass
+    paint.use_two_pass_text = true;
+    let two_pass_start = Instant::now();
+    for _ in 0..iterations {
+        let _ = paint.paint(&elements, &boxes, &styles, &text, viewport);
+    }
+    let two_pass_time = two_pass_start.elapsed();
+
+    // Benchmark single-pass
+    paint.use_two_pass_text = false;
+    let single_pass_start = Instant::now();
+    for _ in 0..iterations {
+        let _ = paint.paint(&elements, &boxes, &styles, &text, viewport);
+    }
+    let single_pass_time = single_pass_start.elapsed();
+
+    let speedup = single_pass_time.as_secs_f64() / two_pass_time.as_secs_f64();
+
+    println!("\n=== Performance: 10K chars, narrow container ===");
+    println!("Two-pass:    {:.2}ms ({} iterations)",
+        two_pass_time.as_secs_f64() * 1000.0, iterations);
+    println!("Single-pass: {:.2}ms ({} iterations)",
+        single_pass_time.as_secs_f64() * 1000.0, iterations);
+    println!("Ratio:       {:.2}x", speedup);
+
+    // Note: On GPU, the benefit is eliminating SIMD divergence,
+    // not raw throughput. The speedup may vary.
+    println!("\nNote: GPU benefit is from eliminating O(word_length) lookback");
+    println!("      and SIMD divergence, which may not show in total time");
+    println!("      but improves worst-case performance consistency.");
+
+    // Re-enable two-pass
+    paint.use_two_pass_text = true;
+}
+
+#[test]
+fn test_two_pass_many_elements() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
+
+    // Create 100 text elements, each with text that may wrap
+    let base_text = b"word1 word2 word3 word4 word5 ";
+    let mut full_text = Vec::new();
+    let mut elements = Vec::new();
+    let mut styles = Vec::new();
+    let mut boxes = Vec::new();
+
+    for i in 0..100 {
+        let start = full_text.len() as u32;
+        full_text.extend_from_slice(base_text);
+
+        elements.push(create_text_element(start, base_text.len() as u32));
+        styles.push(create_text_style(14.0, 1.2));
+        boxes.push(LayoutBox {
+            x: 0.0,
+            y: (i as f32) * 30.0,
+            width: 100.0,
+            height: 25.0,
+            content_x: 0.0,
+            content_y: (i as f32) * 30.0,
+            content_width: 100.0,
+            content_height: 25.0,
+            ..Default::default()
+        });
+    }
+
+    let viewport = Viewport { width: 800.0, height: 3000.0, _padding: [0.0; 2] };
+
+    // Warmup
+    let _ = paint.paint(&elements, &boxes, &styles, &full_text, viewport);
+
+    let start = Instant::now();
+    let vertices = paint.paint(&elements, &boxes, &styles, &full_text, viewport);
+    let elapsed = start.elapsed();
+
+    let text_vertices: Vec<_> = vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+
+    println!("\nMany elements test:");
+    println!("  Elements: {}", elements.len());
+    println!("  Total text: {} chars", full_text.len());
+    println!("  Text vertices: {}", text_vertices.len());
+    println!("  Time: {:?}", elapsed);
+
+    assert!(!text_vertices.is_empty(), "Should have text vertices");
+    assert!(elapsed.as_millis() < 100, "100 elements should paint in < 100ms");
+}
+
+#[test]
+fn test_two_pass_newlines() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
+
+    // Text with explicit newlines
+    let text = b"Line one\nLine two\nLine three";
+    let elements = vec![create_text_element(0, text.len() as u32)];
+    let styles = vec![create_text_style(16.0, 1.2)];
+    let boxes = vec![create_layout_box(500.0, 100.0)];  // Wide container, no forced wrap
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    let vertices = paint.paint(&elements, &boxes, &styles, text, viewport);
+    let text_vertices: Vec<_> = vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+
+    // Count unique Y positions (should be 3 lines)
+    let unique_y: std::collections::HashSet<i32> = text_vertices.iter()
+        .filter(|v| v.color[3] > 0.0)  // Only visible characters
+        .map(|v| (v.position[1] * 1000.0) as i32)
+        .collect();
+
+    println!("\nNewlines test:");
+    println!("  Text: \"{}\"", String::from_utf8_lossy(text).replace('\n', "\\n"));
+    println!("  Unique Y positions: {}", unique_y.len());
+
+    // Should have exactly 3 different Y positions for 3 lines
+    assert!(unique_y.len() >= 3, "Should have at least 3 Y positions for 3 lines");
+}
+
+#[test]
+fn test_two_pass_empty_text() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
+
+    // Empty text element
+    let elements = vec![create_text_element(0, 0)];
+    let styles = vec![create_text_style(16.0, 1.2)];
+    let boxes = vec![create_layout_box(200.0, 50.0)];
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    // Should not crash
+    let vertices = paint.paint(&elements, &boxes, &styles, &[], viewport);
+
+    println!("\nEmpty text test:");
+    println!("  Total vertices: {}", vertices.len());
+    // Empty text should produce no text vertices (or very few)
+}
+
+#[test]
+fn test_two_pass_long_word() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut paint = GpuPaintEngine::new(&device).expect("Failed to create paint engine");
+
+    // Very long word that can't fit on one line
+    let text = "x".repeat(100);
+    let text_bytes = text.as_bytes();
+    let elements = vec![create_text_element(0, text_bytes.len() as u32)];
+    let styles = vec![create_text_style(16.0, 1.2)];
+    // Very narrow container
+    let boxes = vec![create_layout_box(50.0, 500.0)];
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    let vertices = paint.paint(&elements, &boxes, &styles, text_bytes, viewport);
+    let text_vertices: Vec<_> = vertices.iter().filter(|v| v.flags == FLAG_TEXT).collect();
+
+    // Should have vertices for all 100 characters
+    assert!(text_vertices.len() >= 100 * 4, "Should have vertices for all characters");
+
+    // Count lines (unique Y positions)
+    let unique_y: std::collections::HashSet<i32> = text_vertices.iter()
+        .map(|v| (v.position[1] * 1000.0) as i32)
+        .collect();
+
+    println!("\nLong word test:");
+    println!("  Word length: {} chars", text.len());
+    println!("  Container width: 50px");
+    println!("  Lines detected: {}", unique_y.len());
+
+    // Long word must break across multiple lines
+    assert!(unique_y.len() >= 2, "Long word should wrap to multiple lines");
 }

@@ -7,6 +7,8 @@ use metal::*;
 use super::parser::Element;
 use super::style::ComputedStyle;
 use super::layout::{LayoutBox, Viewport};
+use super::image::ImageInfo;
+use super::text::{LineInfo, TextLineDataHeader, MAX_LINES_PER_ELEMENT};
 
 const THREAD_COUNT: u64 = 1024;
 const MAX_ELEMENTS: usize = 65536;
@@ -48,6 +50,7 @@ pub struct PaintCommand {
 }
 
 const PAINT_SHADER: &str = include_str!("paint.metal");
+const TEXT_SHADER: &str = include_str!("text.metal");
 
 /// GPU-accelerated paint engine (vertex generation)
 pub struct GpuPaintEngine {
@@ -59,6 +62,10 @@ pub struct GpuPaintEngine {
     background_pipeline: ComputePipelineState,
     border_pipeline: ComputePipelineState,
     text_pipeline: ComputePipelineState,
+    image_pipeline: ComputePipelineState,
+    // Issue #131: Two-pass text layout pipelines
+    line_breaks_pipeline: ComputePipelineState,
+    text_fast_pipeline: ComputePipelineState,
     element_buffer: Buffer,
     layout_buffer: Buffer,
     style_buffer: Buffer,
@@ -68,6 +75,14 @@ pub struct GpuPaintEngine {
     vertex_buffer: Buffer,
     element_count_buffer: Buffer,
     viewport_buffer: Buffer,
+    // Image rendering buffers
+    image_info_buffer: Buffer,
+    element_to_image_buffer: Buffer,
+    // Issue #131: Two-pass text layout buffers
+    line_header_buffer: Buffer,
+    line_info_buffer: Buffer,
+    /// Enable two-pass text layout (Issue #131)
+    pub use_two_pass_text: bool,
 }
 
 impl GpuPaintEngine {
@@ -94,6 +109,23 @@ impl GpuPaintEngine {
         let text_fn = library
             .get_function("generate_text_vertices", None)
             .map_err(|e| format!("Failed to get text function: {}", e))?;
+        let image_fn = library
+            .get_function("generate_image_vertices", None)
+            .map_err(|e| format!("Failed to get image function: {}", e))?;
+
+        // Issue #131: Two-pass text layout functions
+        let text_fast_fn = library
+            .get_function("generate_text_vertices_fast", None)
+            .map_err(|e| format!("Failed to get text_fast function: {}", e))?;
+
+        // Compile text shader for line breaks kernel
+        let text_library = device
+            .new_library_with_source(TEXT_SHADER, &compile_options)
+            .map_err(|e| format!("Failed to compile text shader: {}", e))?;
+
+        let line_breaks_fn = text_library
+            .get_function("compute_line_breaks_two_pass", None)
+            .map_err(|e| format!("Failed to get line_breaks function: {}", e))?;
 
         let count_pipeline = device
             .new_compute_pipeline_state_with_function(&count_fn)
@@ -110,6 +142,17 @@ impl GpuPaintEngine {
         let text_pipeline = device
             .new_compute_pipeline_state_with_function(&text_fn)
             .map_err(|e| format!("Failed to create text pipeline: {}", e))?;
+        let image_pipeline = device
+            .new_compute_pipeline_state_with_function(&image_fn)
+            .map_err(|e| format!("Failed to create image pipeline: {}", e))?;
+
+        // Issue #131: Two-pass text layout pipelines
+        let line_breaks_pipeline = device
+            .new_compute_pipeline_state_with_function(&line_breaks_fn)
+            .map_err(|e| format!("Failed to create line_breaks pipeline: {}", e))?;
+        let text_fast_pipeline = device
+            .new_compute_pipeline_state_with_function(&text_fast_fn)
+            .map_err(|e| format!("Failed to create text_fast pipeline: {}", e))?;
 
         let element_size = std::mem::size_of::<Element>();
         let layout_size = std::mem::size_of::<LayoutBox>();
@@ -153,6 +196,34 @@ impl GpuPaintEngine {
             MTLResourceOptions::StorageModeShared,
         );
 
+        // Image rendering buffers
+        // ImageInfo is 32 bytes, support up to 1024 images
+        let image_info_buffer = device.new_buffer(
+            (1024 * 32) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        // Element to image mapping (u32 per element, 0xFFFFFFFF = no image)
+        let element_to_image_buffer = device.new_buffer(
+            (MAX_ELEMENTS * std::mem::size_of::<u32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Issue #131: Two-pass text layout buffers
+        let line_header_size = std::mem::size_of::<TextLineDataHeader>();
+        let line_info_size = std::mem::size_of::<LineInfo>();
+
+        // One header per element
+        let line_header_buffer = device.new_buffer(
+            (MAX_ELEMENTS * line_header_size) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // MAX_LINES_PER_ELEMENT lines per element
+        let line_info_buffer = device.new_buffer(
+            (MAX_ELEMENTS * MAX_LINES_PER_ELEMENT * line_info_size) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
         Ok(Self {
             device: device.clone(),
             command_queue,
@@ -161,6 +232,9 @@ impl GpuPaintEngine {
             background_pipeline,
             border_pipeline,
             text_pipeline,
+            image_pipeline,
+            line_breaks_pipeline,
+            text_fast_pipeline,
             element_buffer,
             layout_buffer,
             style_buffer,
@@ -170,10 +244,15 @@ impl GpuPaintEngine {
             vertex_buffer,
             element_count_buffer,
             viewport_buffer,
+            image_info_buffer,
+            element_to_image_buffer,
+            line_header_buffer,
+            line_info_buffer,
+            use_two_pass_text: true,  // Enable by default for Issue #131
         })
     }
 
-    /// Generate vertices for all elements
+    /// Generate vertices for all elements (without images)
     pub fn paint(
         &mut self,
         elements: &[Element],
@@ -181,6 +260,30 @@ impl GpuPaintEngine {
         styles: &[ComputedStyle],
         text_content: &[u8],
         viewport: Viewport,
+    ) -> Vec<PaintVertex> {
+        // Call paint_with_images with no images
+        self.paint_with_images(elements, boxes, styles, text_content, viewport, &[], &[])
+    }
+
+    /// Generate vertices for all elements including images
+    ///
+    /// # Arguments
+    /// * `elements` - Parsed elements
+    /// * `boxes` - Layout boxes from layout engine
+    /// * `styles` - Computed styles
+    /// * `text_content` - Text buffer
+    /// * `viewport` - Viewport dimensions
+    /// * `images` - Array of loaded images with atlas coordinates
+    /// * `element_to_image` - Mapping from element index to image index (use u32::MAX for non-images)
+    pub fn paint_with_images(
+        &mut self,
+        elements: &[Element],
+        boxes: &[LayoutBox],
+        styles: &[ComputedStyle],
+        text_content: &[u8],
+        viewport: Viewport,
+        images: &[ImageInfo],
+        element_to_image: &[u32],
     ) -> Vec<PaintVertex> {
         let element_count = elements.len();
         assert!(element_count <= MAX_ELEMENTS, "Too many elements");
@@ -227,6 +330,30 @@ impl GpuPaintEngine {
                     self.text_buffer.contents() as *mut u8,
                     text_len,
                 );
+            }
+        }
+
+        // Copy image info
+        if !images.is_empty() {
+            let image_count = images.len().min(1024);
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    images.as_ptr(),
+                    self.image_info_buffer.contents() as *mut ImageInfo,
+                    image_count,
+                );
+            }
+        }
+
+        // Initialize element_to_image mapping (default: no image = 0xFFFFFFFF)
+        unsafe {
+            let ptr = self.element_to_image_buffer.contents() as *mut u32;
+            for i in 0..element_count {
+                if i < element_to_image.len() {
+                    *ptr.add(i) = element_to_image[i];
+                } else {
+                    *ptr.add(i) = u32::MAX;  // No image
+                }
             }
         }
 
@@ -332,7 +459,53 @@ impl GpuPaintEngine {
         }
 
         // Pass 5: Generate text vertices
-        {
+        // Issue #131: Use two-pass text layout for O(1) per-character vertex generation
+        if self.use_two_pass_text {
+            // Pass 5a: Compute line breaks (one thread per text element)
+            {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.line_breaks_pipeline);
+                encoder.set_buffer(0, Some(&self.element_buffer), 0);
+                encoder.set_buffer(1, Some(&self.layout_buffer), 0);
+                encoder.set_buffer(2, Some(&self.style_buffer), 0);
+                encoder.set_buffer(3, Some(&self.text_buffer), 0);
+                encoder.set_buffer(4, Some(&self.line_header_buffer), 0);
+                encoder.set_buffer(5, Some(&self.line_info_buffer), 0);
+                encoder.set_buffer(6, Some(&self.element_count_buffer), 0);
+
+                let threadgroups = ((element_count as u64 + THREAD_COUNT - 1) / THREAD_COUNT).max(1);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(threadgroups, 1, 1),
+                    MTLSize::new(THREAD_COUNT, 1, 1),
+                );
+                encoder.end_encoding();
+            }
+
+            // Pass 5b: Generate text vertices using pre-computed line data (O(1) per char)
+            {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&self.text_fast_pipeline);
+                encoder.set_buffer(0, Some(&self.element_buffer), 0);
+                encoder.set_buffer(1, Some(&self.layout_buffer), 0);
+                encoder.set_buffer(2, Some(&self.style_buffer), 0);
+                encoder.set_buffer(3, Some(&self.text_buffer), 0);
+                encoder.set_buffer(4, Some(&self.vertex_offset_buffer), 0);
+                encoder.set_buffer(5, Some(&self.vertex_count_buffer), 0);
+                encoder.set_buffer(6, Some(&self.vertex_buffer), 0);
+                encoder.set_buffer(7, Some(&self.line_header_buffer), 0);
+                encoder.set_buffer(8, Some(&self.line_info_buffer), 0);
+                encoder.set_buffer(9, Some(&self.element_count_buffer), 0);
+                encoder.set_buffer(10, Some(&self.viewport_buffer), 0);
+
+                let threadgroups = ((element_count as u64 + THREAD_COUNT - 1) / THREAD_COUNT).max(1);
+                encoder.dispatch_thread_groups(
+                    MTLSize::new(threadgroups, 1, 1),
+                    MTLSize::new(THREAD_COUNT, 1, 1),
+                );
+                encoder.end_encoding();
+            }
+        } else {
+            // Fallback: Original single-pass text rendering (with O(word_length) lookback)
             let encoder = command_buffer.new_compute_command_encoder();
             encoder.set_compute_pipeline_state(&self.text_pipeline);
             encoder.set_buffer(0, Some(&self.element_buffer), 0);
@@ -341,6 +514,28 @@ impl GpuPaintEngine {
             encoder.set_buffer(3, Some(&self.text_buffer), 0);
             encoder.set_buffer(4, Some(&self.vertex_offset_buffer), 0);
             encoder.set_buffer(5, Some(&self.vertex_count_buffer), 0);
+            encoder.set_buffer(6, Some(&self.vertex_buffer), 0);
+            encoder.set_buffer(7, Some(&self.element_count_buffer), 0);
+            encoder.set_buffer(8, Some(&self.viewport_buffer), 0);
+
+            let threadgroups = ((element_count as u64 + THREAD_COUNT - 1) / THREAD_COUNT).max(1);
+            encoder.dispatch_thread_groups(
+                MTLSize::new(threadgroups, 1, 1),
+                MTLSize::new(THREAD_COUNT, 1, 1),
+            );
+            encoder.end_encoding();
+        }
+
+        // Pass 6: Generate image vertices
+        if !images.is_empty() {
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(&self.image_pipeline);
+            encoder.set_buffer(0, Some(&self.element_buffer), 0);
+            encoder.set_buffer(1, Some(&self.layout_buffer), 0);
+            encoder.set_buffer(2, Some(&self.style_buffer), 0);
+            encoder.set_buffer(3, Some(&self.vertex_offset_buffer), 0);
+            encoder.set_buffer(4, Some(&self.image_info_buffer), 0);
+            encoder.set_buffer(5, Some(&self.element_to_image_buffer), 0);
             encoder.set_buffer(6, Some(&self.vertex_buffer), 0);
             encoder.set_buffer(7, Some(&self.element_count_buffer), 0);
             encoder.set_buffer(8, Some(&self.viewport_buffer), 0);
@@ -398,7 +593,7 @@ mod tests {
         let (elements, text) = parser.parse(&tokens, html);
         let stylesheet = Stylesheet::parse(css);
         let styles = styler.resolve_styles(&elements, &tokens, html, &stylesheet);
-        let boxes = layout.compute_layout(&elements, &styles, viewport);
+        let boxes = layout.compute_layout(&elements, &styles, &text, viewport);
         paint.paint(&elements, &boxes, &styles, &text, viewport)
     }
 
@@ -416,7 +611,7 @@ mod tests {
             text_start: 0,
             text_length: 0,
             token_index: 0,
-            _padding: 0,
+            prev_sibling: -1,
         }];
         let boxes = vec![LayoutBox {
             x: 0.0,
@@ -463,7 +658,7 @@ mod tests {
             text_start: 0,
             text_length: 0,
             token_index: 0,
-            _padding: 0,
+            prev_sibling: -1,
         }];
         let boxes = vec![LayoutBox {
             x: 0.0,
@@ -509,7 +704,7 @@ mod tests {
             text_start: 0,
             text_length: 5,
             token_index: 0,
-            _padding: 0,
+            prev_sibling: -1,
         }];
         let boxes = vec![LayoutBox {
             x: 0.0,
@@ -579,7 +774,7 @@ mod tests {
 
         let stylesheet = Stylesheet::parse(css);
         let styles = styler.resolve_styles(&elements, &tokens, html, &stylesheet);
-        let boxes = layout.compute_layout(&elements, &styles, viewport);
+        let boxes = layout.compute_layout(&elements, &styles, &text, viewport);
         let vertices = paint.paint(&elements, &boxes, &styles, &text, viewport);
 
         // Should not crash, may or may not have vertices
@@ -601,7 +796,7 @@ mod tests {
                 text_start: 0,
                 text_length: 0,
                 token_index: 0,
-                _padding: 0,
+                prev_sibling: -1,
             },
             Element {
                 element_type: 2,  // span
@@ -611,7 +806,7 @@ mod tests {
                 text_start: 0,
                 text_length: 0,
                 token_index: 0,
-                _padding: 0,
+                prev_sibling: -1,
             },
             Element {
                 element_type: 2,  // span
@@ -621,7 +816,7 @@ mod tests {
                 text_start: 0,
                 text_length: 0,
                 token_index: 0,
-                _padding: 0,
+                prev_sibling: -1,
             },
         ];
         let boxes = vec![
@@ -663,7 +858,7 @@ mod tests {
                 text_start: 0,
                 text_length: 0,
                 token_index: 0,
-                _padding: 0,
+                prev_sibling: -1,
             });
             boxes.push(LayoutBox {
                 x: (i % 10) as f32 * 80.0,
@@ -727,7 +922,7 @@ mod tests {
                 text_start: 0,
                 text_length: 0,
                 token_index: 0,
-                _padding: 0,
+                prev_sibling: -1,
             });
             boxes.push(LayoutBox {
                 x: (i % 100) as f32 * 8.0,

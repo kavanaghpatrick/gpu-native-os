@@ -20,10 +20,10 @@ struct Element {
     int parent;
     int first_child;
     int next_sibling;
+    int prev_sibling;    // Issue #128: Enable O(1) cumulative height lookup
     uint text_start;
     uint text_length;
     uint token_index;
-    uint _padding;
 };
 
 struct LayoutBox {
@@ -444,9 +444,10 @@ kernel void generate_text_vertices(
     float container_width = box.content_width > 0 ? box.content_width : 10000.0;
 
     // Simple single-pass text wrapping directly in the paint kernel
-    float x = box.x;
-    float y = box.y;
-    float line_start_x = box.x;
+    // Use content box position (accounts for padding/border)
+    float x = box.content_x;
+    float y = box.content_y;
+    float line_start_x = box.content_x;
 
     // Track word boundaries for wrapping
     float word_start_x = x;
@@ -562,6 +563,176 @@ kernel void generate_text_vertices(
         }
     }
 }
+
+// ============================================================================
+// Issue #131: O(1) Two-Pass Text Line Layout - Pass 2
+// ============================================================================
+
+// Per-element line info header (16 bytes)
+struct TextLineDataHeader {
+    uint line_count;
+    uint _padding[3];
+};
+
+// Pre-computed line information (16 bytes)
+struct LineInfoPaint {
+    uint char_start;
+    uint char_end;
+    float y_offset;
+    float width;
+};
+
+constant uint MAX_LINES_PER_ELEMENT_PAINT = 64;
+
+// Pass 2: Generate text vertices using pre-computed line data - O(1) per character
+// Each thread processes one text element using LineInfo from Pass 1
+kernel void generate_text_vertices_fast(
+    device const Element* elements [[buffer(0)]],
+    device const LayoutBox* boxes [[buffer(1)]],
+    device const ComputedStyle* styles [[buffer(2)]],
+    device const uint8_t* text_buffer [[buffer(3)]],
+    device const uint* vertex_offsets [[buffer(4)]],
+    device const uint* vertex_counts [[buffer(5)]],
+    device PaintVertex* vertices [[buffer(6)]],
+    device const TextLineDataHeader* line_headers [[buffer(7)]],
+    device const LineInfoPaint* line_info [[buffer(8)]],
+    constant uint& element_count [[buffer(9)]],
+    constant Viewport& viewport [[buffer(10)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= element_count) return;
+
+    Element elem = elements[gid];
+
+    // Skip non-text elements
+    if (elem.element_type != ELEM_TEXT) return;
+    if (elem.text_length == 0) return;
+
+    ComputedStyle style = styles[gid];
+    if (style.display == 0) return;
+
+    LayoutBox box = boxes[gid];
+
+    // Calculate offset (after background and border)
+    uint background_count = (style.background_color[3] > 0) ? 4 : 0;
+    bool has_border = style.border_width[0] > 0 || style.border_width[1] > 0 ||
+                      style.border_width[2] > 0 || style.border_width[3] > 0;
+    uint border_count = has_border ? 16 : 0;
+    uint offset = vertex_offsets[gid] + background_count + border_count;
+
+    float2 scale = float2(2.0 / viewport.width, -2.0 / viewport.height);
+    float2 bias = float2(-1.0, 1.0);
+
+    float4 color = float4(
+        style.color[0],
+        style.color[1],
+        style.color[2],
+        style.color[3] * style.opacity
+    );
+
+    float font_size = style.font_size > 0 ? style.font_size : 16.0;
+
+    // Get line data for this element
+    uint line_count = line_headers[gid].line_count;
+    uint line_base = gid * MAX_LINES_PER_ELEMENT_PAINT;
+
+    // Handle edge case: no lines computed (fall back to single line)
+    if (line_count == 0) {
+        // Simple fallback: render all text on one line
+        float x = box.content_x;
+        float y = box.content_y;
+
+        for (uint i = 0; i < elem.text_length; i++) {
+            uint char_code = text_buffer[elem.text_start + i];
+            float advance = glyph_advance(char_code, font_size);
+
+            uint v = offset + i * 4;
+            bool is_visible = (char_code != ' ' && char_code != '\t' &&
+                              char_code != '\n' && char_code != '\r');
+            float4 vertex_color = is_visible ? color : float4(0, 0, 0, 0);
+
+            // Generate quad
+            vertices[v + 0].position = float2(x, y) * scale + bias;
+            vertices[v + 0].tex_coord = float2(float(char_code % 16) / 16.0, float(char_code / 16) / 16.0);
+            vertices[v + 0].color = vertex_color;
+            vertices[v + 0].flags = FLAG_TEXT;
+
+            vertices[v + 1].position = float2(x + advance, y) * scale + bias;
+            vertices[v + 1].tex_coord = float2(float(char_code % 16 + 1) / 16.0, float(char_code / 16) / 16.0);
+            vertices[v + 1].color = vertex_color;
+            vertices[v + 1].flags = FLAG_TEXT;
+
+            vertices[v + 2].position = float2(x + advance, y + font_size) * scale + bias;
+            vertices[v + 2].tex_coord = float2(float(char_code % 16 + 1) / 16.0, float(char_code / 16 + 1) / 16.0);
+            vertices[v + 2].color = vertex_color;
+            vertices[v + 2].flags = FLAG_TEXT;
+
+            vertices[v + 3].position = float2(x, y + font_size) * scale + bias;
+            vertices[v + 3].tex_coord = float2(float(char_code % 16) / 16.0, float(char_code / 16 + 1) / 16.0);
+            vertices[v + 3].color = vertex_color;
+            vertices[v + 3].flags = FLAG_TEXT;
+
+            x += advance;
+        }
+        return;
+    }
+
+    // Process each character with O(1) position lookup using pre-computed line data
+    uint current_line = 0;
+    float x = box.content_x;
+
+    for (uint i = 0; i < elem.text_length; i++) {
+        // O(1) lookup: Find which line this character is on
+        // Characters are sequential, so we just advance when we cross line boundaries
+        while (current_line < line_count - 1 &&
+               i >= line_info[line_base + current_line].char_end) {
+            current_line++;
+            x = box.content_x;  // Reset X for new line
+        }
+
+        // O(1): Y position directly from pre-computed line data
+        float y = box.content_y + line_info[line_base + current_line].y_offset;
+
+        uint char_code = text_buffer[elem.text_start + i];
+        float advance = glyph_advance(char_code, font_size);
+
+        // Generate vertex quad - NO LOOKBACK NEEDED!
+        uint v = offset + i * 4;
+        bool is_visible = (char_code != ' ' && char_code != '\t' &&
+                          char_code != '\n' && char_code != '\r');
+        float4 vertex_color = is_visible ? color : float4(0, 0, 0, 0);
+
+        // Top-left
+        vertices[v + 0].position = float2(x, y) * scale + bias;
+        vertices[v + 0].tex_coord = float2(float(char_code % 16) / 16.0, float(char_code / 16) / 16.0);
+        vertices[v + 0].color = vertex_color;
+        vertices[v + 0].flags = FLAG_TEXT;
+
+        // Top-right
+        vertices[v + 1].position = float2(x + advance, y) * scale + bias;
+        vertices[v + 1].tex_coord = float2(float(char_code % 16 + 1) / 16.0, float(char_code / 16) / 16.0);
+        vertices[v + 1].color = vertex_color;
+        vertices[v + 1].flags = FLAG_TEXT;
+
+        // Bottom-right
+        vertices[v + 2].position = float2(x + advance, y + font_size) * scale + bias;
+        vertices[v + 2].tex_coord = float2(float(char_code % 16 + 1) / 16.0, float(char_code / 16 + 1) / 16.0);
+        vertices[v + 2].color = vertex_color;
+        vertices[v + 2].flags = FLAG_TEXT;
+
+        // Bottom-left
+        vertices[v + 3].position = float2(x, y + font_size) * scale + bias;
+        vertices[v + 3].tex_coord = float2(float(char_code % 16) / 16.0, float(char_code / 16 + 1) / 16.0);
+        vertices[v + 3].color = vertex_color;
+        vertices[v + 3].flags = FLAG_TEXT;
+
+        x += advance;
+    }
+}
+
+// ============================================================================
+// Image Rendering
+// ============================================================================
 
 // ImageInfo structure for GPU image rendering
 struct ImageInfo {

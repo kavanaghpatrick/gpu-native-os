@@ -121,6 +121,15 @@ impl BatchLoadHandle {
             desc.status = 3; // Complete
         }
 
+        // CRITICAL: Sync GPU buffer with updated status!
+        // Without this, GPU kernel sees status=0 and exits immediately.
+        unsafe {
+            let ptr = self.descriptors.contents() as *mut FileDescriptor;
+            for (i, desc) in descriptor_data.iter().enumerate() {
+                *ptr.add(i) = *desc;
+            }
+        }
+
         Some(BatchLoadResult {
             mega_buffer: self.mega_buffer,
             descriptors: self.descriptors,

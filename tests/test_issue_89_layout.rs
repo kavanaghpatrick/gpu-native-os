@@ -31,10 +31,10 @@ fn layout_html(html: &[u8]) -> (Vec<Element>, Vec<LayoutBox>) {
     let viewport = make_viewport(1024.0, 768.0);
 
     let tokens = tokenizer.tokenize(html);
-    let (elements, _text_buffer) = parser.parse(&tokens, html);
+    let (elements, text_buffer) = parser.parse(&tokens, html);
     let stylesheet = Stylesheet::parse("");
     let styles = styler.resolve_styles(&elements, &tokens, html, &stylesheet);
-    let boxes = layout.compute_layout(&elements, &styles, viewport);
+    let boxes = layout.compute_layout(&elements, &styles, &text_buffer, viewport);
     (elements, boxes)
 }
 

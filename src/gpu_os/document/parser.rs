@@ -82,10 +82,10 @@ pub struct Element {
     pub parent: i32,
     pub first_child: i32,
     pub next_sibling: i32,
+    pub prev_sibling: i32,  // Issue #128: Enable O(1) cumulative height lookup
     pub text_start: u32,
     pub text_length: u32,
     pub token_index: u32,
-    pub _padding: u32,
 }
 
 impl Element {
@@ -151,9 +151,14 @@ impl Element {
         self.first_child >= 0
     }
 
-    /// Check if this element has siblings
+    /// Check if this element has a next sibling
     pub fn has_next_sibling(&self) -> bool {
         self.next_sibling >= 0
+    }
+
+    /// Check if this element has a previous sibling
+    pub fn has_prev_sibling(&self) -> bool {
+        self.prev_sibling >= 0
     }
 
     /// Check if this is a text node

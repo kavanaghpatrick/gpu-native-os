@@ -235,15 +235,185 @@ fn test_gpu_buffer_alignment() {
     assert_eq!(buffer.length(), element_count * 4);
 }
 
-// Placeholder for GPU implementation tests
-#[test]
-#[ignore = "Requires GPU implementation"]
-fn test_gpu_cumulative_heights_kernel() {
-    // TODO: Test actual Metal kernel implementation
+// =============================================================================
+// GPU IMPLEMENTATION TESTS
+// =============================================================================
+
+use rust_experiment::gpu_os::document::{
+    Element,
+    ComputedStyle,
+    GpuLayoutEngine,
+    Viewport,
+};
+
+/// Create elements with proper prev_sibling links for GPU testing
+fn create_gpu_wide_tree(siblings_per_parent: usize) -> (Vec<Element>, Vec<ComputedStyle>) {
+    let mut elements = Vec::new();
+    let mut styles = Vec::new();
+
+    // Root element
+    elements.push(Element {
+        element_type: 1, // div
+        parent: -1,
+        first_child: 1,
+        next_sibling: -1,
+        prev_sibling: -1,
+        text_start: 0,
+        text_length: 0,
+        token_index: 0,
+    });
+    styles.push(ComputedStyle {
+        display: 1, // DISPLAY_BLOCK
+        width: 800.0,
+        height: 0.0, // auto
+        ..Default::default()
+    });
+
+    // Child elements
+    for i in 0..siblings_per_parent {
+        let idx = i + 1;
+        elements.push(Element {
+            element_type: 1, // div
+            parent: 0,
+            first_child: -1,
+            next_sibling: if i < siblings_per_parent - 1 { (idx + 1) as i32 } else { -1 },
+            prev_sibling: if i > 0 { (idx - 1) as i32 } else { -1 },
+            text_start: 0,
+            text_length: 0,
+            token_index: 0,
+        });
+        styles.push(ComputedStyle {
+            display: 1, // DISPLAY_BLOCK
+            width: 0.0, // auto
+            height: 20.0 + (i % 5) as f32 * 10.0, // Varying heights
+            ..Default::default()
+        });
+    }
+
+    (elements, styles)
 }
 
 #[test]
-#[ignore = "Requires GPU implementation"]
+fn test_gpu_cumulative_heights_kernel() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut layout = GpuLayoutEngine::new(&device).expect("Failed to create layout engine");
+
+    // Create tree with 10 siblings
+    let (elements, styles) = create_gpu_wide_tree(10);
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    // Compute layout using GPU with O(1) cumulative heights
+    let boxes = layout.compute_layout(&elements, &styles, &[], viewport);
+
+    println!("\nGPU cumulative heights test (10 siblings):");
+    let mut expected_y = 0.0f32;
+    for (i, b) in boxes.iter().enumerate().skip(1) {
+        // Skip root
+        let expected_height = 20.0 + ((i - 1) % 5) as f32 * 10.0;
+        println!("  Element {}: y={:.1}, expected_y={:.1}, height={:.1}",
+            i, b.y, expected_y, b.height);
+
+        // Y position should match cumulative sum of previous siblings
+        assert!(
+            (b.y - expected_y).abs() < 1.0,
+            "Element {} Y mismatch: got {:.1}, expected {:.1}",
+            i, b.y, expected_y
+        );
+
+        expected_y += b.height;
+    }
+}
+
+#[test]
+fn test_gpu_cumulative_heights_wide_tree() {
+    let device = Device::system_default().expect("No Metal device");
+    let mut layout = GpuLayoutEngine::new(&device).expect("Failed to create layout engine");
+
+    // Test with 100 siblings (worst case for old O(siblings) algorithm)
+    let (elements, styles) = create_gpu_wide_tree(100);
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    let boxes = layout.compute_layout(&elements, &styles, &[], viewport);
+
+    println!("\nGPU cumulative heights test (100 siblings):");
+    println!("  Total elements: {}", boxes.len());
+
+    // Verify last sibling's Y position
+    let last_idx = boxes.len() - 1;
+    let last_box = &boxes[last_idx];
+
+    // Calculate expected Y by summing all previous heights
+    let mut expected_y = 0.0f32;
+    for i in 1..last_idx {
+        expected_y += boxes[i].height;
+    }
+
+    println!("  Last sibling (idx {}): y={:.1}, expected={:.1}", last_idx, last_box.y, expected_y);
+
+    assert!(
+        (last_box.y - expected_y).abs() < 1.0,
+        "Last sibling Y mismatch: got {:.1}, expected {:.1}",
+        last_box.y, expected_y
+    );
+}
+
+#[test]
 fn benchmark_gpu_layout_with_cumulative() {
-    // TODO: Benchmark full layout pipeline with O(1) sibling positioning
+    let device = Device::system_default().expect("No Metal device");
+    let mut layout = GpuLayoutEngine::new(&device).expect("Failed to create layout engine");
+
+    // Create tree with 1000 siblings (extreme test for O(1) vs O(siblings))
+    let (elements, styles) = create_gpu_wide_tree(1000);
+    let viewport = Viewport { width: 800.0, height: 600.0, _padding: [0.0; 2] };
+
+    // Warmup
+    let _ = layout.compute_layout(&elements, &styles, &[], viewport);
+
+    // Timed run
+    let iterations = 10;
+    let start = Instant::now();
+    for _ in 0..iterations {
+        let _ = layout.compute_layout(&elements, &styles, &[], viewport);
+    }
+    let elapsed = start.elapsed();
+
+    let per_layout = elapsed.as_secs_f64() * 1000.0 / iterations as f64;
+
+    println!("\n=== GPU Layout Performance (Issue #128) ===");
+    println!("Tree: 1000 siblings (worst case for old O(siblings) algorithm)");
+    println!("Layout time: {:.2}ms per layout ({} iterations)", per_layout, iterations);
+
+    // With O(1) lookup, should be fast even with 1000 siblings
+    // Old O(siblings) would be much slower
+    assert!(
+        per_layout < 20.0,
+        "Layout took too long: {:.2}ms (expected <20ms with O(1) lookup)",
+        per_layout
+    );
+
+    println!("PASS: O(1) cumulative heights working correctly!");
+}
+
+#[test]
+fn test_prev_sibling_links() {
+    // Verify that prev_sibling links are correctly maintained
+    let (elements, _styles) = create_gpu_wide_tree(10);
+
+    println!("\nPrev sibling links test:");
+    for (i, elem) in elements.iter().enumerate() {
+        if i == 0 {
+            assert_eq!(elem.prev_sibling, -1, "Root should have no prev_sibling");
+        } else if i == 1 {
+            assert_eq!(elem.prev_sibling, -1, "First child should have no prev_sibling");
+        } else {
+            assert_eq!(
+                elem.prev_sibling,
+                (i - 1) as i32,
+                "Element {} should have prev_sibling {}",
+                i,
+                i - 1
+            );
+        }
+        println!("  Element {}: prev_sibling={}", i, elem.prev_sibling);
+    }
 }

@@ -3,20 +3,28 @@
 //! Tests for hash table that replaces O(n) linear scan.
 
 use metal::*;
-use std::collections::HashMap;
 use std::time::Instant;
 
-/// Hash table entry
+// Import from library for GPU tests
+use rust_experiment::gpu_os::filesystem::{
+    GpuFilesystem, FileType, ROOT_INODE_ID, DirHashEntry,
+};
+
+// ============================================================================
+// Local test struct for pure-Rust algorithm tests
+// ============================================================================
+
+/// Local hash table entry for pure-Rust tests (matches library struct layout)
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
-struct DirHashEntry {
+struct LocalHashEntry {
     parent_inode: u32,
     name_hash: u32,
     entry_index: u32,
     _padding: u32,
 }
 
-impl DirHashEntry {
+impl LocalHashEntry {
     fn empty() -> Self {
         Self {
             parent_inode: 0,
@@ -51,13 +59,11 @@ fn hash_slot(key: u64, mask: u32) -> u32 {
     ((key >> 32) as u32) & mask
 }
 
-/// Build hash table from entries
-fn build_hash_table(entries: &[(u32, &str, u32)]) -> (Vec<DirHashEntry>, u32) {
-    // entries: [(parent_inode, name, entry_index), ...]
-
+/// Build hash table from entries (pure Rust implementation)
+fn build_hash_table(entries: &[(u32, &str, u32)]) -> (Vec<LocalHashEntry>, u32) {
     let capacity = (entries.len() * 2).next_power_of_two() as u32;
     let mask = capacity - 1;
-    let mut table = vec![DirHashEntry::empty(); capacity as usize];
+    let mut table = vec![LocalHashEntry::empty(); capacity as usize];
 
     for (parent_inode, name, entry_index) in entries {
         let name_hash = hash_name(name);
@@ -69,7 +75,7 @@ fn build_hash_table(entries: &[(u32, &str, u32)]) -> (Vec<DirHashEntry>, u32) {
             slot = (slot + 1) & mask;
         }
 
-        table[slot as usize] = DirHashEntry {
+        table[slot as usize] = LocalHashEntry {
             parent_inode: *parent_inode,
             name_hash,
             entry_index: *entry_index,
@@ -91,13 +97,12 @@ fn lookup_linear(entries: &[(u32, &str, u32)], parent_inode: u32, name: &str) ->
     None
 }
 
-/// O(1) hash table lookup
-fn lookup_hash(table: &[DirHashEntry], mask: u32, parent_inode: u32, name: &str) -> Option<u32> {
+/// O(1) hash table lookup (pure Rust)
+fn lookup_hash(table: &[LocalHashEntry], mask: u32, parent_inode: u32, name: &str) -> Option<u32> {
     let name_hash = hash_name(name);
     let key = dir_hash_key(parent_inode, name_hash);
     let mut slot = hash_slot(key, mask);
 
-    // Linear probing with max 32 attempts
     for _ in 0..32 {
         let entry = &table[slot as usize];
 
@@ -114,6 +119,10 @@ fn lookup_hash(table: &[DirHashEntry], mask: u32, parent_inode: u32, name: &str)
 
     None
 }
+
+// ============================================================================
+// Pure Rust Algorithm Tests
+// ============================================================================
 
 #[test]
 fn test_hash_table_correctness() {
@@ -147,21 +156,19 @@ fn test_hash_table_correctness() {
 
 #[test]
 fn test_hash_table_large() {
-    // Test with many entries
     let entry_count = 10000;
-    let mut entries: Vec<(u32, &'static str, u32)> = Vec::new();
-
-    // Generate test data using static strings
     static NAMES: [&str; 10] = [
         "file0.rs", "file1.rs", "file2.rs", "file3.rs", "file4.rs",
         "file5.rs", "file6.rs", "file7.rs", "file8.rs", "file9.rs",
     ];
 
-    for i in 0..entry_count {
-        let parent = (i / 100) as u32;
-        let name = NAMES[i % 10];
-        entries.push((parent, name, i as u32));
-    }
+    let entries: Vec<(u32, &str, u32)> = (0..entry_count)
+        .map(|i| {
+            let parent = (i / 100) as u32;
+            let name = NAMES[i % 10];
+            (parent, name, i as u32)
+        })
+        .collect();
 
     let (table, mask) = build_hash_table(&entries);
 
@@ -184,7 +191,6 @@ fn test_hash_table_large() {
 fn benchmark_linear_vs_hash() {
     let entry_count = 10000;
 
-    // Generate entries with owned strings for linear scan
     let entries_owned: Vec<(u32, String, u32)> = (0..entry_count)
         .map(|i| {
             let parent = (i / 100) as u32;
@@ -193,7 +199,6 @@ fn benchmark_linear_vs_hash() {
         })
         .collect();
 
-    // Convert to references for hash table
     let entries_ref: Vec<(u32, &str, u32)> = entries_owned
         .iter()
         .map(|(p, n, i)| (*p, n.as_str(), *i))
@@ -233,13 +238,10 @@ fn benchmark_linear_vs_hash() {
 
     let speedup = linear_time.as_secs_f64() / hash_time.as_secs_f64();
 
-    println!("Linear O(n): {:.2}ms ({} lookups)",
-        linear_time.as_secs_f64() * 1000.0, lookups);
-    println!("Hash O(1):   {:.2}ms ({} lookups)",
-        hash_time.as_secs_f64() * 1000.0, lookups);
+    println!("Linear O(n): {:.2}ms ({} lookups)", linear_time.as_secs_f64() * 1000.0, lookups);
+    println!("Hash O(1):   {:.2}ms ({} lookups)", hash_time.as_secs_f64() * 1000.0, lookups);
     println!("Speedup:     {:.0}x", speedup);
 
-    // With 10K entries, hash should be much faster
     assert!(speedup > 10.0, "Expected >10x speedup, got {:.1}x", speedup);
 }
 
@@ -247,7 +249,7 @@ fn benchmark_linear_vs_hash() {
 fn test_memory_overhead() {
     let entry_count = 100000;
     let table_capacity = ((entry_count * 2) as usize).next_power_of_two();
-    let entry_size = std::mem::size_of::<DirHashEntry>();
+    let entry_size = std::mem::size_of::<LocalHashEntry>();
     let table_size = table_capacity * entry_size;
 
     println!("\nMemory overhead test:");
@@ -255,24 +257,26 @@ fn test_memory_overhead() {
     println!("  Table capacity: {} (2x for 50% load factor)", table_capacity);
     println!("  Entry size: {} bytes", entry_size);
     println!("  Total table: {:.1} MB", table_size as f64 / (1024.0 * 1024.0));
-    println!("  Per entry: {} bytes", entry_size * 2);  // 2x capacity
+    println!("  Per entry: {} bytes", entry_size * 2);
 
-    // 16 bytes per entry * 2x capacity = 32 bytes per file
-    // 1M files = 32 MB - acceptable
     assert!(table_size < 64 * 1024 * 1024, "Table too large for 100K entries");
 }
+
+// ============================================================================
+// GPU Implementation Tests
+// ============================================================================
 
 #[test]
 fn test_gpu_buffer_layout() {
     let device = Device::system_default().expect("No Metal device");
 
-    // Verify DirHashEntry is GPU-friendly
+    // Verify DirHashEntry is GPU-friendly (uses library type)
     assert_eq!(std::mem::size_of::<DirHashEntry>(), 16, "Entry should be 16 bytes");
     assert_eq!(std::mem::align_of::<DirHashEntry>(), 4, "Entry should be 4-byte aligned");
 
     let capacity = 1024u64;
     let buffer = device.new_buffer(
-        capacity * 16,  // 16 bytes per entry
+        capacity * 16,
         MTLResourceOptions::StorageModeShared,
     );
 
@@ -283,15 +287,115 @@ fn test_gpu_buffer_layout() {
     assert_eq!(buffer.length(), capacity * 16);
 }
 
-// Placeholder for GPU implementation tests
 #[test]
-#[ignore = "Requires GPU implementation"]
 fn test_gpu_hash_lookup_kernel() {
-    // TODO: Test actual Metal kernel implementation
+    let device = Device::system_default().expect("No Metal device");
+
+    // Create filesystem and add files
+    let mut fs = GpuFilesystem::new(&device, 1024).expect("Failed to create filesystem");
+
+    // Create directory structure: /src/main.rs, /src/lib.rs, /tests/test.rs
+    let src_id = fs.add_file(ROOT_INODE_ID, "src", FileType::Directory).expect("add src");
+    let tests_id = fs.add_file(ROOT_INODE_ID, "tests", FileType::Directory).expect("add tests");
+    let _main_id = fs.add_file(src_id, "main.rs", FileType::Regular).expect("add main.rs");
+    let lib_id = fs.add_file(src_id, "lib.rs", FileType::Regular).expect("add lib.rs");
+    let _test_id = fs.add_file(tests_id, "test.rs", FileType::Regular).expect("add test.rs");
+
+    // Build hash table
+    fs.build_hash_table();
+    assert!(fs.has_hash_table(), "Hash table should be built");
+
+    // Test O(1) hash lookup
+    let result = fs.lookup_path_hash("/src/lib.rs");
+    assert!(result.is_ok(), "Should find /src/lib.rs");
+    assert_eq!(result.unwrap(), lib_id, "Should return correct inode");
+
+    // Test not found
+    let not_found = fs.lookup_path_hash("/src/nonexistent.rs");
+    assert!(not_found.is_err(), "Should not find nonexistent file");
+
+    println!("GPU hash lookup kernel test passed!");
 }
 
 #[test]
-#[ignore = "Requires GPU implementation"]
+fn test_gpu_hash_table_build() {
+    let device = Device::system_default().expect("No Metal device");
+
+    // Create filesystem with many entries
+    let mut fs = GpuFilesystem::new(&device, 10000).expect("Failed to create filesystem");
+
+    // Add 1000 files in nested directories
+    let mut dir_id = ROOT_INODE_ID;
+    for i in 0..10 {
+        let new_dir = fs.add_file(dir_id, &format!("dir{}", i), FileType::Directory)
+            .expect("add dir");
+        dir_id = new_dir;
+
+        for j in 0..100 {
+            fs.add_file(dir_id, &format!("file{}.rs", j), FileType::Regular)
+                .expect("add file");
+        }
+    }
+
+    // Build hash table
+    fs.build_hash_table();
+
+    // Check stats
+    let stats = fs.hash_table_stats();
+    assert!(stats.is_some(), "Should have hash table stats");
+    let (load_factor, size_bytes) = stats.unwrap();
+
+    println!("\nHash table build test:");
+    println!("  Load factor: {:.1}%", load_factor * 100.0);
+    println!("  Size: {} bytes ({:.1} KB)", size_bytes, size_bytes as f64 / 1024.0);
+
+    assert!(load_factor < 0.6, "Load factor should be < 60%");
+    assert!(load_factor > 0.2, "Load factor should be > 20%");
+}
+
+#[test]
 fn benchmark_gpu_path_lookup() {
-    // TODO: Benchmark full path resolution with hash table
+    let device = Device::system_default().expect("No Metal device");
+
+    // Create filesystem with nested structure
+    let mut fs = GpuFilesystem::new(&device, 10000).expect("Failed to create filesystem");
+
+    // Build /a/b/c/d/e/f/g/h/i/file.rs (10 components deep)
+    let mut dir_id = ROOT_INODE_ID;
+    let dir_names = ["a", "b", "c", "d", "e", "f", "g", "h", "i"];
+    for name in &dir_names {
+        dir_id = fs.add_file(dir_id, name, FileType::Directory).expect("add dir");
+    }
+    let file_id = fs.add_file(dir_id, "file.rs", FileType::Regular).expect("add file");
+
+    // Build hash table
+    fs.build_hash_table();
+
+    let path = "/a/b/c/d/e/f/g/h/i/file.rs";
+
+    // Time linear scan (original lookup_path)
+    let linear_start = Instant::now();
+    for _ in 0..100 {
+        let result = fs.lookup_path(path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), file_id);
+    }
+    let linear_time = linear_start.elapsed();
+
+    // Time hash lookup (new lookup_path_hash)
+    let hash_start = Instant::now();
+    for _ in 0..100 {
+        let result = fs.lookup_path_hash(path);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), file_id);
+    }
+    let hash_time = hash_start.elapsed();
+
+    let speedup = linear_time.as_secs_f64() / hash_time.as_secs_f64();
+
+    println!("\n=== GPU Path Lookup Benchmark ===\n");
+    println!("Path: {} (10 components)", path);
+    println!("Linear scan (100 lookups): {:.2}ms", linear_time.as_secs_f64() * 1000.0);
+    println!("Hash lookup (100 lookups): {:.2}ms", hash_time.as_secs_f64() * 1000.0);
+    println!("Speedup: {:.1}x", speedup);
 }

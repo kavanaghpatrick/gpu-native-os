@@ -3,8 +3,9 @@
 //! Tests for persistent GPU kernel with work queue.
 
 use metal::*;
+use rust_experiment::gpu_os::persistent_search::PersistentSearchQueue;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Work item status constants
 const STATUS_EMPTY: u32 = 0;
@@ -247,23 +248,211 @@ fn test_spin_wait_vs_yield() {
     // Important for persistent kernels that may spin frequently
 }
 
-// Placeholder for full implementation tests
+// ============================================================================
+// Full Implementation Tests using PersistentSearchQueue
+// ============================================================================
+
 #[test]
-#[ignore = "Requires PersistentSearchQueue implementation"]
 fn test_persistent_kernel_correctness() {
-    // TODO: Verify persistent kernel produces correct results
+    // Verify persistent kernel produces correct results
+    let device = Device::system_default().expect("No Metal device");
+    let mut queue = PersistentSearchQueue::new(&device, 1024 * 1024)
+        .expect("Failed to create queue");
+
+    println!("\n=== Persistent Kernel Correctness Test ===\n");
+
+    // Load test data
+    let data = b"Hello World Hello World Hello test pattern test pattern test";
+    queue.load_data(0, data).expect("Failed to load data");
+
+    // Start kernel with limited iterations
+    queue.start_kernel(10000);
+
+    // Test 1: Basic search
+    let handle = queue.submit_search("Hello", false, 0).expect("Queue full");
+    let result = queue.wait_result_timeout(handle, Duration::from_secs(5))
+        .expect("Search timed out");
+    println!("  'Hello': {} matches (expected 3)", result.match_count);
+    assert_eq!(result.match_count, 3, "Expected 3 matches for 'Hello'");
+
+    // Test 2: Another pattern
+    // Data: "...test pattern test pattern test" = 3 instances of "test"
+    let handle = queue.submit_search("test", false, 0).expect("Queue full");
+    let result = queue.wait_result_timeout(handle, Duration::from_secs(5))
+        .expect("Search timed out");
+    println!("  'test': {} matches (expected 3)", result.match_count);
+    assert_eq!(result.match_count, 3, "Expected 3 matches for 'test'");
+
+    // Test 3: Not found
+    let handle = queue.submit_search("NotFound", false, 0).expect("Queue full");
+    let result = queue.wait_result_timeout(handle, Duration::from_secs(5))
+        .expect("Search timed out");
+    println!("  'NotFound': {} matches (expected 0)", result.match_count);
+    assert_eq!(result.match_count, 0, "Expected 0 matches for 'NotFound'");
+
+    // Shutdown
+    queue.shutdown();
+    println!("\n  All correctness tests passed!");
 }
 
 #[test]
-#[ignore = "Requires PersistentSearchQueue implementation"]
 fn benchmark_persistent_vs_traditional() {
-    // TODO: Full benchmark comparing dispatch approaches
-    // Target: 3x+ improvement for burst searches
+    // Full benchmark comparing dispatch approaches
+    let device = Device::system_default().expect("No Metal device");
+    let mut queue = PersistentSearchQueue::new(&device, 1024 * 1024)
+        .expect("Failed to create queue");
+
+    println!("\n=== Persistent vs Traditional Benchmark ===\n");
+
+    // Load test data - 100KB of text
+    let mut data = Vec::new();
+    for _ in 0..1000 {
+        data.extend_from_slice(b"Hello World, this is a test string for searching patterns. TODO find me. ");
+        data.extend_from_slice(b"More text here with various patterns to search for in the benchmark test. ");
+    }
+    queue.load_data(0, &data).expect("Failed to load data");
+
+    let iterations = 50;
+
+    // Traditional: new dispatch per search
+    let trad_start = Instant::now();
+    for _ in 0..iterations {
+        let _count = queue.oneshot_search("TODO", false).expect("Search failed");
+    }
+    let trad_time = trad_start.elapsed();
+
+    // Start persistent kernel
+    queue.start_kernel(100000);
+
+    // Warmup
+    for _ in 0..5 {
+        let handle = queue.submit_search("TODO", false, 0).expect("Queue full");
+        queue.wait_result_timeout(handle, Duration::from_secs(5)).expect("Timeout");
+    }
+
+    // Persistent: reuse running kernel
+    let pers_start = Instant::now();
+    for _ in 0..iterations {
+        let handle = queue.submit_search("TODO", false, 0).expect("Queue full");
+        queue.wait_result_timeout(handle, Duration::from_secs(5)).expect("Search timed out");
+    }
+    let pers_time = pers_start.elapsed();
+
+    queue.shutdown();
+
+    let trad_per_search = trad_time.as_micros() as f64 / iterations as f64;
+    let pers_per_search = pers_time.as_micros() as f64 / iterations as f64;
+    let speedup = trad_time.as_secs_f64() / pers_time.as_secs_f64();
+
+    println!("  Data size: {} bytes", data.len());
+    println!("  Iterations: {}", iterations);
+    println!();
+    println!("  Traditional (new dispatch per search):");
+    println!("    Total time: {:.1}ms", trad_time.as_secs_f64() * 1000.0);
+    println!("    Per search: {:.1}us", trad_per_search);
+    println!();
+    println!("  Persistent (reuse running kernel):");
+    println!("    Total time: {:.1}ms", pers_time.as_secs_f64() * 1000.0);
+    println!("    Per search: {:.1}us", pers_per_search);
+    println!();
+    println!("  Speedup: {:.2}x", speedup);
+    println!();
+
+    // Note: speedup may be < 1x for small data because dispatch overhead is only ~19us
+    // The benefit is more significant for rapid repeated searches (search-as-you-type)
+    println!("  Note: Dispatch overhead is ~19us, so benefit is workload-dependent.");
 }
 
 #[test]
-#[ignore = "Requires PersistentSearchQueue implementation"]
 fn test_persistent_kernel_stability() {
-    // TODO: Run persistent kernel for extended period
+    // Run persistent kernel for extended period
     // Verify no memory leaks, hangs, or crashes
+    let device = Device::system_default().expect("No Metal device");
+    let mut queue = PersistentSearchQueue::new(&device, 1024 * 1024)
+        .expect("Failed to create queue");
+
+    println!("\n=== Persistent Kernel Stability Test ===\n");
+
+    // Load test data
+    let data = b"Stability test data with patterns to search repeatedly over time.";
+    queue.load_data(0, data).expect("Failed to load data");
+
+    // Start kernel
+    queue.start_kernel(1000000);  // High iteration limit
+
+    let initial_heartbeat = queue.heartbeat();
+    println!("  Initial heartbeat: {}", initial_heartbeat);
+
+    // Run many searches
+    let num_searches = 100;
+    let start = Instant::now();
+
+    for i in 0..num_searches {
+        let handle = queue.submit_search("test", false, 0).expect("Queue full");
+        let result = queue.wait_result_timeout(handle, Duration::from_secs(1));
+
+        if result.is_none() {
+            panic!("Search {} timed out - kernel may be stuck", i);
+        }
+    }
+
+    let elapsed = start.elapsed();
+    let final_heartbeat = queue.heartbeat();
+
+    println!("  Completed {} searches in {:.1}ms", num_searches, elapsed.as_secs_f64() * 1000.0);
+    println!("  Final heartbeat: {} (delta: {})", final_heartbeat, final_heartbeat - initial_heartbeat);
+
+    // Check stats
+    let stats = queue.stats();
+    println!("  Queue stats: head={}, tail={}", stats.head, stats.tail);
+
+    // Verify heartbeat is advancing (kernel is alive)
+    assert!(final_heartbeat > initial_heartbeat, "Heartbeat should advance");
+
+    // Clean shutdown
+    queue.shutdown();
+    assert!(!queue.is_running(), "Queue should be stopped after shutdown");
+
+    println!("\n  Stability test passed!");
+}
+
+#[test]
+fn test_persistent_queue_operations() {
+    // Test queue operations: submit, is_complete, stats
+    let device = Device::system_default().expect("No Metal device");
+    let mut queue = PersistentSearchQueue::new(&device, 1024 * 1024)
+        .expect("Failed to create queue");
+
+    println!("\n=== Queue Operations Test ===\n");
+
+    let data = b"Test data for queue operations testing.";
+    queue.load_data(0, data).expect("Failed to load data");
+
+    // Check initial stats
+    let stats = queue.stats();
+    assert_eq!(stats.head, 0);
+    assert_eq!(stats.tail, 0);
+    assert!(!stats.shutdown);
+    println!("  Initial stats: head={}, tail={}", stats.head, stats.tail);
+
+    // Start kernel
+    queue.start_kernel(10000);
+    assert!(queue.is_running());
+
+    // Submit search
+    let handle = queue.submit_search("Test", false, 0).expect("Queue full");
+    println!("  Submitted search, handle idx={}", handle.idx);
+
+    // Wait for completion
+    let result = queue.wait_result(handle).expect("Search failed");
+    println!("  Result: {} matches", result.match_count);
+
+    // Check it's complete
+    assert!(queue.is_complete(handle));
+
+    // Shutdown
+    queue.shutdown();
+    assert!(!queue.is_running());
+
+    println!("\n  Queue operations test passed!");
 }

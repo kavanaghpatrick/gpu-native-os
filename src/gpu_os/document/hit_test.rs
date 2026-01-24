@@ -4,9 +4,7 @@
 //! Uses Metal compute shaders for <1ms response time on large documents.
 
 use metal::*;
-use super::parser::Element;
-use super::style::ComputedStyle;
-use super::layout::LayoutBox;
+use super::parser::{Element, ELEM_A, ELEM_BUTTON, ELEM_INPUT, ELEM_TEXTAREA, ELEM_SELECT};
 
 /// Result of a hit test
 #[derive(Clone, Copy, Debug, Default)]
@@ -53,13 +51,6 @@ pub struct HitTestParams {
     pub element_count: u32,
     pub _padding: [u32; 3],
 }
-
-/// Element type constants for hit test results
-pub const ELEM_A: u32 = 4;
-pub const ELEM_BUTTON: u32 = 25;
-pub const ELEM_INPUT: u32 = 24;
-pub const ELEM_TEXTAREA: u32 = 26;
-pub const ELEM_SELECT: u32 = 27;
 
 /// GPU-Native Hit Tester
 pub struct GpuHitTester {

@@ -147,10 +147,10 @@ struct Element {
     int parent;
     int first_child;
     int next_sibling;
+    int prev_sibling;    // Issue #128: Enable O(1) cumulative height lookup
     uint text_start;
     uint text_length;
     uint token_index;
-    uint _padding;
 };
 
 struct Token {
@@ -1344,6 +1344,64 @@ kernel void resolve_styles(
     // GPU-native: parse style="..." attribute directly on GPU
     Token tok = tokens[elem.token_index];
     parse_inline_style_gpu(html, tok.start, tok.end, &style);
+
+    // HEURISTIC: Hide elements with common hidden class patterns
+    // This compensates for not loading external CSS files
+    // Look for class="...hidden..." or class="...noprint..." in the tag
+    {
+        uint pos = tok.start;
+        uint end = tok.end < tok.start + 500 ? tok.end : tok.start + 500; // limit scan
+        while (pos < end) {
+            // Look for "class=" or "class ="
+            if (pos + 6 < end &&
+                html[pos] == 'c' && html[pos+1] == 'l' && html[pos+2] == 'a' &&
+                html[pos+3] == 's' && html[pos+4] == 's') {
+                pos += 5;
+                while (pos < end && (html[pos] == ' ' || html[pos] == '=')) pos++;
+                if (pos < end && (html[pos] == '"' || html[pos] == '\'')) {
+                    uint quote = html[pos];
+                    pos++;
+                    uint class_start = pos;
+                    while (pos < end && html[pos] != quote) pos++;
+                    uint class_end = pos;
+
+                    // Scan class value for hidden patterns
+                    for (uint i = class_start; i + 5 < class_end; i++) {
+                        // "hidden"
+                        if (html[i] == 'h' && html[i+1] == 'i' && html[i+2] == 'd' &&
+                            html[i+3] == 'd' && html[i+4] == 'e' && html[i+5] == 'n') {
+                            style.display = DISPLAY_NONE;
+                            break;
+                        }
+                        // "noprint"
+                        if (html[i] == 'n' && html[i+1] == 'o' && html[i+2] == 'p' &&
+                            html[i+3] == 'r' && html[i+4] == 'i' && html[i+5] == 'n') {
+                            style.display = DISPLAY_NONE;
+                            break;
+                        }
+                        // "collapsed" (Wikipedia sidebar)
+                        if (i + 8 < class_end &&
+                            html[i] == 'c' && html[i+1] == 'o' && html[i+2] == 'l' &&
+                            html[i+3] == 'l' && html[i+4] == 'a' && html[i+5] == 'p' &&
+                            html[i+6] == 's' && html[i+7] == 'e' && html[i+8] == 'd') {
+                            style.display = DISPLAY_NONE;
+                            break;
+                        }
+                    }
+                }
+                break; // Done with class attribute
+            }
+            pos++;
+        }
+    }
+
+    // HEURISTIC: Hide common invisible elements (script, style, template, noscript)
+    if (elem.element_type == 12 ||  // script
+        elem.element_type == 13 ||  // style
+        elem.element_type == 28 ||  // template (if we have it)
+        elem.element_type == 29) {  // noscript (if we have it)
+        style.display = DISPLAY_NONE;
+    }
 
     // Note: Inheritance is handled by apply_inheritance kernel after this pass
     // This ensures explicit selector values are not overwritten
