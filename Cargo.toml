@@ -57,6 +57,10 @@ path = "examples/benchmark_hittest.rs"
 name = "benchmark_visual"
 path = "examples/benchmark_visual.rs"
 
+[[example]]
+name = "filesystem_browser"
+path = "examples/filesystem_browser.rs"
+
 [dependencies]
 metal = "0.33"
 cocoa = "0.26"
