@@ -459,6 +459,255 @@ impl GpuRuntime {
     pub fn current_signal_value(&self) -> u64 {
         self.shared_event.signaled_value()
     }
+
+    // =========================================================================
+    // GPU-Driven Event Loop (Issue #149)
+    // =========================================================================
+    //
+    // These methods enable GPU-driven event processing, eliminating CPU from
+    // steady-state event handling. The GPU:
+    // - Reads from existing InputQueue (via InputHandler)
+    // - Routes events to appropriate handlers
+    // - Manages window drag/resize/focus state
+    // - Dispatches render when frame is dirty
+    //
+    // CPU's only job: push input events via InputHandler.push_*() methods
+
+    /// Initialize the GPU event loop
+    ///
+    /// Creates the event loop state buffer and compiles GPU kernels.
+    /// Returns an EventLoopHandle for controlling the loop.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let runtime = GpuRuntime::new(device);
+    /// let handle = runtime.init_event_loop().unwrap();
+    /// runtime.start_event_loop(&handle, &windows_buffer);
+    /// // Input is pushed via existing InputHandler:
+    /// runtime.push_mouse_move(x, y);
+    /// ```
+    pub fn init_event_loop(&self) -> Result<super::event_loop::EventLoopHandle, String> {
+        use super::event_loop::{
+            GpuEventLoopState, HitTestResult, EventLoopHandle, EVENT_LOOP_SHADER_SOURCE
+        };
+
+        // Create NEW state buffer for GPU event loop state
+        let state_buffer = self.device.new_buffer(
+            GpuEventLoopState::SIZE as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Initialize state
+        unsafe {
+            let ptr = state_buffer.contents() as *mut GpuEventLoopState;
+            *ptr = GpuEventLoopState::new();
+        }
+
+        // Create hit result buffer
+        let hit_result_buffer = self.device.new_buffer(
+            HitTestResult::SIZE as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Initialize hit result
+        unsafe {
+            let ptr = hit_result_buffer.contents() as *mut HitTestResult;
+            *ptr = HitTestResult::default();
+        }
+
+        // Compile event loop kernels
+        let options = CompileOptions::new();
+        let library = self.device
+            .new_library_with_source(EVENT_LOOP_SHADER_SOURCE, &options)
+            .map_err(|e| format!("Failed to compile event loop shaders: {}", e))?;
+
+        // Helper to get function and create pipeline
+        let create_pipeline = |name: &str| -> Result<ComputePipelineState, String> {
+            let function = library.get_function(name, None)
+                .map_err(|e| format!("Failed to get function {}: {}", name, e))?;
+            self.device.new_compute_pipeline_state_with_function(&function)
+                .map_err(|e| format!("Failed to create pipeline for {}: {}", name, e))
+        };
+
+        let event_loop_pipeline = create_pipeline("gpu_event_loop")?;
+        let hit_test_pipeline = create_pipeline("hit_test_parallel")?;
+        let hit_result_handler_pipeline = create_pipeline("handle_hit_result")?;
+        let window_move_pipeline = create_pipeline("window_move")?;
+        let window_resize_pipeline = create_pipeline("window_resize")?;
+
+        Ok(EventLoopHandle {
+            state_buffer,
+            hit_result_buffer,
+            event_loop_pipeline,
+            hit_test_pipeline,
+            hit_result_handler_pipeline,
+            window_move_pipeline,
+            window_resize_pipeline,
+            running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    }
+
+    /// Start the GPU event loop
+    ///
+    /// Dispatches the first event loop kernel. Subsequent iterations are
+    /// driven by polling or explicit calls to process_event_loop().
+    ///
+    /// Uses existing infrastructure:
+    /// - `self.input.buffer()` for input queue
+    /// - `self.command_queue` for dispatch
+    /// - `self.shared_event` for async signaling
+    pub fn start_event_loop(
+        &self,
+        handle: &super::event_loop::EventLoopHandle,
+        windows_buffer: &Buffer,
+        window_count: u32,
+    ) {
+        handle.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.dispatch_event_loop_iteration(handle, windows_buffer, window_count);
+    }
+
+    /// Process one iteration of the GPU event loop
+    ///
+    /// Checks what the GPU wants to do next and dispatches the appropriate
+    /// kernel. Call this in your main loop or use completion handlers.
+    pub fn process_event_loop(
+        &self,
+        handle: &super::event_loop::EventLoopHandle,
+        windows_buffer: &Buffer,
+        window_count: u32,
+    ) -> bool {
+        use super::event_loop::dispatch;
+
+        if !handle.is_running() {
+            return false;
+        }
+
+        // Read what GPU wants to do next
+        let next_dispatch = unsafe {
+            let state_ptr = handle.state_buffer.contents() as *const super::event_loop::GpuEventLoopState;
+            (*state_ptr).next_dispatch
+        };
+
+        // Create window count buffer
+        let window_count_buffer = self.device.new_buffer_with_data(
+            &window_count as *const u32 as *const _,
+            4,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = self.command_queue.new_command_buffer();
+
+        match next_dispatch {
+            dispatch::HIT_TEST => {
+                // Parallel hit test
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&handle.hit_test_pipeline);
+                encoder.set_buffer(0, Some(&handle.state_buffer), 0);
+                encoder.set_buffer(1, Some(windows_buffer), 0);
+                encoder.set_buffer(2, Some(&handle.hit_result_buffer), 0);
+                encoder.set_buffer(3, Some(&window_count_buffer), 0);
+                let threads = (window_count as u64).max(1);
+                encoder.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(64.min(threads), 1, 1));
+                encoder.end_encoding();
+
+                // Handle hit result
+                let encoder2 = command_buffer.new_compute_command_encoder();
+                encoder2.set_compute_pipeline_state(&handle.hit_result_handler_pipeline);
+                encoder2.set_buffer(0, Some(&handle.state_buffer), 0);
+                encoder2.set_buffer(1, Some(&handle.hit_result_buffer), 0);
+                encoder2.set_buffer(2, Some(windows_buffer), 0);
+                encoder2.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                encoder2.end_encoding();
+            }
+            dispatch::WINDOW_MOVE => {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&handle.window_move_pipeline);
+                encoder.set_buffer(0, Some(&handle.state_buffer), 0);
+                encoder.set_buffer(1, Some(windows_buffer), 0);
+                // Screen size buffer
+                let screen_size: [f32; 2] = [1920.0, 1080.0]; // TODO: pass actual screen size
+                let screen_buffer = self.device.new_buffer_with_data(
+                    screen_size.as_ptr() as *const _,
+                    8,
+                    MTLResourceOptions::StorageModeShared,
+                );
+                encoder.set_buffer(2, Some(&screen_buffer), 0);
+                encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                encoder.end_encoding();
+            }
+            dispatch::WINDOW_RESIZE => {
+                let encoder = command_buffer.new_compute_command_encoder();
+                encoder.set_compute_pipeline_state(&handle.window_resize_pipeline);
+                encoder.set_buffer(0, Some(&handle.state_buffer), 0);
+                encoder.set_buffer(1, Some(windows_buffer), 0);
+                encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+                encoder.end_encoding();
+            }
+            dispatch::RENDER => {
+                // Return true to signal render is needed
+                command_buffer.commit();
+                command_buffer.wait_until_completed();
+                self.dispatch_event_loop_iteration(handle, windows_buffer, window_count);
+                return true;
+            }
+            _ => {
+                // DISPATCH_NONE or others - just continue
+            }
+        }
+
+        // Re-dispatch event loop
+        self.encode_event_loop_kernel(command_buffer.new_compute_command_encoder(), handle, windows_buffer, &window_count_buffer);
+
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+
+        // Check if frame needs render
+        let frame_dirty = unsafe {
+            let state_ptr = handle.state_buffer.contents() as *const super::event_loop::GpuEventLoopState;
+            (*state_ptr).frame_dirty
+        };
+        frame_dirty != 0
+    }
+
+    /// Dispatch one iteration of the event loop kernel
+    fn dispatch_event_loop_iteration(
+        &self,
+        handle: &super::event_loop::EventLoopHandle,
+        windows_buffer: &Buffer,
+        window_count: u32,
+    ) {
+        let window_count_buffer = self.device.new_buffer_with_data(
+            &window_count as *const u32 as *const _,
+            4,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let command_buffer = self.command_queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+
+        self.encode_event_loop_kernel(encoder, handle, windows_buffer, &window_count_buffer);
+
+        let signal_value = self.next_signal_value.fetch_add(1, Ordering::SeqCst);
+        command_buffer.encode_signal_event(&self.shared_event, signal_value);
+        command_buffer.commit();
+    }
+
+    /// Encode the event loop kernel into an encoder
+    fn encode_event_loop_kernel(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        handle: &super::event_loop::EventLoopHandle,
+        windows_buffer: &Buffer,
+        window_count_buffer: &Buffer,
+    ) {
+        encoder.set_compute_pipeline_state(&handle.event_loop_pipeline);
+        encoder.set_buffer(0, Some(self.input.buffer()), 0);
+        encoder.set_buffer(1, Some(&handle.state_buffer), 0);
+        encoder.set_buffer(2, Some(windows_buffer), 0);
+        encoder.set_buffer(3, Some(window_count_buffer), 0);
+        encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
+        encoder.end_encoding();
+    }
 }
 
 // ============================================================================

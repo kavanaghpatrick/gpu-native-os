@@ -27,6 +27,7 @@ pub mod vsync;       // #18 - VSync Execution
 
 // Application framework
 pub mod app;         // GpuApp trait and GpuRuntime
+pub mod event_loop;  // #149 - GPU-Driven Event Dispatch
 pub mod gpu_string;  // #79 - GPU String Processing (tokenization, parsing)
 
 // Applications (use GpuApp framework)

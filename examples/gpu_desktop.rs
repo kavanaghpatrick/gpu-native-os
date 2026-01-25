@@ -134,6 +134,8 @@ struct App {
     frame_count: u64,
     mouse_x: f32,
     mouse_y: f32,
+    /// Use GPU-driven event loop (Issue #149) instead of CPU event handling
+    use_gpu_event_loop: bool,
 }
 
 impl App {
@@ -158,6 +160,7 @@ impl App {
             frame_count: 0,
             mouse_x: 0.0,
             mouse_y: 0.0,
+            use_gpu_event_loop: true,  // Enable GPU-driven event loop by default
         }
     }
 
@@ -179,6 +182,11 @@ impl App {
 
         // Update desktop
         desktop.update(delta);
+
+        // Process GPU events if GPU event loop is enabled
+        if self.use_gpu_event_loop && desktop.has_gpu_event_loop() {
+            desktop.process_gpu_events();
+        }
 
         // Create render pass
         let texture = drawable.texture();
@@ -203,10 +211,16 @@ impl App {
         // Status text at bottom of screen (above dock)
         text_renderer.clear();
         let status_y = height - 80.0;  // Above dock
+        let mode = if self.use_gpu_event_loop && desktop.has_gpu_event_loop() {
+            "GPU"
+        } else {
+            "CPU"
+        };
         text_renderer.add_text(
-            &format!("{} windows | {:.1} FPS | ESC to quit",
+            &format!("{} windows | {:.1} FPS | {} events | ESC to quit",
                 desktop.state.window_count,
-                1.0 / delta.max(0.001)
+                1.0 / delta.max(0.001),
+                mode
             ),
             10.0, status_y,
             0x888888FF,
@@ -321,6 +335,16 @@ impl ApplicationHandler for App {
             eprintln!("Failed to launch text editor: {}", e);
         }
 
+        // Initialize GPU event loop (Issue #149)
+        if self.use_gpu_event_loop {
+            if let Err(e) = desktop.init_gpu_event_loop() {
+                eprintln!("Failed to init GPU event loop: {}, falling back to CPU", e);
+                self.use_gpu_event_loop = false;
+            } else {
+                println!("GPU Event Loop enabled (Issue #149)");
+            }
+        }
+
         self.desktop = Some(desktop);
 
         // Initialize text rendering
@@ -361,16 +385,26 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                let old_x = self.mouse_x;
+                let old_y = self.mouse_y;
                 self.mouse_x = position.x as f32;
                 self.mouse_y = position.y as f32;
 
                 if let Some(desktop) = &mut self.desktop {
-                    desktop.on_mouse_move(self.mouse_x, self.mouse_y);
+                    if self.use_gpu_event_loop && desktop.has_gpu_event_loop() {
+                        // GPU event loop: push to input queue
+                        let dx = self.mouse_x - old_x;
+                        let dy = self.mouse_y - old_y;
+                        desktop.push_mouse_move(self.mouse_x, self.mouse_y, dx, dy);
+                    } else {
+                        // CPU event handling (fallback)
+                        desktop.on_mouse_move(self.mouse_x, self.mouse_y);
+                    }
                 }
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
-                let btn = match button {
+                let btn: u8 = match button {
                     MouseButton::Left => 0,
                     MouseButton::Right => 1,
                     MouseButton::Middle => 2,
@@ -378,12 +412,19 @@ impl ApplicationHandler for App {
                 };
 
                 if let Some(desktop) = &mut self.desktop {
-                    match state {
-                        ElementState::Pressed => {
-                            desktop.on_mouse_down(self.mouse_x, self.mouse_y, btn);
-                        }
-                        ElementState::Released => {
-                            desktop.on_mouse_up(self.mouse_x, self.mouse_y, btn);
+                    if self.use_gpu_event_loop && desktop.has_gpu_event_loop() {
+                        // GPU event loop: push to input queue
+                        let pressed = matches!(state, ElementState::Pressed);
+                        desktop.push_mouse_button(btn as u16, pressed, self.mouse_x, self.mouse_y);
+                    } else {
+                        // CPU event handling (fallback)
+                        match state {
+                            ElementState::Pressed => {
+                                desktop.on_mouse_down(self.mouse_x, self.mouse_y, btn);
+                            }
+                            ElementState::Released => {
+                                desktop.on_mouse_up(self.mouse_x, self.mouse_y, btn);
+                            }
                         }
                     }
                 }
