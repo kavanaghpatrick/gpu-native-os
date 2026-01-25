@@ -201,6 +201,17 @@ impl DocumentViewerApp {
             self.scroll_offset = max_scroll;
         }
     }
+
+    /// Truncate text to fit within max characters
+    fn truncate_text(text: &str, max_chars: usize) -> String {
+        if text.len() <= max_chars {
+            text.to_string()
+        } else if max_chars < 4 {
+            ".".repeat(max_chars.min(3))
+        } else {
+            format!("{}...", &text[..max_chars - 3])
+        }
+    }
 }
 
 impl Default for DocumentViewerApp {
@@ -240,7 +251,8 @@ impl DesktopApp for DocumentViewerApp {
     fn render(&mut self, ctx: &mut AppRenderContext) {
         let line_height = 16.0;
         let padding = 10.0;
-        let char_width = 8.0;
+        let char_width = 12.0;  // 8.0 base * 1.5 scale
+        let scrollbar_width = 20.0;  // Reserve space for scroll indicator
 
         // Calculate visible lines and clamp scroll before borrowing text_renderer
         self.visible_lines = ((ctx.height - padding * 2.0) / line_height) as usize;
@@ -255,6 +267,10 @@ impl DesktopApp for DocumentViewerApp {
         let ox = ctx.window_x;
         let oy = ctx.window_y;
 
+        // Calculate max characters for text (accounting for scrollbar area)
+        // Add extra padding (20px) for border/shadow visual margin
+        let text_area_width = ctx.width - padding * 2.0 - scrollbar_width - 20.0;
+
         // Render document lines
         let start = self.scroll_offset;
         let end = (start + self.visible_lines).min(self.lines.len());
@@ -263,7 +279,13 @@ impl DesktopApp for DocumentViewerApp {
             let y = padding + idx as f32 * line_height;
             let x = padding + line.indent as f32 * char_width;
 
-            text_renderer.add_text(&line.text, ox + x, oy + y, line.color);
+            // Calculate max chars for this line (accounting for indent)
+            let indent_width = line.indent as f32 * char_width;
+            let available_width = text_area_width - indent_width;
+            let max_chars = (available_width / char_width) as usize;
+
+            let display_text = Self::truncate_text(&line.text, max_chars);
+            text_renderer.add_text(&display_text, ox + x, oy + y, line.color);
         }
 
         // Scroll indicator
@@ -274,10 +296,10 @@ impl DesktopApp for DocumentViewerApp {
                 self.scroll_offset as f32 / (self.lines.len() - self.visible_lines) as f32
             };
 
-            let indicator = format!("Line {}/{}", start + 1, self.lines.len());
+            let indicator = format!("{}/{}", start + 1, self.lines.len());
             text_renderer.add_text(
                 &indicator,
-                ox + ctx.width - 100.0,
+                ox + ctx.width - 60.0,
                 oy + ctx.height - padding - line_height,
                 colors::GRAY,
             );

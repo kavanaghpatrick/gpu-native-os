@@ -133,6 +133,18 @@ impl FileBrowserApp {
         }
     }
 
+    /// Truncate text to fit within max characters, adding "..." if truncated
+    fn truncate_text(text: &str, max_chars: usize) -> String {
+        if max_chars < 4 {
+            return ".".repeat(max_chars.min(3));
+        }
+        if text.len() <= max_chars {
+            text.to_string()
+        } else {
+            format!("{}...", &text[..max_chars - 3])
+        }
+    }
+
     /// Ensure selection is visible
     fn ensure_visible(&mut self) {
         if self.selected < self.scroll_offset {
@@ -186,24 +198,32 @@ impl DesktopApp for FileBrowserApp {
 
         let line_height = 16.0;
         let padding = 8.0;
+        let char_width = 12.0;  // 8.0 base * 1.5 scale
         let mut y = padding;
 
         // Offset for window position - text coords are in screen space
         let ox = ctx.window_x;
         let oy = ctx.window_y;
 
-        // Header: current path
+        // Calculate max characters that fit in window
+        // Add extra padding (20px) for border/shadow visual margin
+        let effective_width = ctx.width - padding * 2.0 - 20.0;
+        let max_chars = (effective_width / char_width).max(10.0) as usize;
+
+        // Header: current path (truncated to fit)
+        let path_display = Self::truncate_text(&self.current_path, max_chars);
         text_renderer.add_text(
-            &self.current_path,
+            &path_display,
             ox + padding,
             oy + y,
             colors::BLUE,
         );
         y += line_height + 4.0;
 
-        // Separator
+        // Separator (fit to window width)
+        let separator_len = max_chars.min(60);
         text_renderer.add_text(
-            &"-".repeat(50),
+            &"-".repeat(separator_len),
             ox + padding,
             oy + y,
             colors::DARK_GRAY,
@@ -233,14 +253,6 @@ impl DesktopApp for FileBrowserApp {
             // Icon
             let icon = if entry.is_dir { ">" } else { " " };
 
-            // Name (truncate if too long)
-            let max_name_len = 40;
-            let name = if entry.name.len() > max_name_len {
-                format!("{}...", &entry.name[..max_name_len - 3])
-            } else {
-                entry.name.clone()
-            };
-
             // Size (for files)
             let size_str = if entry.is_dir {
                 "".to_string()
@@ -250,6 +262,12 @@ impl DesktopApp for FileBrowserApp {
 
             // Selection background indicator
             let prefix = if is_selected { "> " } else { "  " };
+
+            // Calculate available space for name
+            // prefix (2) + icon (1) + space (1) + name + spaces (2) + size
+            let fixed_chars = prefix.len() + 1 + 1 + 2 + size_str.len();
+            let max_name_len = max_chars.saturating_sub(fixed_chars);
+            let name = Self::truncate_text(&entry.name, max_name_len);
 
             let line = format!("{}{} {}  {}", prefix, icon, name, size_str);
             text_renderer.add_text(&line, ox + padding, oy + y, color);

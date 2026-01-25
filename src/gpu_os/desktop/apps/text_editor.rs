@@ -165,6 +165,17 @@ impl TextEditorApp {
             self.scroll_offset = self.cursor_row - self.visible_lines + 1;
         }
     }
+
+    /// Truncate text to fit within max characters
+    fn truncate_text(text: &str, max_chars: usize) -> String {
+        if text.len() <= max_chars {
+            text.to_string()
+        } else if max_chars < 4 {
+            ".".repeat(max_chars.min(3))
+        } else {
+            format!("{}...", &text[..max_chars - 3])
+        }
+    }
 }
 
 impl Default for TextEditorApp {
@@ -212,7 +223,7 @@ impl DesktopApp for TextEditorApp {
     fn render(&mut self, ctx: &mut AppRenderContext) {
         let line_height = 14.0;
         let padding = 8.0;
-        let char_width = 8.0;
+        let char_width = 12.0;  // 8.0 base * 1.5 scale
         let gutter_width = 32.0;  // Space for line numbers
 
         // Calculate visible lines before borrowing
@@ -226,6 +237,11 @@ impl DesktopApp for TextEditorApp {
 
         let ox = ctx.window_x;
         let oy = ctx.window_y;
+
+        // Calculate max characters for text content (excluding gutter)
+        // Add extra padding (20px) for border/shadow visual margin
+        let effective_width = ctx.width - gutter_width - padding - 20.0;
+        let max_text_chars = (effective_width / char_width).max(10.0) as usize;
 
         // Render visible lines
         let start = self.scroll_offset;
@@ -244,20 +260,23 @@ impl DesktopApp for TextEditorApp {
             };
             text_renderer.add_text(&num_str, ox + padding, oy + y, num_color);
 
-            // Line content - dark text on light background
+            // Line content - truncated to fit window
             let text_color = colors::BLACK;
-            text_renderer.add_text(line, ox + gutter_width, oy + y, text_color);
+            let display_line = Self::truncate_text(line, max_text_chars);
+            text_renderer.add_text(&display_line, ox + gutter_width, oy + y, text_color);
         }
 
-        // Render cursor
+        // Render cursor (only if within visible text area)
         if self.cursor_visible && self.cursor_row >= start && self.cursor_row < end {
-            let cursor_screen_row = self.cursor_row - start;
-            let cursor_y = padding + cursor_screen_row as f32 * line_height;
-            let cursor_x = gutter_width + self.cursor_col as f32 * char_width;
-            text_renderer.add_text("_", ox + cursor_x, oy + cursor_y, colors::CYAN);
+            if self.cursor_col <= max_text_chars {
+                let cursor_screen_row = self.cursor_row - start;
+                let cursor_y = padding + cursor_screen_row as f32 * line_height;
+                let cursor_x = gutter_width + self.cursor_col as f32 * char_width;
+                text_renderer.add_text("_", ox + cursor_x, oy + cursor_y, colors::CYAN);
+            }
         }
 
-        // Status bar
+        // Status bar (truncated to fit)
         let status_y = ctx.height - padding - line_height;
         let status = format!(
             "Ln {}, Col {} {}",
@@ -265,9 +284,9 @@ impl DesktopApp for TextEditorApp {
             self.cursor_col + 1,
             if self.modified { "[Modified]" } else { "" }
         );
-        text_renderer.add_text(&status, ox + padding, oy + status_y, colors::GRAY);
-
-        text_renderer.render(ctx.encoder, font, ctx.screen_width, ctx.screen_height);
+        let max_status_chars = ((ctx.width - padding * 2.0) / char_width) as usize;
+        let display_status = Self::truncate_text(&status, max_status_chars);
+        text_renderer.add_text(&display_status, ox + padding, oy + status_y, colors::GRAY);
     }
 
     fn handle_input(&mut self, event: &AppInputEvent) -> bool {

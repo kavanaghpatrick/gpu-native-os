@@ -57,7 +57,7 @@ impl TerminalApp {
                 },
                 OutputLine {
                     text: "Type 'help' for commands".to_string(),
-                    color: colors::GRAY,
+                    color: colors::DARK_GRAY,
                 },
                 OutputLine {
                     text: "".to_string(),
@@ -160,6 +160,17 @@ impl TerminalApp {
     fn scroll_to_bottom(&mut self) {
         // Will be calculated during render
     }
+
+    /// Truncate text to fit within max characters
+    fn truncate_text(text: &str, max_chars: usize) -> String {
+        if text.len() <= max_chars {
+            text.to_string()
+        } else if max_chars < 4 {
+            ".".repeat(max_chars.min(3))
+        } else {
+            format!("{}...", &text[..max_chars - 3])
+        }
+    }
 }
 
 impl Default for TerminalApp {
@@ -221,11 +232,16 @@ impl DesktopApp for TerminalApp {
 
         let line_height = 14.0;
         let padding = 8.0;
-        let char_width = 8.0;  // Approximate monospace width
+        let char_width = 12.0;  // 8.0 base * 1.5 scale
 
         // Offset for window position - text coords are in screen space
         let ox = ctx.window_x;
         let oy = ctx.window_y;
+
+        // Calculate max characters that fit in window
+        // Add extra padding (20px) for border/shadow visual margin
+        let effective_width = ctx.width - padding * 2.0 - 20.0;
+        let max_chars = (effective_width / char_width).max(10.0) as usize;
 
         // Dark terminal background is handled by window content color
 
@@ -241,10 +257,11 @@ impl DesktopApp for TerminalApp {
             0
         };
 
-        // Render output
+        // Render output (truncated to fit window)
         let mut y = padding;
         for line in self.output.iter().skip(start) {
-            text_renderer.add_text(&line.text, ox + padding, oy + y, line.color);
+            let display_text = Self::truncate_text(&line.text, max_chars);
+            text_renderer.add_text(&display_text, ox + padding, oy + y, line.color);
             y += line_height;
         }
 
@@ -254,10 +271,12 @@ impl DesktopApp for TerminalApp {
         text_renderer.add_text(prompt, ox + padding, oy + input_y, colors::CYAN);
 
         let input_x = padding + (prompt.len() as f32 * char_width);
-        text_renderer.add_text(&self.current_line, ox + input_x, oy + input_y, colors::BLACK);
+        let input_max_chars = max_chars.saturating_sub(prompt.len());
+        let display_input = Self::truncate_text(&self.current_line, input_max_chars);
+        text_renderer.add_text(&display_input, ox + input_x, oy + input_y, colors::BLACK);
 
-        // Render cursor
-        if self.cursor_visible {
+        // Render cursor (only if within visible area)
+        if self.cursor_visible && self.cursor_pos <= input_max_chars {
             let cursor_x = input_x + (self.cursor_pos as f32 * char_width);
             text_renderer.add_text("_", ox + cursor_x, oy + input_y, colors::BLACK);
         }

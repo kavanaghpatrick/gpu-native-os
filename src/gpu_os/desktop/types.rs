@@ -414,6 +414,10 @@ impl Default for DesktopState {
     }
 }
 
+/// Placement constants
+const PLACEMENT_PADDING: f32 = 10.0;   // Padding from screen edges
+const PLACEMENT_GRID_STEP: f32 = 50.0; // Grid step for candidate positions
+
 impl DesktopState {
     /// Create a new desktop state with given screen dimensions
     pub fn new(width: f32, height: f32) -> Self {
@@ -621,6 +625,118 @@ impl DesktopState {
     pub fn usable_area(&self) -> (f32, f32, f32, f32) {
         let menu_bar_height = 24.0;  // MENU_BAR_HEIGHT
         (0.0, menu_bar_height, self.screen_width, self.screen_height - self.dock_height - menu_bar_height)
+    }
+
+    /// Find a non-overlapping position for a new window
+    ///
+    /// Scans candidate positions and finds one with zero (or minimal) overlap
+    /// with existing windows. Uses a grid-based search starting from top-left.
+    pub fn find_non_overlapping_position(&self, width: f32, height: f32) -> (f32, f32) {
+        let (usable_x, usable_y, usable_w, usable_h) = self.usable_area();
+
+        // If no windows, place at top-left with padding
+        if self.window_count == 0 {
+            return (usable_x + PLACEMENT_PADDING, usable_y + PLACEMENT_PADDING);
+        }
+
+        let max_x = usable_x + usable_w - width - PLACEMENT_PADDING;
+        let max_y = usable_y + usable_h - height - PLACEMENT_PADDING;
+
+        // Clamp to ensure window fits
+        let max_x = max_x.max(usable_x + PLACEMENT_PADDING);
+        let max_y = max_y.max(usable_y + PLACEMENT_PADDING);
+
+        let mut best_x = usable_x + PLACEMENT_PADDING;
+        let mut best_y = usable_y + PLACEMENT_PADDING;
+        let mut best_overlap = f32::MAX;
+
+        // Scan grid of candidate positions
+        let mut test_y = usable_y + PLACEMENT_PADDING;
+        while test_y <= max_y {
+            let mut test_x = usable_x + PLACEMENT_PADDING;
+            while test_x <= max_x {
+                let overlap = self.calculate_total_overlap(test_x, test_y, width, height);
+
+                if overlap < best_overlap {
+                    best_overlap = overlap;
+                    best_x = test_x;
+                    best_y = test_y;
+
+                    // Found zero overlap - use it immediately
+                    if overlap == 0.0 {
+                        return (best_x, best_y);
+                    }
+                }
+
+                test_x += PLACEMENT_GRID_STEP;
+            }
+            test_y += PLACEMENT_GRID_STEP;
+        }
+
+        // Also try positions adjacent to existing windows (right edge, bottom edge)
+        for i in 0..self.window_count as usize {
+            let win = &self.windows[i];
+            if !win.is_visible() {
+                continue;
+            }
+
+            // Try to the right of this window
+            let right_x = win.x + win.width + PLACEMENT_PADDING;
+            let right_y = win.y;
+            if right_x + width <= usable_x + usable_w - PLACEMENT_PADDING {
+                let overlap = self.calculate_total_overlap(right_x, right_y, width, height);
+                if overlap < best_overlap {
+                    best_overlap = overlap;
+                    best_x = right_x;
+                    best_y = right_y;
+                    if overlap == 0.0 {
+                        return (best_x, best_y);
+                    }
+                }
+            }
+
+            // Try below this window
+            let below_x = win.x;
+            let below_y = win.y + win.height + PLACEMENT_PADDING;
+            if below_y + height <= usable_y + usable_h - PLACEMENT_PADDING {
+                let overlap = self.calculate_total_overlap(below_x, below_y, width, height);
+                if overlap < best_overlap {
+                    best_overlap = overlap;
+                    best_x = below_x;
+                    best_y = below_y;
+                    if overlap == 0.0 {
+                        return (best_x, best_y);
+                    }
+                }
+            }
+        }
+
+        (best_x, best_y)
+    }
+
+    /// Calculate total overlap area between a candidate rect and all existing windows
+    fn calculate_total_overlap(&self, x: f32, y: f32, width: f32, height: f32) -> f32 {
+        let mut total = 0.0;
+
+        for i in 0..self.window_count as usize {
+            let win = &self.windows[i];
+            if !win.is_visible() {
+                continue;
+            }
+
+            // Calculate intersection
+            let left = x.max(win.x);
+            let right = (x + width).min(win.x + win.width);
+            let top = y.max(win.y);
+            let bottom = (y + height).min(win.y + win.height);
+
+            if left < right && top < bottom {
+                let overlap_area = (right - left) * (bottom - top);
+                total += overlap_area;
+            }
+        }
+
+        total
     }
 }
 

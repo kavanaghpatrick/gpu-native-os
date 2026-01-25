@@ -193,10 +193,8 @@ impl GpuDesktop {
         let (pref_w, pref_h) = app.preferred_size();
         let name = app.name().to_string();
 
-        // Create window at center of usable area (below menu bar, above dock)
-        let (_, usable_y, usable_w, usable_h) = self.state.usable_area();
-        let x = (usable_w - pref_w) / 2.0;
-        let y = usable_y + (usable_h - pref_h) / 2.0;
+        // Find non-overlapping position for new window
+        let (x, y) = self.state.find_non_overlapping_position(pref_w, pref_h);
 
         let window_id = self.state.create_window(&name, x, y, pref_w, pref_h)
             .ok_or_else(|| "Failed to create window".to_string())?;

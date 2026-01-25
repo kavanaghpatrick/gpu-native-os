@@ -200,21 +200,15 @@ impl App {
         // Render desktop (windows + dock)
         desktop.render(encoder);
 
-        // Render status text
+        // Status text at bottom of screen (above dock)
         text_renderer.clear();
+        let status_y = height - 80.0;  // Above dock
         text_renderer.add_text(
-            &format!("GPU Desktop | {} windows | {:.1} FPS",
+            &format!("{} windows | {:.1} FPS | ESC to quit",
                 desktop.state.window_count,
                 1.0 / delta.max(0.001)
             ),
-            10.0, 10.0,
-            0xFFFFFFFF,
-        );
-
-        // Instructions
-        text_renderer.add_text(
-            "Drag title bars to move | Edges to resize | ESC to quit",
-            10.0, 30.0,
+            10.0, status_y,
             0x888888FF,
         );
 
