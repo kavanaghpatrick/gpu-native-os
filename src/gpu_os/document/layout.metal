@@ -827,13 +827,43 @@ kernel void layout_position_siblings(
     if (gid >= element_count) return;
     if (depths[gid] != current_level) return;  // Only process this level
 
+    Element elem = elements[gid];
     ComputedStyle style = styles[gid];
 
     // Skip hidden elements and out-of-flow elements
     if (style.display == DISPLAY_NONE) return;
     if (style.position == POSITION_ABSOLUTE || style.position == POSITION_FIXED) return;
 
-    // Issue #128: O(1) lookup using pre-computed cumulative heights
+    // Check if parent is flex - if so, handle flex layout differently
+    if (elem.parent >= 0) {
+        ComputedStyle parent_style = styles[elem.parent];
+        if (parent_style.display == DISPLAY_FLEX) {
+            // Flex children are positioned by the flex algorithm, not block flow
+            // For flex row: items are positioned horizontally
+            // For flex column: items are positioned vertically (like block flow but with flex features)
+            bool is_row = (parent_style.flex_direction == FLEX_ROW);
+
+            if (is_row) {
+                // Flex row: X position is cumulative, Y depends on align-items
+                CumulativeInfo info = cumulative[gid];
+                float x = info.y_offset;  // Reuse cumulative for X in flex row
+
+                // Add horizontal margins
+                x += style.margin[3];
+
+                boxes[gid].x = x;
+                boxes[gid].y = style.margin[0];  // Will be adjusted by align-items later
+
+                // Update content box position
+                boxes[gid].content_x = boxes[gid].x + style.border_width[3] + style.padding[3];
+                boxes[gid].content_y = boxes[gid].y + style.border_width[0] + style.padding[0];
+                return;
+            }
+            // Flex column falls through to block-like Y positioning
+        }
+    }
+
+    // Block flow: Y position from cumulative heights
     CumulativeInfo info = cumulative[gid];
     float y = info.y_offset;
 
