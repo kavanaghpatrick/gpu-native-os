@@ -7,6 +7,7 @@ pub mod gpu_io;         // #112 - GPU-Direct Storage with MTLIOCommandQueue
 pub mod batch_io;       // #125 - GPU Batch I/O with MTLIOCommandQueue
 pub mod streaming_search; // #132 - Streaming I/O - Overlap File Loading with GPU Search
 pub mod gpu_index;      // #77 - GPU-Resident Filesystem Index
+pub mod shared_index;   // #135 - Shared GPU-Resident Filesystem Index
 pub mod parallel_alloc;   // #91 - GPU-Native Parallel Prefix Allocator
 pub mod parallel_compact; // #126 - GPU Parallel Compaction with Prefix Sum
 pub mod gpu_cache;        // #127 - GPU-Resident Persistent File Cache
@@ -40,9 +41,14 @@ pub mod benchmark_visual;  // GPU vs CPU Benchmark Demo
 pub mod filesystem;        // GPU-Native Filesystem (Issue #19-24)
 pub mod content_search;    // GPU Content Search (Issue #50)
 pub mod duplicate_finder;  // GPU Duplicate Finder (Issue #51)
+pub mod shell;             // GPU Shell - PowerShell-style command line (Issue #126)
 pub mod document;          // GPU-Native Document Viewer (Issue #25+)
 pub mod document_app;      // GPU-Native Document Browser (GpuApp implementation)
 pub mod vector;             // GPU Vector Rasterizer (Issue #34 + #35 + #36)
+
+// Desktop environment (Issue #127-#133)
+pub mod screenshot;        // #127 - GPU Screenshot & Visual Testing Infrastructure
+pub mod desktop;           // #128-#133 - GPU Desktop Environment
 
 // Demo modules (legacy - standalone implementations)
 pub mod ball_physics;   // 1024-Ball Physics demo

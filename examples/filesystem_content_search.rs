@@ -6,6 +6,7 @@
 use metal::Device;
 use rust_experiment::gpu_os::filesystem::GpuPathSearch;
 use rust_experiment::gpu_os::content_search::SearchOptions;
+use rust_experiment::gpu_os::shared_index::GpuFilesystemIndex;
 use std::collections::HashSet;
 use std::env;
 use std::fs;
@@ -73,14 +74,44 @@ fn main() {
     }
     println!();
 
-    // Collect paths from directory
-    println!("{}Phase 1:{} Scanning filesystem...", BOLD, RESET);
+    // Collect paths - try shared index first (100x faster for home directory)
+    println!("{}Phase 1:{} Loading paths...", BOLD, RESET);
     let scan_start = Instant::now();
     let mut paths = Vec::new();
-    collect_paths(dir, &mut paths, 10, 0);
+
+    // Canonicalize search directory for comparison
+    let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let search_prefix = format!("{}/", canonical_dir.display());
+
+    // Try shared GPU-resident index first (Issue #135)
+    let mut used_shared_index = false;
+    if let Ok(shared_idx) = GpuFilesystemIndex::load_or_create(&device) {
+        if let Some(home_idx) = shared_idx.home() {
+            // Filter paths under search directory
+            for entry in home_idx.iter() {
+                if !entry.is_dir() {
+                    let entry_path = entry.path_str();
+                    if entry_path.starts_with(&search_prefix) {
+                        paths.push(entry_path.to_string());
+                    }
+                }
+            }
+            if !paths.is_empty() {
+                used_shared_index = true;
+            }
+        }
+    }
+
+    // Fall back to filesystem scan if shared index didn't work
+    if !used_shared_index {
+        paths.clear();
+        collect_paths(dir, &mut paths, 10, 0);
+    }
+
     let scan_time = scan_start.elapsed();
-    println!("  {}✓{} Found {} paths in {:.1}ms",
-        GREEN, RESET, paths.len(), scan_time.as_secs_f64() * 1000.0);
+    let source = if used_shared_index { "shared index" } else { "filesystem scan" };
+    println!("  {}✓{} Found {} paths via {} in {:.1}ms",
+        GREEN, RESET, paths.len(), source, scan_time.as_secs_f64() * 1000.0);
 
     if paths.is_empty() {
         println!("  {}No files found!{}", YELLOW, RESET);

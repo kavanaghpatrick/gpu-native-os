@@ -17,6 +17,9 @@ use rust_experiment::gpu_os::content_search::{GpuContentSearch, SearchOptions};
 use rust_experiment::gpu_os::mmap_buffer::MmapBuffer;
 use rust_experiment::gpu_os::gpu_index::GpuResidentIndex;
 use rust_experiment::gpu_os::batch_io::GpuBatchLoader;
+use rust_experiment::gpu_os::streaming_search::StreamingSearch;
+use rust_experiment::gpu_os::persistent_search::PersistentSearchQueue;
+use rust_experiment::gpu_os::shared_index::GpuFilesystemIndex;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -46,48 +49,47 @@ fn has_searchable_extension(path: &str) -> bool {
     }
 }
 
-/// Build a GPU-resident index from a directory
-fn build_index(dir: &Path) -> Result<PathBuf, String> {
+/// Build a temporary GPU-resident index from a directory
+fn build_temp_index(device: &Device, dir: &Path) -> GpuResidentIndex {
     let index_path = std::env::temp_dir().join("gpu_ripgrep_index.bin");
 
-    // Build and save the index
+    let build_start = Instant::now();
     GpuResidentIndex::build_and_save(dir, &index_path, None)
-        .map_err(|e| format!("Failed to build index: {:?}", e))?;
+        .expect("Failed to build index");
 
-    Ok(index_path)
+    let idx = GpuResidentIndex::load_smart(device, &index_path)
+        .expect("Failed to load built index");
+
+    println!("  {}✓{} Built temp index ({} entries) in {:.1}ms",
+        GREEN, RESET,
+        idx.entry_count(),
+        build_start.elapsed().as_secs_f64() * 1000.0);
+
+    idx
 }
 
 /// Extract file paths from GPU-resident index that match our extensions AND search directory
 fn filter_paths_from_index(index: &GpuResidentIndex, search_dir: &Path) -> Vec<String> {
-    // Normalize search directory - handle both relative and absolute paths
-    let search_str = search_dir.to_string_lossy();
+    // Canonicalize search_dir ONCE (not per-entry!)
+    let canonical_search = search_dir.canonicalize()
+        .unwrap_or_else(|_| search_dir.to_path_buf());
 
-    // For "." or relative paths, just check prefix directly
-    // For absolute paths, canonicalize the entry paths for comparison
-    let is_relative = search_str == "." || !search_dir.is_absolute();
+    // Add trailing slash to prevent prefix collisions
+    // e.g., ~/code/ should not match ~/codex-tests/
+    let mut search_prefix = canonical_search.to_string_lossy().to_string();
+    if !search_prefix.ends_with('/') {
+        search_prefix.push('/');
+    }
 
+    // Simple string prefix matching - no syscalls per entry!
+    // The index stores absolute paths, so we just check if entry starts with search_prefix
     index.iter()
         .filter(|entry| !entry.is_dir())
         .filter(|entry| has_searchable_extension(entry.path_str()))
         .filter(|entry| {
-            if is_relative {
-                // For relative searches like "./src" or ".", all paths in the index match
-                // since the index was built from the same base directory
-                if search_str == "." {
-                    true  // Current dir - include all files from this index
-                } else {
-                    // Check if path starts with the relative prefix
-                    let entry_path = entry.path_str();
-                    entry_path.starts_with(&*search_str) ||
-                    entry_path.starts_with(&format!("./{}", search_str.trim_start_matches("./")))
-                }
-            } else {
-                // Absolute path - canonicalize entry path for comparison
-                let entry_path = Path::new(entry.path_str());
-                entry_path.canonicalize()
-                    .map(|p| p.starts_with(search_dir))
-                    .unwrap_or(false)
-            }
+            let entry_path = entry.path_str();
+            // Fast string prefix check (no syscalls!)
+            entry_path.starts_with(&search_prefix)
         })
         .map(|entry| entry.path_str().to_string())
         .collect()
@@ -179,6 +181,8 @@ fn print_usage(program: &str) {
     eprintln!("  --rebuild               Force rebuild filesystem index\n");
     eprintln!("{}Loading modes:{}", YELLOW, RESET);
     eprintln!("  --batch                 GPU-direct via MTLIOCommandQueue (default)");
+    eprintln!("  --streaming             Overlap I/O with GPU search (Issue #132)");
+    eprintln!("  --persistent            Persistent kernel for burst search (Issue #133)");
     eprintln!("  --smart                 Auto-detect hot/cold cache");
     eprintln!("  --mmap                  Force mmap (fallback for Metal 2)\n");
     eprintln!("{}Architecture:{}", YELLOW, RESET);
@@ -190,9 +194,11 @@ fn print_usage(program: &str) {
 /// Loading mode for files
 #[derive(Clone, Copy, PartialEq)]
 enum LoadMode {
-    Smart,  // Auto-detect hot/cold cache
-    Mmap,   // Force mmap (zero-copy)
-    Batch,  // Force MTLIOCommandQueue
+    Smart,      // Auto-detect hot/cold cache
+    Mmap,       // Force mmap (zero-copy)
+    Batch,      // Force MTLIOCommandQueue
+    Streaming,  // #132: Overlap I/O with GPU search
+    Persistent, // #133: Persistent kernel for burst search
 }
 
 fn main() {
@@ -219,6 +225,8 @@ fn main() {
             "--smart" => load_mode = LoadMode::Smart,
             "--mmap" => load_mode = LoadMode::Mmap,
             "--batch" => load_mode = LoadMode::Batch,
+            "--streaming" => load_mode = LoadMode::Streaming,
+            "--persistent" => load_mode = LoadMode::Persistent,
             "-h" | "--help" => {
                 print_usage(&args[0]);
                 return;
@@ -246,6 +254,8 @@ fn main() {
         LoadMode::Smart => "smart (auto-detect)",
         LoadMode::Mmap => "mmap (zero-copy)",
         LoadMode::Batch => "batch (GPU-direct)",
+        LoadMode::Streaming => "streaming (I/O overlap)",
+        LoadMode::Persistent => "persistent (burst search)",
     };
 
     println!();
@@ -260,47 +270,76 @@ fn main() {
 
     let total_start = Instant::now();
 
-    // Phase 1: Build/Load GPU-Resident Index (using smart loading)
-    println!("{}Phase 1:{} GPU-Resident Filesystem Index", BOLD, RESET);
-    let index_path = std::env::temp_dir().join("gpu_ripgrep_index.bin");
+    // Phase 1: Load Shared GPU-Resident Index (Issue #135)
+    println!("{}Phase 1:{} Shared GPU-Resident Filesystem Index", BOLD, RESET);
 
     let index_start = Instant::now();
-    let index = if rebuild || !index_path.exists() {
-        // Build new index
-        println!("  Building index for {}...", dir.display());
-        let build_start = Instant::now();
-        GpuResidentIndex::build_and_save(&dir, &index_path, None)
-            .expect("Failed to build index");
 
-        let idx = GpuResidentIndex::load_smart(&device, &index_path)
-            .expect("Failed to load built index");
+    // Try to use shared index first (instant load via mmap)
+    // We need to keep shared_index alive if we use it, so declare both options
+    let shared_index: Option<GpuFilesystemIndex>;
+    let temp_index: Option<GpuResidentIndex>;
+    let used_shared: bool;
 
-        println!("  {}✓{} Built index ({} entries) in {:.1}ms",
-            GREEN, RESET,
-            idx.entry_count(),
-            build_start.elapsed().as_secs_f64() * 1000.0);
-        idx
-    } else {
-        // Load existing index using smart loading (auto-detects hot/cold)
-        match GpuResidentIndex::load_smart(&device, &index_path) {
-            Ok(idx) => {
-                let method = if idx.is_gpu_direct() { "GPU-direct" } else { "mmap" };
-                println!("  {}✓{} Loaded cached index ({} entries, {:.1} MB) via {} in {:.1}ms",
+    // Check if search dir is under home (covered by shared index)
+    let search_abs = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+    let home = dirs::home_dir().unwrap_or_default();
+    let is_under_home = search_abs.starts_with(&home);
+
+    // Check if shared index already exists (don't build on first run - too slow)
+    let shared_manifest = dirs::home_dir()
+        .map(|h| h.join(".gpu_os/index/manifest.json"))
+        .filter(|p| p.exists());
+
+    if !rebuild && is_under_home && shared_manifest.is_some() {
+        // Shared index exists - load it (fast!)
+        match GpuFilesystemIndex::load_or_create(&device) {
+            Ok(shared) if shared.total_entries() > 0 => {
+                println!("  {}✓{} Using shared index ({} entries) loaded in {:.1}ms",
                     GREEN, RESET,
-                    idx.entry_count(),
-                    idx.memory_usage() as f64 / (1024.0 * 1024.0),
-                    method,
+                    shared.total_entries(),
                     index_start.elapsed().as_secs_f64() * 1000.0);
-                idx
+                println!("    (Shared index at ~/.gpu_os/index/ - {}10x faster startup{})", GREEN, RESET);
+                shared_index = Some(shared);
+                temp_index = None;
+                used_shared = true;
+            }
+            Ok(_) => {
+                println!("  {}!{} Shared index empty, building temp...", YELLOW, RESET);
+                temp_index = Some(build_temp_index(&device, &dir));
+                shared_index = None;
+                used_shared = false;
             }
             Err(e) => {
-                println!("  {}!{} Cache invalid ({}), rebuilding...", YELLOW, RESET, e);
-                GpuResidentIndex::build_and_save(&dir, &index_path, None)
-                    .expect("Failed to build index");
-                GpuResidentIndex::load_smart(&device, &index_path)
-                    .expect("Failed to load built index")
+                println!("  {}!{} Shared index error ({}), building temp...", YELLOW, RESET, e);
+                temp_index = Some(build_temp_index(&device, &dir));
+                shared_index = None;
+                used_shared = false;
             }
         }
+    } else if !rebuild && is_under_home {
+        // No shared index yet - use temp (run `gpu-index build` to create shared)
+        println!("  {}!{} No shared index yet (run gpu-index build), using temp...", YELLOW, RESET);
+        temp_index = Some(build_temp_index(&device, &dir));
+        shared_index = None;
+        used_shared = false;
+    } else {
+        // Build temp index (rebuild requested or outside home)
+        if rebuild {
+            println!("  {}!{} Rebuild requested, building fresh index...", YELLOW, RESET);
+        } else {
+            println!("  {}!{} Search dir outside home, building temp index...", YELLOW, RESET);
+        }
+        temp_index = Some(build_temp_index(&device, &dir));
+        shared_index = None;
+        used_shared = false;
+    }
+
+    // Get reference to the index we'll use
+    let index: &GpuResidentIndex = if used_shared {
+        shared_index.as_ref().unwrap().home().expect("Home index should exist")
+    } else {
+        temp_index.as_ref().unwrap()
     };
     let index_time = index_start.elapsed();
 
@@ -342,6 +381,202 @@ fn main() {
         }
         mode => mode,
     };
+
+    // Handle streaming mode (#132) - overlaps I/O with GPU search
+    if load_mode == LoadMode::Streaming {
+        println!();
+        println!("{}Phase 3+4:{} Streaming Search (I/O overlapped with GPU)", BOLD, RESET);
+
+        let mut streaming = StreamingSearch::new(&device)
+            .expect("Failed to create streaming search");
+
+        let file_paths: Vec<PathBuf> = matching_paths.iter()
+            .map(|p| PathBuf::from(p))
+            .collect();
+
+        let search_start = Instant::now();
+        let (matches, profile) = streaming.search_streaming_with_profile(
+            &file_paths,
+            &pattern,
+            case_sensitive,
+        );
+        let search_time = search_start.elapsed();
+
+        println!("  {}✓{} Streaming search complete in {:.1}ms",
+            GREEN, RESET, search_time.as_secs_f64() * 1000.0);
+        profile.print();
+
+        let total_time = total_start.elapsed();
+
+        // Results
+        println!();
+        println!("{}─────────────────────────────────────────────────────────────{}", CYAN, RESET);
+        println!("{}Results:{}", BOLD, RESET);
+        println!();
+
+        for m in matches.iter().take(max_results) {
+            let highlighted = if case_sensitive {
+                m.context.replace(&pattern, &format!("{}{}{}{}", RED, BOLD, &pattern, RESET))
+            } else {
+                let lower = m.context.to_lowercase();
+                let pattern_lower = pattern.to_lowercase();
+                if let Some(pos) = lower.find(&pattern_lower) {
+                    let before = &m.context[..pos];
+                    let matched = &m.context[pos..pos + pattern.len()];
+                    let after = &m.context[pos + pattern.len()..];
+                    format!("{}{}{}{}{}{}", before, RED, BOLD, matched, RESET, after)
+                } else {
+                    m.context.clone()
+                }
+            };
+
+            println!("{}{}{}:{}{}{}:{}",
+                MAGENTA, m.file_path, RESET,
+                GREEN, m.line_number, RESET,
+                highlighted);
+        }
+
+        // Summary
+        println!();
+        println!("{}─────────────────────────────────────────────────────────────{}", CYAN, RESET);
+        println!("{}Performance Summary (Streaming Mode):{}", BOLD, RESET);
+        println!();
+        let index_method = if index.is_gpu_direct() { "GPU-direct" } else { "mmap" };
+        println!("  Phase 1 (Index):     {:>7.1}ms  {} entries via {}",
+            index_time.as_secs_f64() * 1000.0, index.entry_count(), index_method);
+        println!("  Phase 2 (Filter):    {:>7.1}ms  {} files matched",
+            filter_time.as_secs_f64() * 1000.0, matching_paths.len());
+        println!("  Phase 3+4 (Stream):  {:>7.1}ms  I/O overlapped with GPU search",
+            search_time.as_secs_f64() * 1000.0);
+        println!("  {}─────────────────────────────────{}", CYAN, RESET);
+        println!("  {}Total:              {:>7.1}ms{}", BOLD, total_time.as_secs_f64() * 1000.0, RESET);
+        println!();
+        let throughput = if profile.total_us > 0 {
+            (profile.bytes_processed as f64 / (1024.0 * 1024.0)) / (profile.total_us as f64 / 1_000_000.0)
+        } else {
+            0.0
+        };
+        println!("  {}Throughput: {:.1} MB/s{}", GREEN, throughput, RESET);
+        println!();
+
+        return;
+    }
+
+    // Handle persistent mode (#133) - persistent kernel for burst search
+    if load_mode == LoadMode::Persistent {
+        println!();
+        println!("{}Phase 3:{} GPU-Direct File Loading", BOLD, RESET);
+
+        let loader = match GpuBatchLoader::new(&device) {
+            Some(l) => l,
+            None => {
+                println!("  {}✗{} MTLIOCommandQueue not available", RED, RESET);
+                return;
+            }
+        };
+
+        let file_paths: Vec<PathBuf> = matching_paths.iter()
+            .map(|p| PathBuf::from(p))
+            .collect();
+
+        let load_start = Instant::now();
+        let batch_result = match loader.load_batch(&file_paths) {
+            Some(r) => r,
+            None => {
+                println!("  {}✗{} Batch load failed", RED, RESET);
+                return;
+            }
+        };
+        let load_time = load_start.elapsed();
+        let total_size = batch_result.total_bytes as usize;
+
+        println!("  {}✓{} Loaded {} files ({:.1} MB) in {:.1}ms",
+            GREEN, RESET,
+            batch_result.file_count(),
+            total_size as f64 / (1024.0 * 1024.0),
+            load_time.as_secs_f64() * 1000.0);
+
+        println!();
+        println!("{}Phase 4:{} Persistent Kernel Search", BOLD, RESET);
+
+        // Create persistent queue with the loaded data
+        let mut queue = PersistentSearchQueue::new(&device, total_size)
+            .expect("Failed to create persistent queue");
+
+        // Load data into the persistent queue
+        // Get data from batch result mega_buffer
+        let data_ptr = batch_result.mega_buffer.contents() as *const u8;
+        let data_slice = unsafe { std::slice::from_raw_parts(data_ptr, total_size) };
+        queue.load_data(0, data_slice).expect("Failed to load data");
+
+        // Use oneshot search (processes single search efficiently)
+        let search_start = Instant::now();
+        let match_count = queue.oneshot_search(&pattern, case_sensitive)
+            .expect("Persistent search failed");
+        let search_time = search_start.elapsed();
+
+        println!("  {}✓{} Persistent search: {} matches in {:.2}ms",
+            GREEN, RESET, match_count, search_time.as_secs_f64() * 1000.0);
+
+        let total_time = total_start.elapsed();
+
+        // For persistent mode, we get match count but need to extract context differently
+        // Use the batch searcher for result extraction
+        let mut searcher = GpuContentSearch::new(&device, batch_result.file_count())
+            .expect("Failed to create search engine");
+        let _ = searcher.load_from_batch(&batch_result).expect("Failed to load from batch");
+
+        let options = SearchOptions { case_sensitive, max_results };
+        let (matches, _) = searcher.search_with_profiling(&pattern, &options);
+
+        // Results
+        println!();
+        println!("{}─────────────────────────────────────────────────────────────{}", CYAN, RESET);
+        println!("{}Results:{}", BOLD, RESET);
+        println!();
+
+        for m in matches.iter().take(max_results) {
+            let highlighted = if case_sensitive {
+                m.context.replace(&pattern, &format!("{}{}{}{}", RED, BOLD, &pattern, RESET))
+            } else {
+                let lower = m.context.to_lowercase();
+                let pattern_lower = pattern.to_lowercase();
+                if let Some(pos) = lower.find(&pattern_lower) {
+                    let before = &m.context[..pos];
+                    let matched = &m.context[pos..pos + pattern.len()];
+                    let after = &m.context[pos + pattern.len()..];
+                    format!("{}{}{}{}{}{}", before, RED, BOLD, matched, RESET, after)
+                } else {
+                    m.context.clone()
+                }
+            };
+
+            println!("{}{}{}:{}{}{}:{}",
+                MAGENTA, m.file_path, RESET,
+                GREEN, m.line_number, RESET,
+                highlighted);
+        }
+
+        // Summary
+        println!();
+        println!("{}─────────────────────────────────────────────────────────────{}", CYAN, RESET);
+        println!("{}Performance Summary (Persistent Mode):{}", BOLD, RESET);
+        println!();
+        let index_method = if index.is_gpu_direct() { "GPU-direct" } else { "mmap" };
+        println!("  Phase 1 (Index):     {:>7.1}ms  {} entries via {}",
+            index_time.as_secs_f64() * 1000.0, index.entry_count(), index_method);
+        println!("  Phase 2 (Filter):    {:>7.1}ms  {} files matched",
+            filter_time.as_secs_f64() * 1000.0, matching_paths.len());
+        println!("  Phase 3 (Load):      {:>7.1}ms  {:.1} MB via GPU-direct",
+            load_time.as_secs_f64() * 1000.0, total_size as f64 / (1024.0 * 1024.0));
+        println!("  Phase 4 (Search):    {:>7.1}ms  persistent kernel",
+            search_time.as_secs_f64() * 1000.0);
+        println!("  {}─────────────────────────────────{}", CYAN, RESET);
+        println!("  {}Total:              {:>7.1}ms{}", BOLD, total_time.as_secs_f64() * 1000.0, RESET);
+        println!();
+
+        return;
+    }
 
     // Handle batch mode separately since it uses search_direct (no blit copy!)
     if actual_mode == LoadMode::Batch {

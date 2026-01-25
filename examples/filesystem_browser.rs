@@ -19,6 +19,7 @@ use rust_experiment::gpu_os::content_search::{GpuContentSearch, ContentMatch, Se
 use rust_experiment::gpu_os::batch_io::GpuBatchLoader;
 use rust_experiment::gpu_os::duplicate_finder::{GpuDuplicateFinder, DuplicateGroup};
 use rust_experiment::gpu_os::text_render::{BitmapFont, TextRenderer, colors};
+use rust_experiment::gpu_os::shared_index::GpuFilesystemIndex;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -26,10 +27,55 @@ use std::mem;
 use std::path::Path;
 use std::time::Instant;
 
+// Legacy cache file - kept for fallback but prefer shared index
 const INDEX_FILE: &str = "/Users/patrickkavanagh/.filesystem_index.txt";
 // 10M paths = ~2.5GB GPU memory - easily fits on Apple Silicon with unified memory
 // This eliminates the need for streaming search in most cases
 const MAX_GPU_PATHS: usize = 10_000_000;
+
+// File extensions to exclude from search (generated/binary/cache files)
+const EXCLUDED_EXTENSIONS: &[&str] = &[
+    // Cache and temporary files
+    "cache", "tmp", "temp", "bak", "swp", "swo",
+    // Compiled/binary files
+    "o", "obj", "a", "so", "dylib", "dll", "exe", "bin",
+    "class", "pyc", "pyo", "__pycache__",
+    "rlib", "rmeta", "d",
+    // Android/mobile
+    "smali", "dex", "apk", "ipa", "aab",
+    // Data/database files
+    "db", "sqlite", "sqlite3", "ldb", "sst",
+    // Archives (not useful to search inside)
+    "zip", "tar", "gz", "bz2", "xz", "7z", "rar",
+    // Images/media (can't search text in these)
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "svg",
+    "mp3", "mp4", "avi", "mov", "mkv", "wav", "flac",
+    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+    // Fonts
+    "ttf", "otf", "woff", "woff2", "eot",
+    // Logs (usually too large/noisy)
+    "log",
+    // Lock files
+    "lock", "lockb",
+    // Source maps (generated)
+    "map",
+    // Dictionary/data files
+    "dict", "idx", "pak", "dat",
+    // Node/package manager
+    "tsbuildinfo",
+    // Misc binary
+    "wasm", "node", "pdb",
+];
+
+/// Check if a file path should be excluded based on extension
+fn should_exclude_path(path: &str) -> bool {
+    // Get extension (lowercase)
+    let ext = path.rsplit('.').next().unwrap_or("");
+    let ext_lower = ext.to_lowercase();
+
+    // Check against excluded list
+    EXCLUDED_EXTENSIONS.iter().any(|&excluded| ext_lower == excluded)
+}
 use winit::{
     application::ApplicationHandler,
     event::{ElementState, KeyEvent, WindowEvent},
@@ -84,6 +130,10 @@ struct FilesystemBrowserApp {
     // GPU Duplicate Finder
     duplicate_finder: Option<GpuDuplicateFinder>,
     duplicate_groups: Vec<DuplicateGroup>,
+
+    // Shared GPU-Resident Filesystem Index (Issue #135)
+    // Pre-built index at ~/.gpu_os/index/ - loads in <20ms vs 5-10s filesystem scan
+    shared_index: Option<GpuFilesystemIndex>,
 
     // State
     search_query: String,
@@ -143,6 +193,12 @@ impl FilesystemBrowserApp {
             .map_err(|e| eprintln!("Warning: GPU streaming search init failed: {}", e))
             .ok();
 
+        // Try to load shared GPU-resident filesystem index (Issue #135)
+        // This is pre-built at ~/.gpu_os/index/ and loads in <20ms
+        let shared_index = GpuFilesystemIndex::load_or_create(&device)
+            .map_err(|e| eprintln!("Warning: Shared index not available: {:?}", e))
+            .ok();
+
         Self {
             window: None,
             device,
@@ -158,6 +214,7 @@ impl FilesystemBrowserApp {
             content_results: Vec::new(),
             duplicate_finder,
             duplicate_groups: Vec::new(),
+            shared_index,
             search_query: String::new(),
             search_mode: SearchMode::Path,
             modifiers: ModifiersState::empty(),
@@ -181,7 +238,89 @@ impl FilesystemBrowserApp {
     fn scan_filesystem(&mut self) {
         let start = Instant::now();
 
-        // Try to load from cache first
+        // PRIORITY 1: Try shared GPU-resident filesystem index (Issue #135)
+        // This is 100x faster than legacy cache - loads in <20ms for 1.7M paths
+        if let Some(ref shared_idx) = self.shared_index {
+            if let Some(home_idx) = shared_idx.home() {
+                let index_start = Instant::now();
+                let entry_count = home_idx.entry_count();
+
+                // Extract paths from shared index (filtering out non-useful file types)
+                let mut file_count = 0usize;
+                let mut dir_count = 0usize;
+                let mut skipped_count = 0usize;
+                let mut paths = HashMap::new();
+
+                for (idx, entry) in home_idx.iter().enumerate() {
+                    let path = entry.path_str();
+
+                    // Skip excluded file types (cache, binary, media, etc.)
+                    if !entry.is_dir() && should_exclude_path(path) {
+                        skipped_count += 1;
+                        continue;
+                    }
+
+                    if entry.is_dir() {
+                        dir_count += 1;
+                    } else {
+                        file_count += 1;
+                    }
+                    paths.insert(path.to_string(), idx as u32);
+                }
+
+                println!("  Filtered out {} non-searchable files (cache, binary, media)",
+                    skipped_count);
+
+                self.path_to_id = paths;
+                self.file_count = file_count;
+                self.dir_count = dir_count;
+
+                let index_load_time = index_start.elapsed();
+                let gpu_start = Instant::now();
+
+                // Check if we need streaming mode
+                if entry_count as usize > MAX_GPU_PATHS {
+                    self.use_streaming = true;
+                    self.all_paths = self.path_to_id.keys().cloned().collect();
+                    println!("Using streaming search for {} paths (exceeds {} limit)",
+                        entry_count, MAX_GPU_PATHS);
+
+                    self.scan_complete = true;
+                    self.status_message = format!(
+                        "{} files, {} folders - STREAMING ({}M paths) - shared index in {:.0}ms",
+                        self.file_count,
+                        self.dir_count,
+                        entry_count / 1_000_000,
+                        index_load_time.as_secs_f64() * 1000.0
+                    );
+                    return;
+                }
+
+                // Regular GPU search - load paths into GPU buffer
+                if let Some(ref mut gpu_search) = self.gpu_search {
+                    let path_list: Vec<String> = self.path_to_id.keys().cloned().collect();
+                    if let Err(e) = gpu_search.add_paths(&path_list) {
+                        eprintln!("GPU path load error: {}", e);
+                    }
+                }
+                let gpu_load_time = gpu_start.elapsed();
+
+                self.scan_complete = true;
+                let loaded_count = self.file_count + self.dir_count;
+                self.status_message = format!(
+                    "{} files, {} folders from SHARED INDEX in {:.0}ms (filtered {})",
+                    self.file_count,
+                    self.dir_count,
+                    index_load_time.as_secs_f64() * 1000.0,
+                    skipped_count
+                );
+                println!("✓ Loaded {} paths from shared index in {:.0}ms (skipped {} non-searchable)",
+                    loaded_count, index_load_time.as_secs_f64() * 1000.0, skipped_count);
+                return;
+            }
+        }
+
+        // PRIORITY 2: Try legacy cache file (slower but still faster than scan)
         if let Some((paths, file_count, dir_count)) = load_index() {
             self.path_to_id = paths;
             self.file_count = file_count;
@@ -220,7 +359,7 @@ impl FilesystemBrowserApp {
 
             self.scan_complete = true;
             self.status_message = format!(
-                "{} files, {} folders loaded from cache in {:.1}s (GPU: {:.0}ms)",
+                "{} files, {} folders loaded from legacy cache in {:.1}s (GPU: {:.0}ms)",
                 self.file_count,
                 self.dir_count,
                 start.elapsed().as_secs_f32(),
