@@ -1,3 +1,33 @@
+[workspace]
+members = [".", "wasm_translator", "gpu_std", "gpu_dsl", "gpu_dsl_macro"]
+exclude = [
+    "test_data/gpu_wasm_app",
+    "test_programs/external/bubble_sort",
+    "test_programs/external/crc32",
+    "test_programs/external/fastrand",
+    "test_programs/external/fnv_hash",
+    "test_programs/external/mandelbrot",
+    "test_programs/external/prime_sieve",
+    "test_programs/external/siphasher",
+    "test_programs/external/xxhash",
+    "test_programs/external/base64",
+    "test_programs/internet/gcd",
+    "test_programs/internet/factorial",
+    "test_programs/internet/sum_digits",
+    "test_programs/internet/collatz",
+    "test_programs/internet/fizzbuzz",
+    "test_programs/apps/game_of_life",
+    "test_programs/apps/snake",
+    "test_programs/apps/pong",
+    "test_programs/apps/clock",
+    "test_programs/apps/mandelbrot_interactive",
+    "test_programs/apps/game_2048",
+    "test_programs/apps/particles",
+    "test_programs/apps/bouncing_balls",
+    "test_programs/apps/drawing",
+]
+resolver = "2"
+
 [package]
 name = "rust-experiment"
 version = "0.1.0"
@@ -180,19 +210,31 @@ chrono = { version = "0.4", features = ["serde"] }  # Date/time for index timest
 dirs = "5"           # Platform-specific directories (~/.gpu_os) (#135)
 serde = { version = "1.0", features = ["derive"] }  # Serialization for index manifest (#135)
 serde_json = "1.0"   # JSON serialization for manifest.json (#135)
+toml = "0.8"         # TOML parsing for .gpuapp manifests (#141)
 rayon = "1.10"       # Parallel iterators for fast directory scanning (#135)
 
 [dev-dependencies]
 tempfile = "3"       # Temporary files for tests
+wasm_translator = { path = "wasm_translator" }  # WASM→GPU bytecode translator (#174)
+wat = "1.0"          # WAT text format parsing for register exhaustion tests
+wasmtime = "19.0"    # CPU reference execution for differential testing (#190)
+gpu_std = { path = "gpu_std", features = ["std"] }  # GPU standard library for HashMap tests (with std for host testing)
 
 [[example]]
 name = "gpu_ripgrep"
 path = "examples/gpu_ripgrep.rs"
 
-[[example]]
-name = "gpu_desktop"
-path = "examples/gpu_desktop.rs"
+# ARCHIVED: gpu_desktop - Was CPU-centric, replaced by megakernel
 
 [[example]]
 name = "gpu_shell"
 path = "examples/gpu_shell.rs"
+
+# Issue #162 - Visual Megakernel Demo
+[[example]]
+name = "visual_megakernel"
+path = "examples/visual_megakernel.rs"
+
+[[example]]
+name = "visual_wasm_apps"
+path = "examples/visual_wasm_apps.rs"

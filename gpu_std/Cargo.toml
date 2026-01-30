@@ -1,0 +1,16 @@
+[package]
+name = "gpu_std"
+version = "0.1.0"
+edition = "2021"
+description = "Standard library for GPU-native Rust applications"
+license = "MIT"
+
+[features]
+default = ["alloc"]
+alloc = []  # Enable Vec, String, Box via global allocator
+std = ["alloc"]  # Use standard library (for testing on host)
+
+[dependencies]
+
+[lib]
+crate-type = ["rlib"]

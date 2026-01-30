@@ -1,0 +1,12 @@
+[package]
+name = "wasm_translator"
+version = "0.1.0"
+edition = "2021"
+description = "WASM to GPU Bytecode Translator - THE GPU IS THE COMPUTER"
+
+[dependencies]
+wasmparser = "0.219"
+rust-experiment = { path = ".." }
+
+[dev-dependencies]
+wat = "1.219"
