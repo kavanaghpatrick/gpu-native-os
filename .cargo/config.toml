@@ -1,0 +1,11 @@
+# Cargo configuration for GPU-native OS project
+#
+# CRITICAL: Run tests serially to prevent GPU resource exhaustion.
+# Apple Silicon M4 has ONE GPU - parallel test execution causes:
+# - Command queue exhaustion (~256 limit)
+# - GPU memory pressure
+# - System hangs when multiple tests dispatch kernels simultaneously
+
+[env]
+# Rust test threads - single threaded to prevent GPU contention
+RUST_TEST_THREADS = "1"

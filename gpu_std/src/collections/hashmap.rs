@@ -499,6 +499,9 @@ where
 
     /// Add entry to stash (overflow buffer)
     fn add_to_stash(&mut self, key: K, value: V) {
+        // Maximum resize attempts before giving up (prevents infinite loops)
+        const MAX_RESIZE_ATTEMPTS: usize = 16;
+
         if self.stash_len < STASH_SIZE {
             unsafe {
                 let entry = &mut *self.stash.add(self.stash_len);
@@ -508,14 +511,79 @@ where
                 self.len += 1;
             }
         } else {
-            // Stash full - resize and retry
-            self.resize();
-            // After resize, try insert again (will go through normal path)
-            self.insert(key, value);
+            // Stash full - resize and retry WITHOUT recursion
+            // Keep resizing until this entry fits (bounded to prevent infinite loop)
+            for _attempt in 0..MAX_RESIZE_ATTEMPTS {
+                self.resize();
+                // Try to place directly into table 1
+                let b1 = self.bucket1(&key);
+                unsafe {
+                    let bucket1 = self.get_bucket1_mut(b1);
+                    if let Some(slot) = bucket1.find_empty() {
+                        bucket1.entries[slot] = CuckooEntry { key, value };
+                        bucket1.set_occupied(slot);
+                        self.len += 1;
+                        return;
+                    }
+                }
+                // Try table 2
+                let b2 = self.bucket2(&key);
+                unsafe {
+                    let bucket2 = self.get_bucket2_mut(b2);
+                    if let Some(slot) = bucket2.find_empty() {
+                        bucket2.entries[slot] = CuckooEntry { key, value };
+                        bucket2.set_occupied(slot);
+                        self.len += 1;
+                        return;
+                    }
+                }
+                // Both full after resize, try stash
+                if self.stash_len < STASH_SIZE {
+                    unsafe {
+                        let entry = &mut *self.stash.add(self.stash_len);
+                        entry.key = key;
+                        entry.value = value;
+                        self.stash_len += 1;
+                        self.len += 1;
+                    }
+                    return;
+                }
+                // Still no room, resize again
+            }
+            // CRITICAL: Exceeded maximum resize attempts - hash distribution failure
+            panic!("HashMap insert failed: exceeded {} resize attempts. Hash distribution failure.", MAX_RESIZE_ATTEMPTS);
         }
     }
 
+    /// Try to insert without using stash or recursion - returns true if successful
+    fn try_insert_direct(&mut self, key: K, value: V) -> bool {
+        // Try table 1
+        let b1 = self.bucket1(&key);
+        unsafe {
+            let bucket1 = self.get_bucket1_mut(b1);
+            if let Some(slot) = bucket1.find_empty() {
+                bucket1.entries[slot] = CuckooEntry { key, value };
+                bucket1.set_occupied(slot);
+                self.len += 1;
+                return true;
+            }
+        }
+        // Try table 2
+        let b2 = self.bucket2(&key);
+        unsafe {
+            let bucket2 = self.get_bucket2_mut(b2);
+            if let Some(slot) = bucket2.find_empty() {
+                bucket2.entries[slot] = CuckooEntry { key, value };
+                bucket2.set_occupied(slot);
+                self.len += 1;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Resize the hash tables (double capacity) and rehash all entries
+    /// Uses iterative rehashing to avoid recursion
     fn resize(&mut self) {
         let old_table1 = self.table1;
         let old_table2 = self.table2;
@@ -534,14 +602,14 @@ where
         self.len = 0;
         self.stash_len = 0;
 
-        // Rehash all entries from old table 1
+        // Rehash all entries from old table 1 using direct insert (no recursion)
         unsafe {
             for i in 0..old_num_buckets {
                 let bucket = &*old_table1.add(i);
                 for j in 0..BUCKET_SIZE {
                     if bucket.is_occupied(j) {
                         let entry = &bucket.entries[j];
-                        self.insert(entry.key, entry.value);
+                        self.rehash_entry(entry.key, entry.value);
                     }
                 }
             }
@@ -552,7 +620,7 @@ where
                 for j in 0..BUCKET_SIZE {
                     if bucket.is_occupied(j) {
                         let entry = &bucket.entries[j];
-                        self.insert(entry.key, entry.value);
+                        self.rehash_entry(entry.key, entry.value);
                     }
                 }
             }
@@ -560,7 +628,7 @@ where
             // Rehash entries from old stash
             for i in 0..old_stash_len {
                 let entry = &*old_stash.add(i);
-                self.insert(entry.key, entry.value);
+                self.rehash_entry(entry.key, entry.value);
             }
 
             // Free old tables
@@ -572,6 +640,88 @@ where
 
             let layout_stash = core::alloc::Layout::array::<CuckooEntry<K, V>>(STASH_SIZE).unwrap();
             alloc::alloc::dealloc(old_stash as *mut u8, layout_stash);
+        }
+    }
+
+    /// Rehash a single entry during resize - does NOT trigger recursive resize
+    /// Uses eviction but overflow goes to stash without further resize
+    fn rehash_entry(&mut self, key: K, value: V) {
+        // Try direct insert first
+        if self.try_insert_direct(key, value) {
+            return;
+        }
+
+        // Need eviction - similar to insert_with_eviction but no recursive resize
+        let mut cur_key = key;
+        let mut cur_value = value;
+        let mut use_table1 = true;
+
+        for _ in 0..MAX_EVICTIONS {
+            unsafe {
+                if use_table1 {
+                    let b1 = self.bucket1(&cur_key);
+                    let bucket1 = self.get_bucket1_mut(b1);
+
+                    // Try to find empty slot
+                    if let Some(slot) = bucket1.find_empty() {
+                        bucket1.entries[slot] = CuckooEntry { key: cur_key, value: cur_value };
+                        bucket1.set_occupied(slot);
+                        self.len += 1;
+                        return;
+                    }
+
+                    // Evict first occupied entry
+                    for i in 0..BUCKET_SIZE {
+                        if bucket1.is_occupied(i) {
+                            let victim_key = bucket1.entries[i].key;
+                            let victim_value = bucket1.entries[i].value;
+                            bucket1.entries[i] = CuckooEntry { key: cur_key, value: cur_value };
+                            cur_key = victim_key;
+                            cur_value = victim_value;
+                            break;
+                        }
+                    }
+                } else {
+                    let b2 = self.bucket2(&cur_key);
+                    let bucket2 = self.get_bucket2_mut(b2);
+
+                    // Try to find empty slot
+                    if let Some(slot) = bucket2.find_empty() {
+                        bucket2.entries[slot] = CuckooEntry { key: cur_key, value: cur_value };
+                        bucket2.set_occupied(slot);
+                        self.len += 1;
+                        return;
+                    }
+
+                    // Evict first occupied entry
+                    for i in 0..BUCKET_SIZE {
+                        if bucket2.is_occupied(i) {
+                            let victim_key = bucket2.entries[i].key;
+                            let victim_value = bucket2.entries[i].value;
+                            bucket2.entries[i] = CuckooEntry { key: cur_key, value: cur_value };
+                            cur_key = victim_key;
+                            cur_value = victim_value;
+                            break;
+                        }
+                    }
+                }
+                use_table1 = !use_table1;
+            }
+        }
+
+        // Eviction chain exhausted - use stash (no resize during rehash)
+        if self.stash_len < STASH_SIZE {
+            unsafe {
+                let entry = &mut *self.stash.add(self.stash_len);
+                entry.key = cur_key;
+                entry.value = cur_value;
+                self.stash_len += 1;
+                self.len += 1;
+            }
+        } else {
+            // CRITICAL: Never silently drop data - this violates project principles.
+            // If we reach here, our hash function has catastrophic distribution.
+            panic!("HashMap rehash failed: stash overflow after resize. Hash distribution failure.");
         }
     }
 
@@ -913,3 +1063,338 @@ extern crate std as alloc;
 
 #[cfg(not(feature = "std"))]
 extern crate alloc;
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_basic_insert_get() {
+        let mut map = HashMap::new();
+
+        map.insert(1, "one");
+        map.insert(2, "two");
+        map.insert(3, "three");
+
+        assert_eq!(map.get(&1), Some(&"one"));
+        assert_eq!(map.get(&2), Some(&"two"));
+        assert_eq!(map.get(&3), Some(&"three"));
+        assert_eq!(map.get(&4), None);
+    }
+
+    #[test]
+    fn test_update_existing() {
+        let mut map = HashMap::new();
+
+        map.insert(1, 100);
+        assert_eq!(map.get(&1), Some(&100));
+
+        map.insert(1, 200);
+        assert_eq!(map.get(&1), Some(&200));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_remove() {
+        let mut map = HashMap::new();
+
+        map.insert(1, "one");
+        map.insert(2, "two");
+        map.insert(3, "three");
+
+        assert_eq!(map.remove(&2), Some("two"));
+        assert_eq!(map.get(&2), None);
+        assert_eq!(map.len(), 2);
+
+        assert_eq!(map.remove(&2), None);
+        assert_eq!(map.len(), 2);
+    }
+
+    #[test]
+    fn test_contains_key() {
+        let mut map = HashMap::new();
+
+        map.insert("key1", 1);
+        map.insert("key2", 2);
+
+        assert!(map.contains_key(&"key1"));
+        assert!(map.contains_key(&"key2"));
+        assert!(!map.contains_key(&"key3"));
+    }
+
+    #[test]
+    fn test_len_and_empty() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+
+        assert!(map.is_empty());
+        assert_eq!(map.len(), 0);
+
+        map.insert(1, 1);
+        assert!(!map.is_empty());
+        assert_eq!(map.len(), 1);
+
+        map.insert(2, 2);
+        assert_eq!(map.len(), 2);
+
+        map.remove(&1);
+        assert_eq!(map.len(), 1);
+
+        map.clear();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn test_clear() {
+        let mut map = HashMap::new();
+
+        for i in 0..100 {
+            map.insert(i, i * 10);
+        }
+
+        assert_eq!(map.len(), 100);
+
+        map.clear();
+
+        assert!(map.is_empty());
+        assert_eq!(map.get(&50), None);
+    }
+
+    #[test]
+    fn test_many_entries() {
+        let mut map = HashMap::new();
+
+        // Insert many entries to trigger resizing
+        for i in 0..1000 {
+            map.insert(i, i * 2);
+        }
+
+        assert_eq!(map.len(), 1000);
+
+        // Verify all entries
+        for i in 0..1000 {
+            assert_eq!(map.get(&i), Some(&(i * 2)));
+        }
+    }
+
+    #[test]
+    fn test_eviction_chain() {
+        // Insert keys that likely hash to same buckets to test eviction
+        let mut map = HashMap::with_capacity(16);
+
+        for i in 0..100 {
+            map.insert(i, i);
+        }
+
+        // All should be retrievable
+        for i in 0..100 {
+            assert_eq!(map.get(&i), Some(&i));
+        }
+    }
+
+    #[test]
+    fn test_stash_usage() {
+        // Fill map to near capacity to force stash usage
+        let mut map = HashMap::with_capacity(8);
+
+        for i in 0..200 {
+            map.insert(i, i);
+        }
+
+        // All should be retrievable (some may be in stash)
+        for i in 0..200 {
+            assert_eq!(map.get(&i), Some(&i), "Failed to find key {}", i);
+        }
+    }
+
+    #[test]
+    fn test_get_mut() {
+        let mut map = HashMap::new();
+
+        map.insert(1, 100);
+
+        if let Some(value) = map.get_mut(&1) {
+            *value = 200;
+        }
+
+        assert_eq!(map.get(&1), Some(&200));
+    }
+
+    #[test]
+    fn test_entry_api_vacant() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+
+        match map.entry(1) {
+            Entry::Vacant(e) => {
+                e.insert(100);
+            }
+            Entry::Occupied(_) => panic!("Expected vacant entry"),
+        }
+
+        assert_eq!(map.get(&1), Some(&100));
+    }
+
+    #[test]
+    fn test_entry_api_occupied() {
+        let mut map = HashMap::new();
+        map.insert(1, 100);
+
+        match map.entry(1) {
+            Entry::Vacant(_) => panic!("Expected occupied entry"),
+            Entry::Occupied(e) => {
+                assert_eq!(*e.get(), 100);
+            }
+        }
+    }
+
+    #[test]
+    fn test_or_insert() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+
+        let v = map.entry(1).or_insert(100);
+        assert_eq!(*v, 100);
+
+        let v = map.entry(1).or_insert(200);
+        assert_eq!(*v, 100); // Should not change
+    }
+
+    #[test]
+    fn test_or_insert_with() {
+        let mut map: HashMap<i32, i32> = HashMap::new();
+
+        let v = map.entry(1).or_insert_with(|| 42 * 2);
+        assert_eq!(*v, 84);
+
+        // Counter to track if closure is called
+        let mut called = false;
+        let v = map.entry(1).or_insert_with(|| {
+            called = true;
+            999
+        });
+        assert_eq!(*v, 84);
+        assert!(!called); // Closure should not be called
+    }
+
+    #[test]
+    fn test_bulk_insert() {
+        let pairs = [(1, "one"), (2, "two"), (3, "three")];
+        let mut map: HashMap<i32, &str> = HashMap::new();
+        for (k, v) in pairs {
+            map.insert(k, v);
+        }
+
+        assert_eq!(map.len(), 3);
+        assert_eq!(map.get(&1), Some(&"one"));
+        assert_eq!(map.get(&2), Some(&"two"));
+        assert_eq!(map.get(&3), Some(&"three"));
+    }
+
+    #[test]
+    fn test_iter() {
+        let mut map = HashMap::new();
+        map.insert(1, 10);
+        map.insert(2, 20);
+        map.insert(3, 30);
+
+        let items = map.iter();
+        assert_eq!(items.len(), 3);
+
+        // Check all items are present (order not guaranteed)
+        let keys: alloc::vec::Vec<i32> = items.iter().map(|(k, _)| *k).collect();
+        assert!(keys.contains(&1));
+        assert!(keys.contains(&2));
+        assert!(keys.contains(&3));
+    }
+
+    #[test]
+    fn test_keys() {
+        let mut map = HashMap::new();
+        map.insert(1, "a");
+        map.insert(2, "b");
+        map.insert(3, "c");
+
+        let keys = map.keys();
+        assert_eq!(keys.len(), 3);
+        assert!(keys.contains(&1));
+        assert!(keys.contains(&2));
+        assert!(keys.contains(&3));
+    }
+
+    #[test]
+    fn test_values() {
+        let mut map = HashMap::new();
+        map.insert(1, 10);
+        map.insert(2, 20);
+        map.insert(3, 30);
+
+        let values = map.values();
+        assert_eq!(values.len(), 3);
+        assert!(values.contains(&10));
+        assert!(values.contains(&20));
+        assert!(values.contains(&30));
+    }
+
+    #[test]
+    fn test_capacity() {
+        let map: HashMap<i32, i32> = HashMap::with_capacity(100);
+        // Capacity should be at least what we requested
+        assert!(map.capacity() >= 100);
+    }
+
+    #[test]
+    fn test_string_keys() {
+        // Test with different key types
+        let mut map = HashMap::new();
+        map.insert("hello", 1);
+        map.insert("world", 2);
+
+        assert_eq!(map.get(&"hello"), Some(&1));
+        assert_eq!(map.get(&"world"), Some(&2));
+    }
+
+    #[test]
+    fn test_zero_key() {
+        let mut map = HashMap::new();
+        map.insert(0i32, 100);
+
+        assert_eq!(map.get(&0), Some(&100));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn test_negative_keys() {
+        let mut map = HashMap::new();
+        map.insert(-1, "negative one");
+        map.insert(-100, "negative hundred");
+        map.insert(0, "zero");
+        map.insert(1, "one");
+
+        assert_eq!(map.get(&-1), Some(&"negative one"));
+        assert_eq!(map.get(&-100), Some(&"negative hundred"));
+        assert_eq!(map.get(&0), Some(&"zero"));
+        assert_eq!(map.get(&1), Some(&"one"));
+    }
+
+    #[test]
+    fn test_resize_preserves_entries() {
+        let mut map = HashMap::with_capacity(8);
+
+        // Insert enough to trigger multiple resizes
+        for i in 0..500 {
+            map.insert(i, i * 3);
+        }
+
+        // All entries should be preserved
+        for i in 0..500 {
+            assert_eq!(
+                map.get(&i),
+                Some(&(i * 3)),
+                "Entry {} missing after resize",
+                i
+            );
+        }
+    }
+}
