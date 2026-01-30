@@ -817,6 +817,18 @@ pub mod bytecode_op {
     pub const COS: u8 = 0x08;
     pub const SQRT: u8 = 0x09;
 
+    // Transcendental functions (Issue #284 - rand/nalgebra compatibility)
+    pub const LN: u8 = 0x31;           // dst.x = log(s1.x) - natural logarithm
+    pub const EXP: u8 = 0x32;          // dst.x = exp(s1.x) - e^x
+    pub const LOG2: u8 = 0x33;         // dst.x = log2(s1.x)
+    pub const EXP2: u8 = 0x34;         // dst.x = exp2(s1.x) - 2^x
+    pub const POW: u8 = 0x35;          // dst.x = pow(s1.x, s2.x) - s1^s2
+    pub const TAN: u8 = 0x36;          // dst.x = tan(s1.x)
+    pub const ASIN: u8 = 0x37;         // dst.x = asin(s1.x)
+    pub const ACOS: u8 = 0x38;         // dst.x = acos(s1.x)
+    pub const ATAN: u8 = 0x39;         // dst.x = atan(s1.x)
+    pub const ATAN2: u8 = 0x3A;        // dst.x = atan2(s1.x, s2.x)
+
     // Float unary/binary math ops (Issue #198)
     pub const ABS: u8 = 0x20;        // dst.x = fabs(s1.x)
     pub const CEIL: u8 = 0x21;       // dst.x = ceil(s1.x)
@@ -1207,6 +1219,18 @@ impl BytecodeAssembler {
     pub fn fmin(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::FMIN, dst, a, b, 0.0) }
     pub fn fmax(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::FMAX, dst, a, b, 0.0) }
     pub fn fneg(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::FNEG, dst, src, 0, 0.0) }
+
+    // Transcendental functions (Issue #284 - rand/nalgebra compatibility)
+    pub fn ln(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::LN, dst, src, 0, 0.0) }
+    pub fn exp(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::EXP, dst, src, 0, 0.0) }
+    pub fn log2(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::LOG2, dst, src, 0, 0.0) }
+    pub fn exp2(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::EXP2, dst, src, 0, 0.0) }
+    pub fn pow(&mut self, dst: u8, base: u8, exp: u8) -> usize { self.emit(bytecode_op::POW, dst, base, exp, 0.0) }
+    pub fn tan(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::TAN, dst, src, 0, 0.0) }
+    pub fn asin(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::ASIN, dst, src, 0, 0.0) }
+    pub fn acos(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::ACOS, dst, src, 0, 0.0) }
+    pub fn atan(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::ATAN, dst, src, 0, 0.0) }
+    pub fn atan2(&mut self, dst: u8, y: u8, x: u8) -> usize { self.emit(bytecode_op::ATAN2, dst, y, x, 0.0) }
 
     // ═══════════════════════════════════════════════════════════════════════════
     // 64-BIT FLOAT OPERATIONS (Issue #189)
@@ -3535,6 +3559,18 @@ constant uint OP_SIN = 0x07;
 constant uint OP_COS = 0x08;
 constant uint OP_SQRT = 0x09;
 
+// Transcendental functions (Issue #284 - rand/nalgebra compatibility)
+constant uint OP_LN = 0x31;           // dst.x = log(s1.x) - natural logarithm
+constant uint OP_EXP = 0x32;          // dst.x = exp(s1.x) - e^x
+constant uint OP_LOG2 = 0x33;         // dst.x = log2(s1.x)
+constant uint OP_EXP2 = 0x34;         // dst.x = exp2(s1.x) - 2^x
+constant uint OP_POW = 0x35;          // dst.x = pow(s1.x, s2.x) - s1^s2
+constant uint OP_TAN = 0x36;          // dst.x = tan(s1.x)
+constant uint OP_ASIN = 0x37;         // dst.x = asin(s1.x)
+constant uint OP_ACOS = 0x38;         // dst.x = acos(s1.x)
+constant uint OP_ATAN = 0x39;         // dst.x = atan(s1.x)
+constant uint OP_ATAN2 = 0x3A;        // dst.x = atan2(s1.x, s2.x)
+
 // Float unary/binary math ops (Issue #198)
 constant uint OP_ABS = 0x20;        // dst.x = fabs(s1.x)
 constant uint OP_CEIL = 0x21;       // dst.x = ceil(s1.x)
@@ -4811,6 +4847,19 @@ inline void bytecode_update(
             case OP_SIN: regs[d].x = sin(regs[s1].x); break;
             case OP_COS: regs[d].x = cos(regs[s1].x); break;
             case OP_SQRT: regs[d].x = sqrt(regs[s1].x); break;
+
+            // Transcendental functions (Issue #284 - rand/nalgebra compatibility)
+            // These enable Normal distribution, Exponential, and scientific computing
+            case OP_LN: regs[d].x = log(regs[s1].x); break;      // natural log
+            case OP_EXP: regs[d].x = exp(regs[s1].x); break;     // e^x
+            case OP_LOG2: regs[d].x = log2(regs[s1].x); break;   // log base 2
+            case OP_EXP2: regs[d].x = exp2(regs[s1].x); break;   // 2^x
+            case OP_POW: regs[d].x = pow(regs[s1].x, regs[s2].x); break;  // x^y
+            case OP_TAN: regs[d].x = tan(regs[s1].x); break;
+            case OP_ASIN: regs[d].x = asin(regs[s1].x); break;
+            case OP_ACOS: regs[d].x = acos(regs[s1].x); break;
+            case OP_ATAN: regs[d].x = atan(regs[s1].x); break;
+            case OP_ATAN2: regs[d].x = atan2(regs[s1].x, regs[s2].x); break;
 
             // Float unary/binary math ops (Issue #198)
             case OP_ABS: regs[d].x = fabs(regs[s1].x); break;
@@ -8312,6 +8361,32 @@ impl GpuAppSystem {
                 .add(state_offset) as *const f32;
             let float_val = *result_ptr;
             Some(float_val as i32)
+        }
+    }
+
+    /// Read bytecode result as f32 directly (from state[3].x)
+    /// USE THIS for float operations (LN, EXP, SIN, COS, etc.)
+    /// Unlike read_bytecode_result + from_bits, this reads the float VALUE directly
+    /// State layout: SlabAllocator[0-2] (48 bytes) | result[3] (16 bytes) | params[4-7] (64 bytes) | heap[8+]
+    pub fn read_bytecode_result_f32_direct(&self, slot: u32) -> Option<f32> {
+        let app = self.get_app(slot)?;
+
+        let header: BytecodeHeader = unsafe {
+            let header_ptr = self.unified_state_buffer.contents()
+                .add(app.state_offset as usize) as *const BytecodeHeader;
+            *header_ptr
+        };
+
+        let header_size = std::mem::size_of::<BytecodeHeader>();
+        let inst_size = std::mem::size_of::<BytecodeInst>();
+        let alloc_header_size = 48;
+        let state_offset = header_size + (header.code_size as usize) * inst_size + alloc_header_size;
+
+        unsafe {
+            let result_ptr = self.unified_state_buffer.contents()
+                .add(app.state_offset as usize)
+                .add(state_offset) as *const f32;
+            Some(*result_ptr)
         }
     }
 
