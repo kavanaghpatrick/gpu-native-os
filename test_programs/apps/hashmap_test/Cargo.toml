@@ -1,0 +1,19 @@
+[package]
+name = "hashmap_test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+# Enable alloc feature for HashMap (requires heap allocation)
+gpu_std = { path = "../../../gpu_std", default-features = true }
+
+[profile.release]
+opt-level = "z"
+lto = true

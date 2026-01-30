@@ -4262,8 +4262,23 @@ inline float2 ds_to_u64(float2 ds) {
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Double-single reinterpret operations
-// NOTE: These are APPROXIMATIONS since double-single format is different from IEEE 754.
-// They reconstruct the f64 value and convert to/from bits, which works for most cases.
+//
+// CRITICAL LIMITATION: These operations CANNOT preserve full IEEE 754 f64 bit patterns.
+//
+// Mathematical reality:
+//   - IEEE 754 f64: 52-bit mantissa (stored in 64 bits)
+//   - Double-single: ~47-bit mantissa (two 23-bit f32 mantissas combined)
+//   - 5 bits of precision are LOST during conversion
+//
+// Example:
+//   CPU (IEEE 754):    0.1 = 0x3FB999999999999A (all 52 mantissa bits used)
+//   GPU (double-single): 0.1 -> 0x3FB99999A0000000 (low 5 bits zeroed)
+//
+// This is UNFIXABLE without native f64 hardware support (which Metal lacks).
+// Arithmetic operations work fine (value equality within epsilon).
+// Bit-exact reinterpret operations will show discrepancies in low-order bits.
+//
+// See: tests/test_opcodes_f64.rs for the ignored test and full explanation.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // Convert IEEE 754 f64 bits (stored as two u32s in xy) to double-single
