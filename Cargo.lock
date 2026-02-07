@@ -1362,23 +1362,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gpu_dsl"
-version = "0.1.0"
-dependencies = [
- "gpu_dsl_macro",
- "rust-experiment",
-]
-
-[[package]]
-name = "gpu_dsl_macro"
-version = "0.1.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.114",
-]
-
-[[package]]
 name = "gpu_std"
 version = "0.1.0"
 
