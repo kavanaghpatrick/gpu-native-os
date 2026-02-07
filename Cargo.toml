@@ -238,3 +238,76 @@ path = "examples/visual_megakernel.rs"
 [[example]]
 name = "visual_wasm_apps"
 path = "examples/visual_wasm_apps.rs"
+
+[[example]]
+name = "visual_wasm_gpu"
+path = "examples/visual_wasm_gpu.rs"
+
+# Additional benchmarks (Issue #123)
+[[example]]
+name = "benchmark_index_load"
+path = "examples/benchmark_index_load.rs"
+
+[[example]]
+name = "benchmark_memory_bandwidth"
+path = "examples/benchmark_memory_bandwidth.rs"
+
+[[example]]
+name = "benchmark_ripgrep_comparison"
+path = "examples/benchmark_ripgrep_comparison.rs"
+
+[[example]]
+name = "benchmark_smart_load"
+path = "examples/benchmark_smart_load.rs"
+
+# Bytecode/WASM visual tests (Issue #123)
+[[example]]
+name = "bytecode_test"
+path = "examples/bytecode_test.rs"
+
+[[example]]
+name = "bytecode_visual_test"
+path = "examples/bytecode_visual_test.rs"
+
+[[example]]
+name = "bytecode_window"
+path = "examples/bytecode_window.rs"
+
+# Filesystem utilities (Issue #123)
+[[example]]
+name = "build_shared_index"
+path = "examples/build_shared_index.rs"
+
+[[example]]
+name = "fast_search_kernel"
+path = "examples/fast_search_kernel.rs"
+
+[[example]]
+name = "filesystem_content_search"
+path = "examples/filesystem_content_search.rs"
+
+# Profiling tools (Issue #123)
+[[example]]
+name = "profile_cache_behavior"
+path = "examples/profile_cache_behavior.rs"
+
+[[example]]
+name = "profile_content_search"
+path = "examples/profile_content_search.rs"
+
+[[example]]
+name = "profile_index_load"
+path = "examples/profile_index_load.rs"
+
+[[example]]
+name = "profile_index_load_v2"
+path = "examples/profile_index_load_v2.rs"
+
+[[example]]
+name = "profile_io_deep"
+path = "examples/profile_io_deep.rs"
+
+# QA/Testing (Issue #123)
+[[example]]
+name = "megakernel_qa"
+path = "examples/megakernel_qa.rs"
