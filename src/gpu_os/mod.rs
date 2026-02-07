@@ -29,6 +29,7 @@ pub mod vsync;       // #18 - VSync Execution
 pub mod app;         // GpuApp trait and GpuRuntime
 pub mod event_loop;  // #149 - GPU-Driven Event Dispatch
 pub mod gpu_string;  // #79 - GPU String Processing (tokenization, parsing)
+pub mod gpu_app_system; // GPU App System - bytecode VM and app management
 
 // Applications (use GpuApp framework)
 pub mod game_of_life;      // Game of Life app
@@ -41,6 +42,7 @@ pub mod waves;             // Wave Simulation app
 pub mod benchmark_visual;  // GPU vs CPU Benchmark Demo
 pub mod filesystem;        // GPU-Native Filesystem (Issue #19-24)
 pub mod content_search;    // GPU Content Search (Issue #50)
+pub mod content_pipeline;  // #289 - Content Pipeline with Bounds-Checked Handle Access
 pub mod duplicate_finder;  // GPU Duplicate Finder (Issue #51)
 pub mod shell;             // GPU Shell - PowerShell-style command line (Issue #126)
 pub mod document;          // GPU-Native Document Viewer (Issue #25+)
