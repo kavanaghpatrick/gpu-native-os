@@ -5223,27 +5223,53 @@ inline void bytecode_update(
                 break;
             }
             case OP_INT64_DIV_S: {
+                // WASM spec: integer division by zero or overflow MUST trap
                 long a = as_type<long>(regs[s1].xy);
                 long b = as_type<long>(regs[s2].xy);
-                regs[d].xy = as_type<float2>(b != 0 ? a / b : 0L);
+                if (b == 0 || (a == LONG_MIN && b == -1)) {
+                    // Division by zero or overflow trap (LONG_MIN / -1 overflows)
+                    running = false;
+                } else {
+                    regs[d].xy = as_type<float2>(a / b);
+                }
                 break;
             }
             case OP_INT64_DIV_U: {
+                // WASM spec: integer division by zero MUST trap
                 ulong a = as_type<ulong>(regs[s1].xy);
                 ulong b = as_type<ulong>(regs[s2].xy);
-                regs[d].xy = as_type<float2>(b != 0 ? a / b : 0UL);
+                if (b == 0) {
+                    // Division by zero trap - halt execution
+                    running = false;
+                } else {
+                    regs[d].xy = as_type<float2>(a / b);
+                }
                 break;
             }
             case OP_INT64_REM_U: {
+                // WASM spec: integer remainder by zero MUST trap
                 ulong a = as_type<ulong>(regs[s1].xy);
                 ulong b = as_type<ulong>(regs[s2].xy);
-                regs[d].xy = as_type<float2>(b != 0 ? a % b : 0UL);
+                if (b == 0) {
+                    // Division by zero trap - halt execution
+                    running = false;
+                } else {
+                    regs[d].xy = as_type<float2>(a % b);
+                }
                 break;
             }
             case OP_INT64_REM_S: {
+                // WASM spec: integer remainder by zero MUST trap
+                // WASM spec: a % -1 = 0 for any a (avoid LONG_MIN % -1 UB)
                 long a = as_type<long>(regs[s1].xy);
                 long b = as_type<long>(regs[s2].xy);
-                regs[d].xy = as_type<float2>(b != 0 ? a % b : 0L);
+                if (b == 0) {
+                    running = false;
+                } else if (b == -1) {
+                    regs[d].xy = as_type<float2>(0L);  // a % -1 = 0 for all a
+                } else {
+                    regs[d].xy = as_type<float2>(a % b);
+                }
                 break;
             }
 
@@ -5408,31 +5434,53 @@ inline void bytecode_update(
                 break;
             }
             case OP_INT_DIV_S: {
-                // Issue #213 fix: Values are stored as floats now
+                // WASM spec: integer division by zero or overflow MUST trap
                 int a = int(regs[s1].x);
                 int b = int(regs[s2].x);
-                regs[d].x = float(b != 0 ? a / b : 0);
+                if (b == 0 || (a == INT_MIN && b == -1)) {
+                    // Division by zero or overflow trap (INT_MIN / -1 overflows)
+                    running = false;
+                } else {
+                    regs[d].x = float(a / b);
+                }
                 break;
             }
             case OP_INT_DIV_U: {
-                // Issue #213 fix: Values are stored as floats now
+                // WASM spec: integer division by zero MUST trap
                 uint a = uint(regs[s1].x);
                 uint b = uint(regs[s2].x);
-                regs[d].x = float(b != 0 ? a / b : 0u);
+                if (b == 0) {
+                    // Division by zero trap - halt execution
+                    running = false;
+                } else {
+                    regs[d].x = float(a / b);
+                }
                 break;
             }
             case OP_INT_REM_S: {
-                // Issue #213 fix: Values are stored as floats now
+                // WASM spec: integer remainder by zero MUST trap
+                // WASM spec: a % -1 = 0 for any a (avoid INT_MIN % -1 UB)
                 int a = int(regs[s1].x);
                 int b = int(regs[s2].x);
-                regs[d].x = float(b != 0 ? a % b : 0);
+                if (b == 0) {
+                    running = false;
+                } else if (b == -1) {
+                    regs[d].x = 0.0f;  // a % -1 = 0 for all a
+                } else {
+                    regs[d].x = float(a % b);
+                }
                 break;
             }
             case OP_INT_REM_U: {
-                // Issue #213 fix: Values are stored as floats now
+                // WASM spec: integer remainder by zero MUST trap
                 uint a = uint(regs[s1].x);
                 uint b = uint(regs[s2].x);
-                regs[d].x = float(b != 0 ? a % b : 0u);
+                if (b == 0) {
+                    // Division by zero trap - halt execution
+                    running = false;
+                } else {
+                    regs[d].x = float(a % b);
+                }
                 break;
             }
             case OP_INT_NEG: {
