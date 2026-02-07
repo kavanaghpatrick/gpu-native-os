@@ -314,6 +314,11 @@ impl GpuAppLoader {
     }
 
     /// Validate a header (GPU-side)
+    ///
+    /// Issue #285 fix: Correct buffer bindings to match Metal shader signature:
+    ///   buffer(0) = header_data
+    ///   buffer(1) = file_size
+    ///   buffer(2) = result
     pub fn gpu_validate_header(&self, device: &Device, header_data: &[u8]) -> bool {
         if header_data.len() < GPUAPP_HEADER_SIZE {
             return false;
@@ -326,13 +331,23 @@ impl GpuAppLoader {
         // Create input buffer with header data
         let header_buffer = device.new_buffer_with_data(
             header_data.as_ptr() as *const _,
-            GPUAPP_HEADER_SIZE as u64,
+            header_data.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        // Issue #285: Create file_size buffer for bounds checking (Issue #272)
+        let file_size: u32 = header_data.len() as u32;
+        let file_size_buffer = device.new_buffer_with_data(
+            &file_size as *const u32 as *const _,
+            std::mem::size_of::<u32>() as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
         encoder.set_compute_pipeline_state(&self.validate_pipeline);
-        encoder.set_buffer(0, Some(&header_buffer), 0);
-        encoder.set_buffer(1, Some(&self.results_buffer), 0);
+        // Issue #285: Correct buffer bindings to match Metal shader
+        encoder.set_buffer(0, Some(&header_buffer), 0);      // buffer(0) = header_data
+        encoder.set_buffer(1, Some(&file_size_buffer), 0);   // buffer(1) = file_size
+        encoder.set_buffer(2, Some(&self.results_buffer), 0); // buffer(2) = result
 
         encoder.dispatch_threads(MTLSize::new(1, 1, 1), MTLSize::new(1, 1, 1));
         encoder.end_encoding();
