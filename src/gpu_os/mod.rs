@@ -23,8 +23,7 @@ pub mod gpu_cache;        // #127 - GPU-Resident Persistent File Cache
 pub mod profiler;       // GPU profiling and persistence boundary measurement
 pub mod work_queue;     // GPU work queue for persistent kernel execution
 pub mod persistent_search; // #133 - Persistent Search Kernel
-// ARCHIVED: persistent_runtime/ - Minimal VM (20 opcodes) caused confusion with gpu_app_system (130+ opcodes)
-// See archive/persistent_runtime_minimal_vm/ - gpu_app_system is the production WASM VM
+pub mod persistent_runtime; // #280 - Persistent Runtime (all-threads-participate pattern)
 pub mod kernel;      // #11 - Unified Worker Model
 pub mod memory;      // #12 - Memory Architecture
 pub mod input;       // #13 - Input Pipeline
