@@ -495,6 +495,35 @@ impl Emitter {
         self.asm.f64_max(dst, a, b);
     }
 
+    // F64 unary operations (double-single aware, Issue #294)
+    pub fn f64_neg(&mut self, dst: u8, src: u8) {
+        self.asm.f64_neg(dst, src);
+    }
+
+    pub fn f64_abs(&mut self, dst: u8, src: u8) {
+        self.asm.f64_abs(dst, src);
+    }
+
+    pub fn f64_ceil(&mut self, dst: u8, src: u8) {
+        self.asm.f64_ceil(dst, src);
+    }
+
+    pub fn f64_floor(&mut self, dst: u8, src: u8) {
+        self.asm.f64_floor(dst, src);
+    }
+
+    pub fn f64_trunc(&mut self, dst: u8, src: u8) {
+        self.asm.f64_trunc(dst, src);
+    }
+
+    pub fn f64_nearest(&mut self, dst: u8, src: u8) {
+        self.asm.f64_nearest(dst, src);
+    }
+
+    pub fn f64_copysign(&mut self, dst: u8, mag: u8, sign: u8) {
+        self.asm.f64_copysign(dst, mag, sign);
+    }
+
     // F64 conversion from integers
     pub fn f64_from_i32_s(&mut self, dst: u8, src: u8) {
         self.asm.f64_from_i32_s(dst, src);

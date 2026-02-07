@@ -1583,55 +1583,46 @@ impl<'a> TranslationContext<'a> {
             Operator::F64Neg => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                // Negate both hi and lo components
-                // TODO: Add f64_neg to emit.rs for proper double-single negation
-                self.emit.fneg(dst, a);  // Negates .x only - NEEDS FIX
+                self.emit.f64_neg(dst, a);  // Double-single negation (both hi and lo)
             }
 
-            // F64 unary ops - operate on hi component, lo stays 0 for these
-            // These ops work on the double-single value but may lose lo precision
+            // F64 unary ops - double-single aware (Issue #294 fix)
             Operator::F64Abs => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                // TODO: Add f64_abs for proper double-single abs
-                self.emit.abs(dst, a);  // Applies abs to .x only
+                self.emit.f64_abs(dst, a);  // Double-single absolute value
             }
 
             Operator::F64Ceil => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                // TODO: Add f64_ceil for proper double-single ceil
-                self.emit.ceil(dst, a);
+                self.emit.f64_ceil(dst, a);  // Double-single ceiling
             }
 
             Operator::F64Floor => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                // TODO: Add f64_floor for proper double-single floor
-                self.emit.floor(dst, a);
+                self.emit.f64_floor(dst, a);  // Double-single floor
             }
 
             Operator::F64Trunc => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                // TODO: Add f64_trunc for proper double-single trunc
-                self.emit.trunc(dst, a);
+                self.emit.f64_trunc(dst, a);  // Double-single truncate
             }
 
             Operator::F64Nearest => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                // TODO: Add f64_nearest for proper double-single nearest
-                self.emit.nearest(dst, a);
+                self.emit.f64_nearest(dst, a);  // Double-single round to nearest
             }
 
-            // F64 binary ops
+            // F64 binary ops - double-single aware (Issue #294 fix)
             Operator::F64Copysign => {
                 let b = self.stack.pop()?;
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                // TODO: Add f64_copysign for proper double-single copysign
-                self.emit.copysign(dst, a, b);
+                self.emit.f64_copysign(dst, a, b);  // Double-single copysign
             }
 
             Operator::F64Min => {
