@@ -1867,6 +1867,14 @@ impl<'a> TranslationContext<'a> {
     // ═══════════════════════════════════════════════════════════════════════════
 
     /// Translate an indirect function call
+    ///
+    /// SECURITY: This implements strict type checking as required by WASM spec.
+    /// call_indirect must validate that the function's type SIGNATURE (params and results)
+    /// matches the expected type structurally. This prevents type confusion attacks
+    /// where different function signatures could be called through the same indirect call site.
+    ///
+    /// Note: WASM uses STRUCTURAL type equality, not nominal (index) equality.
+    /// Two types are equal if their params and results match, regardless of type index.
     fn translate_call_indirect(&mut self, type_index: u32, table_index: u32) -> Result<(), TranslateError> {
         let module = self.module
             .ok_or_else(|| TranslateError::Invalid("module not set for call_indirect".into()))?;
@@ -1884,10 +1892,14 @@ impl<'a> TranslationContext<'a> {
         // Get the function table
         let func_table = &module.func_table;
 
-        // Collect all non-None entries with their indices
-        let entries: Vec<(usize, u32)> = func_table.iter()
+        // Collect all non-None entries with their indices and their type indices
+        let entries: Vec<(usize, u32, u32)> = func_table.iter()
             .enumerate()
-            .filter_map(|(i, f)| f.map(|func_idx| (i, func_idx)))
+            .filter_map(|(i, f)| {
+                f.and_then(|func_idx| {
+                    module.get_func_type_idx(func_idx).map(|type_idx| (i, func_idx, type_idx))
+                })
+            })
             .collect();
 
         if entries.is_empty() {
@@ -1896,20 +1908,67 @@ impl<'a> TranslationContext<'a> {
             return Ok(());
         }
 
-        // Get the expected function type for validation
+        // Get the expected function type for error messages
         let expected_type = module.types.get(type_index as usize)
             .ok_or_else(|| TranslateError::Invalid("type index out of bounds".into()))?;
 
-        // Optimization: if all entries have the same function, just inline it
-        let all_same = entries.iter().all(|(_, f)| *f == entries[0].1);
-        if all_same {
-            // All entries point to the same function - just inline it
+        // ═══════════════════════════════════════════════════════════════════════════
+        // SECURITY FIX: Type SIGNATURE validation (structural equality)
+        //
+        // WASM spec requires STRUCTURAL type matching, not index matching.
+        // Two function types are equal if their params and results match exactly,
+        // even if they have different type indices in the module.
+        //
+        // For entries with mismatched signatures, we emit a trap instead of the call.
+        // ═══════════════════════════════════════════════════════════════════════════
+
+        // Separate entries into signature-matching and non-matching
+        // Compare actual FuncType structures (params and results), not indices
+        let matching_entries: Vec<_> = entries.iter()
+            .filter(|(_, func_idx, _)| {
+                if let Some(func_type) = module.get_func_type(*func_idx) {
+                    // STRUCTURAL EQUALITY: params and results must match exactly
+                    func_type.params == expected_type.params &&
+                    func_type.results == expected_type.results
+                } else {
+                    false
+                }
+            })
+            .copied()
+            .collect();
+
+        let mismatched_entries: Vec<_> = entries.iter()
+            .filter(|(_, func_idx, _)| {
+                if let Some(func_type) = module.get_func_type(*func_idx) {
+                    // Mismatch if signatures differ
+                    func_type.params != expected_type.params ||
+                    func_type.results != expected_type.results
+                } else {
+                    true // No type found = mismatch
+                }
+            })
+            .copied()
+            .collect();
+
+        // Log type mismatches for debugging (compile-time only, not a security issue)
+        for (table_slot, func_idx, func_type_idx) in &mismatched_entries {
+            // These entries will trap at runtime if called
+            let _ = (table_slot, func_idx, func_type_idx); // silence unused warning
+        }
+
+        // Optimization: if all entries have the same function AND matching type, inline it
+        let all_same = matching_entries.len() == entries.len()
+            && matching_entries.iter().all(|(_, f, _)| *f == matching_entries[0].1);
+        if all_same && !matching_entries.is_empty() {
+            // All entries point to the same function with matching type - just inline it
             // The table index becomes dead code (we already validated it)
-            return self.translate_call(entries[0].1);
+            return self.translate_call(matching_entries[0].1);
         }
 
         // General case: emit a switch-case based on the table index
-        // For each possible table entry, check if idx == entry_index, then inline that function
+        // For each possible table entry, check if idx == entry_index, then either:
+        // - Inline the function (if type matches)
+        // - Trap (if type doesn't match)
         //
         // CRITICAL: We must save and restore stack state for each branch because:
         // - At compile time, we generate code for ALL branches
@@ -1922,7 +1981,8 @@ impl<'a> TranslationContext<'a> {
         // Save stack state BEFORE any branch (after popping table index)
         let saved_state = self.stack.save_state();
 
-        for (i, (table_slot, func_idx)) in entries.iter().enumerate() {
+        // First, emit code for type-matching entries (these call the function)
+        for (i, (table_slot, func_idx, _func_type_idx)) in matching_entries.iter().enumerate() {
             // Restore stack state for this branch (so each branch sees the same args)
             if i > 0 {
                 self.stack.restore_state(saved_state.clone());
@@ -1940,24 +2000,45 @@ impl<'a> TranslationContext<'a> {
             // If not equal, skip to next case
             self.emit.jz_label(31, skip_label);
 
-            // Validate function type matches (at compile time)
-            if let Some(func_type) = module.get_func_type(*func_idx) {
-                if func_type.params.len() != expected_type.params.len() ||
-                   func_type.results.len() != expected_type.results.len() {
-                    return Err(TranslateError::Invalid(
-                        format!("type mismatch in call_indirect: expected {:?} params, got {:?}",
-                                expected_type.params.len(), func_type.params.len())
-                    ));
-                }
-            }
-
-            // Inline the function at this table slot
+            // Type already validated at compile time - inline the function
             self.translate_call(*func_idx)?;
 
             // Jump to end
             self.emit.jmp_label(end_label);
 
             // Define skip label for this case
+            self.emit.define_label(skip_label);
+        }
+
+        // Second, emit code for type-mismatched entries (these trap)
+        // This is the key security fix: if a table entry has a mismatched type,
+        // calling it must trap, not silently call the wrong function.
+        for (table_slot, _func_idx, func_type_idx) in &mismatched_entries {
+            // Restore stack state for this branch
+            self.stack.restore_state(saved_state.clone());
+
+            // Check if idx_reg == table_slot
+            let skip_label = self.emit.new_label();
+
+            // Load table slot constant
+            self.emit.loadi_uint(30, *table_slot as u32);
+
+            // Compare: r31 = (idx_reg == table_slot)
+            self.emit.int_eq(31, idx_reg, 30);
+
+            // If not equal, skip to next case
+            self.emit.jz_label(31, skip_label);
+
+            // SECURITY: Type mismatch - emit trap
+            // This prevents type confusion attacks where an attacker could
+            // call a function with the wrong signature through an indirect call
+            //
+            // Emit a comment in the bytecode (for debugging) about why we trapped
+            // The actual trap is a HALT instruction
+            let _ = (func_type_idx, expected_type); // Use for potential future debug output
+            self.emit.halt();
+
+            // Define skip label for this case (code after halt is unreachable, but needed for structure)
             self.emit.define_label(skip_label);
         }
 

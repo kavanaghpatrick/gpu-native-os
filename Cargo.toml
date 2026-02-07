@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "wasm_translator", "gpu_std", "gpu_dsl", "gpu_dsl_macro"]
+members = [".", "wasm_translator", "gpu_std"]
 exclude = [
     "test_data/gpu_wasm_app",
     "test_programs/external/bubble_sort",
