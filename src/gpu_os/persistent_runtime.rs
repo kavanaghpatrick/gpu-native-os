@@ -684,6 +684,22 @@ impl PersistentRuntime {
         }
         Ok(())
     }
+
+    /// Push an input event to the GPU input queue
+    ///
+    /// This is an alias for queue_input() for API compatibility.
+    /// Uses volatile writes and memory fencing to ensure GPU visibility.
+    ///
+    /// # Arguments
+    /// * `event` - The input event to push (keyboard, mouse, etc.)
+    ///
+    /// # Returns
+    /// * `Ok(())` if the event was queued successfully
+    /// * `Err(String)` if the input queue is full
+    #[inline]
+    pub fn push_input(&self, event: InputEvent) -> Result<(), String> {
+        self.queue_input(event)
+    }
 }
 
 impl Drop for PersistentRuntime {
