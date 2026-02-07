@@ -873,11 +873,12 @@ pub mod bytecode_op {
     pub const F64_FROM_I64_S: u8 = 0x11;  // dst.xy = ds_from_i64(s1.xy signed)
     pub const F64_FROM_I64_U: u8 = 0x12;  // dst.xy = ds_from_u64(s1.xy unsigned)
 
-    // F64 to integer conversion - using 0x18-0x1F range
-    pub const F64_TO_I32_S: u8 = 0x18;    // dst.x = ds_to_i32(s1.xy) truncate
-    pub const F64_TO_I32_U: u8 = 0x19;    // dst.x = ds_to_u32(s1.xy) truncate
-    pub const F64_TO_I64_S: u8 = 0x1A;    // dst.xy = ds_to_i64(s1.xy) truncate
-    pub const F64_TO_I64_U: u8 = 0x1B;    // dst.xy = ds_to_u64(s1.xy) truncate
+    // F64 to integer conversion - TRAPPING versions (0x18-0x1B)
+    // Per WASM spec: these TRAP on overflow or NaN
+    pub const F64_TO_I32_S: u8 = 0x18;    // dst.x = ds_to_i32(s1.xy) truncate, TRAPS on overflow/NaN
+    pub const F64_TO_I32_U: u8 = 0x19;    // dst.x = ds_to_u32(s1.xy) truncate, TRAPS on overflow/NaN
+    pub const F64_TO_I64_S: u8 = 0x1A;    // dst.xy = ds_to_i64(s1.xy) truncate, TRAPS on overflow/NaN
+    pub const F64_TO_I64_U: u8 = 0x1B;    // dst.xy = ds_to_u64(s1.xy) truncate, TRAPS on overflow/NaN
 
     // Vector packing (0x1C)
     pub const PACK2: u8 = 0x1C;           // dst.xy = (s1.x, s2.x) - pack two scalars into float2
@@ -887,6 +888,13 @@ pub mod bytecode_op {
     // They reconstruct the value and convert, which gives correct results for most cases
     pub const F64_REINTERPRET_I64: u8 = 0x1D;  // dst.xy = ds_from_f64_bits(s1.xy)
     pub const I64_REINTERPRET_F64: u8 = 0x1E;  // dst.xy = ds_to_f64_bits(s1.xy)
+
+    // F64 to integer SATURATING conversions (0x3B-0x3E)
+    // Per WASM spec: these saturate on overflow and return 0 for NaN
+    pub const F64_TO_I32_S_SAT: u8 = 0x3B;    // dst.x = ds_to_i32_sat(s1.xy), saturates to [-2^31, 2^31-1], NaN->0
+    pub const F64_TO_I32_U_SAT: u8 = 0x3C;    // dst.x = ds_to_u32_sat(s1.xy), saturates to [0, 2^32-1], NaN->0
+    pub const F64_TO_I64_S_SAT: u8 = 0x3D;    // dst.xy = ds_to_i64_sat(s1.xy), saturates to [-2^63, 2^63-1], NaN->0
+    pub const F64_TO_I64_U_SAT: u8 = 0x3E;    // dst.xy = ds_to_u64_sat(s1.xy), saturates to [0, 2^64-1], NaN->0
 
     pub const LOADI: u8 = 0x13;
     pub const SETX: u8 = 0x14;
@@ -990,11 +998,17 @@ pub mod bytecode_op {
     pub const INT_LE_S: u8 = 0xD8;
     pub const INT_LE_U: u8 = 0xD9;
 
-    // Conversion (0xDA-0xDD)
+    // Conversion - TRAPPING versions (0xDA-0xDD)
+    // Per WASM spec: F_TO_INT and F_TO_UINT TRAP on overflow or NaN
     pub const INT_TO_F: u8 = 0xDA;
     pub const UINT_TO_F: u8 = 0xDB;
-    pub const F_TO_INT: u8 = 0xDC;
-    pub const F_TO_UINT: u8 = 0xDD;
+    pub const F_TO_INT: u8 = 0xDC;     // f32 -> i32, TRAPS on overflow/NaN
+    pub const F_TO_UINT: u8 = 0xDD;    // f32 -> u32, TRAPS on overflow/NaN
+
+    // Conversion - SATURATING versions (0x3F, 0x1F)
+    // Per WASM spec: saturate on overflow, return 0 for NaN
+    pub const F_TO_INT_SAT: u8 = 0x3F;   // f32 -> i32 with saturation, NaN->0
+    pub const F_TO_UINT_SAT: u8 = 0x1F;  // f32 -> u32 with saturation, NaN->0
 
     // Load immediate integer (0xDE-0xDF)
     pub const LOADI_INT: u8 = 0xDE;
@@ -1263,11 +1277,16 @@ impl BytecodeAssembler {
     pub fn f64_from_i64_s(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_FROM_I64_S, dst, src, 0, 0.0) }
     pub fn f64_from_i64_u(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_FROM_I64_U, dst, src, 0, 0.0) }
 
-    // F64 conversion to integers
+    // F64 conversion to integers - trapping versions (per WASM spec)
     pub fn f64_to_i32_s(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I32_S, dst, src, 0, 0.0) }
     pub fn f64_to_i32_u(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I32_U, dst, src, 0, 0.0) }
     pub fn f64_to_i64_s(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I64_S, dst, src, 0, 0.0) }
     pub fn f64_to_i64_u(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I64_U, dst, src, 0, 0.0) }
+    // F64 conversion to integers - saturating versions (per WASM spec)
+    pub fn f64_to_i32_s_sat(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I32_S_SAT, dst, src, 0, 0.0) }
+    pub fn f64_to_i32_u_sat(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I32_U_SAT, dst, src, 0, 0.0) }
+    pub fn f64_to_i64_s_sat(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I64_S_SAT, dst, src, 0, 0.0) }
+    pub fn f64_to_i64_u_sat(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TO_I64_U_SAT, dst, src, 0, 0.0) }
 
     // F64 reinterpret operations
     // NOTE: These are approximations - double-single doesn't preserve IEEE 754 bit pattern
@@ -1417,11 +1436,14 @@ impl BytecodeAssembler {
     pub fn int_le_s(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::INT_LE_S, dst, a, b, 0.0) }
     pub fn int_le_u(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::INT_LE_U, dst, a, b, 0.0) }
 
-    // Conversion
+    // Conversion - trapping versions (per WASM spec)
     pub fn int_to_f(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::INT_TO_F, dst, src, 0, 0.0) }
     pub fn uint_to_f(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::UINT_TO_F, dst, src, 0, 0.0) }
     pub fn f_to_int(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F_TO_INT, dst, src, 0, 0.0) }
     pub fn f_to_uint(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F_TO_UINT, dst, src, 0, 0.0) }
+    // Conversion - saturating versions (per WASM spec)
+    pub fn f_to_int_sat(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F_TO_INT_SAT, dst, src, 0, 0.0) }
+    pub fn f_to_uint_sat(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F_TO_UINT_SAT, dst, src, 0, 0.0) }
 
     /// Load signed integer immediate - bits are preserved through float representation
     pub fn loadi_int(&mut self, dst: u8, val: i32) -> usize {
@@ -3615,11 +3637,19 @@ constant uint OP_F64_FROM_I32_U = 0x10;  // dst.xy = ds_from_u32(s1.x unsigned)
 constant uint OP_F64_FROM_I64_S = 0x11;  // dst.xy = ds_from_i64(s1.xy signed)
 constant uint OP_F64_FROM_I64_U = 0x12;  // dst.xy = ds_from_u64(s1.xy unsigned)
 
-// F64 to integer conversion (0x18-0x1B)
-constant uint OP_F64_TO_I32_S = 0x18;    // dst.x = ds_to_i32(s1.xy truncate)
-constant uint OP_F64_TO_I32_U = 0x19;    // dst.x = ds_to_u32(s1.xy truncate)
-constant uint OP_F64_TO_I64_S = 0x1A;    // dst.xy = ds_to_i64(s1.xy truncate)
-constant uint OP_F64_TO_I64_U = 0x1B;    // dst.xy = ds_to_u64(s1.xy truncate)
+// F64 to integer conversion - TRAPPING versions (0x18-0x1B)
+// Per WASM spec: these TRAP on overflow or NaN
+constant uint OP_F64_TO_I32_S = 0x18;    // dst.x = ds_to_i32(s1.xy), TRAPS on overflow/NaN
+constant uint OP_F64_TO_I32_U = 0x19;    // dst.x = ds_to_u32(s1.xy), TRAPS on overflow/NaN
+constant uint OP_F64_TO_I64_S = 0x1A;    // dst.xy = ds_to_i64(s1.xy), TRAPS on overflow/NaN
+constant uint OP_F64_TO_I64_U = 0x1B;    // dst.xy = ds_to_u64(s1.xy), TRAPS on overflow/NaN
+
+// F64 to integer conversion - SATURATING versions (0x3B-0x3E)
+// Per WASM spec: saturate on overflow, return 0 for NaN
+constant uint OP_F64_TO_I32_S_SAT = 0x3B;  // dst.x = ds_to_i32_sat(s1.xy), saturates, NaN->0
+constant uint OP_F64_TO_I32_U_SAT = 0x3C;  // dst.x = ds_to_u32_sat(s1.xy), saturates, NaN->0
+constant uint OP_F64_TO_I64_S_SAT = 0x3D;  // dst.xy = ds_to_i64_sat(s1.xy), saturates, NaN->0
+constant uint OP_F64_TO_I64_U_SAT = 0x3E;  // dst.xy = ds_to_u64_sat(s1.xy), saturates, NaN->0
 
 // F64 reinterpret operations (0x1D-0x1E)
 // NOTE: These are approximations since double-single doesn't preserve IEEE 754 bits
@@ -3762,11 +3792,17 @@ constant uint OP_INT_LT_U = 0xD7;   // Unsigned less than
 constant uint OP_INT_LE_S = 0xD8;   // Signed less or equal
 constant uint OP_INT_LE_U = 0xD9;   // Unsigned less or equal
 
-// Conversion (0xDA-0xDD)
+// Conversion - TRAPPING versions (0xDA-0xDD)
+// Per WASM spec: F_TO_INT and F_TO_UINT TRAP on overflow or NaN
 constant uint OP_INT_TO_F = 0xDA;   // Signed int to float
 constant uint OP_UINT_TO_F = 0xDB;  // Unsigned int to float
-constant uint OP_F_TO_INT = 0xDC;   // Float to signed int
-constant uint OP_F_TO_UINT = 0xDD;  // Float to unsigned int
+constant uint OP_F_TO_INT = 0xDC;   // Float to signed int, TRAPS on overflow/NaN
+constant uint OP_F_TO_UINT = 0xDD;  // Float to unsigned int, TRAPS on overflow/NaN
+
+// Conversion - SATURATING versions (0x3F, 0x1F)
+// Per WASM spec: saturate on overflow, return 0 for NaN
+constant uint OP_F_TO_INT_SAT = 0x3F;   // f32 -> i32 with saturation, NaN->0
+constant uint OP_F_TO_UINT_SAT = 0x1F;  // f32 -> u32 with saturation, NaN->0
 
 // Load immediate integer (0xDE-0xDF)
 constant uint OP_LOADI_INT = 0xDE;  // Load immediate as signed int bits
@@ -4906,18 +4942,173 @@ inline void bytecode_update(
             case OP_F64_FROM_I64_S: regs[d].xy = ds_from_i64(regs[s1].xy); break;
             case OP_F64_FROM_I64_U: regs[d].xy = ds_from_u64(regs[s1].xy); break;
 
-            // Store as float VALUE (1 -> 1.0f), not as bits (1 -> 0x00000001)
-            // This matches how LOADI_INT stores integers
-            case OP_F64_TO_I32_S: regs[d].x = float(ds_to_i32(regs[s1].xy)); break;
-            // For unsigned: truncate to uint, reinterpret bits as signed, then store as float
-            // This handles large values (> INT_MAX) which should become negative i32 values
-            case OP_F64_TO_I32_U: {
-                uint u = ds_to_u32(regs[s1].xy);
-                regs[d].x = float(as_type<int>(u));  // Reinterpret uint bits as signed, store as float value
+            // ═══════════════════════════════════════════════════════════════
+            // F64 to integer - TRAPPING versions (per WASM spec)
+            // ═══════════════════════════════════════════════════════════════
+            case OP_F64_TO_I32_S: {
+                // WASM i32.trunc_f64_s: TRAP on overflow or NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                // Check for NaN (either component)
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v)) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                // Check for overflow: i32 range is [-2147483648, 2147483647]
+                if (v >= 2147483648.0f || v < -2147483648.0f) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                regs[d].x = float(int(v));
                 break;
             }
-            case OP_F64_TO_I64_S: regs[d].xy = ds_to_i64(regs[s1].xy); break;
-            case OP_F64_TO_I64_U: regs[d].xy = ds_to_u64(regs[s1].xy); break;
+            case OP_F64_TO_I32_U: {
+                // WASM i32.trunc_f64_u: TRAP on overflow or NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                // Check for NaN
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v)) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                // Check for overflow: u32 range is [0, 4294967295]
+                if (v >= 4294967296.0f || v < 0.0f) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                uint u = uint(v);
+                regs[d].x = float(as_type<int>(u));
+                break;
+            }
+            case OP_F64_TO_I64_S: {
+                // WASM i64.trunc_f64_s: TRAP on overflow or NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                // Check for NaN
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v)) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                // Check for overflow: i64 range is [-9223372036854775808, 9223372036854775807]
+                // In float precision: approximately [-9.22e18, 9.22e18]
+                if (v >= 9223372036854775808.0f || v < -9223372036854775808.0f) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                regs[d].xy = ds_to_i64(ds);
+                break;
+            }
+            case OP_F64_TO_I64_U: {
+                // WASM i64.trunc_f64_u: TRAP on overflow or NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                // Check for NaN
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v)) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                // Check for overflow: u64 range is [0, 18446744073709551615]
+                if (v >= 18446744073709551616.0f || v < 0.0f) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                regs[d].xy = ds_to_u64(ds);
+                break;
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // F64 to integer - SATURATING versions (per WASM spec)
+            // ═══════════════════════════════════════════════════════════════
+            case OP_F64_TO_I32_S_SAT: {
+                // WASM i32.trunc_sat_f64_s: saturate on overflow, 0 for NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                int result;
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v)) {
+                    result = 0;
+                } else if (v >= 2147483648.0f) {
+                    result = 2147483647;  // INT32_MAX
+                } else if (v < -2147483648.0f) {
+                    result = -2147483648;  // INT32_MIN
+                } else {
+                    result = int(v);
+                }
+                regs[d].x = float(result);
+                break;
+            }
+            case OP_F64_TO_I32_U_SAT: {
+                // WASM i32.trunc_sat_f64_u: saturate on overflow, 0 for NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                uint result;
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v) || v < 0.0f) {
+                    result = 0u;
+                } else if (v >= 4294967296.0f) {
+                    result = 0xFFFFFFFFu;  // UINT32_MAX
+                } else {
+                    result = uint(v);
+                }
+                regs[d].x = float(as_type<int>(result));
+                break;
+            }
+            case OP_F64_TO_I64_S_SAT: {
+                // WASM i64.trunc_sat_f64_s: saturate on overflow, 0 for NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v)) {
+                    regs[d].xy = float2(0.0f, 0.0f);  // 0 as i64
+                } else if (v >= 9223372036854775808.0f) {
+                    // INT64_MAX = 0x7FFFFFFFFFFFFFFF
+                    regs[d].x = as_type<float>(0xFFFFFFFFu);  // lo
+                    regs[d].y = as_type<float>(0x7FFFFFFFu);  // hi
+                } else if (v < -9223372036854775808.0f) {
+                    // INT64_MIN = 0x8000000000000000
+                    regs[d].x = as_type<float>(0x00000000u);  // lo
+                    regs[d].y = as_type<float>(0x80000000u);  // hi
+                } else {
+                    regs[d].xy = ds_to_i64(ds);
+                }
+                break;
+            }
+            case OP_F64_TO_I64_U_SAT: {
+                // WASM i64.trunc_sat_f64_u: saturate on overflow, 0 for NaN
+                float2 ds = regs[s1].xy;
+                float v = ds.x + ds.y;
+                if (isnan(ds.x) || isnan(ds.y) || isnan(v) || v < 0.0f) {
+                    regs[d].xy = float2(0.0f, 0.0f);  // 0 as u64
+                } else if (v >= 18446744073709551616.0f) {
+                    // UINT64_MAX = 0xFFFFFFFFFFFFFFFF
+                    regs[d].x = as_type<float>(0xFFFFFFFFu);  // lo
+                    regs[d].y = as_type<float>(0xFFFFFFFFu);  // hi
+                } else {
+                    regs[d].xy = ds_to_u64(ds);
+                }
+                break;
+            }
 
             // F64 reinterpret operations (approximations for double-single)
             // i64 bits -> f64 value: parse IEEE 754 bits and convert to double-single
@@ -5485,13 +5676,79 @@ inline void bytecode_update(
                 break;
             }
             case OP_F_TO_INT: {
+                // WASM i32.trunc_f32_s: TRAP on overflow or NaN
                 float a = regs[s1].x;
+                // Check for NaN
+                if (isnan(a)) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);  // Marker for trunc trap
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                // Check for overflow: i32 range is [-2147483648, 2147483647]
+                // Values >= 2147483648.0f or < -2147483648.0f overflow
+                if (a >= 2147483648.0f || a < -2147483648.0f) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);  // Marker for trunc trap
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
                 regs[d].x = as_type<float>(int(a));
                 break;
             }
             case OP_F_TO_UINT: {
+                // WASM i32.trunc_f32_u: TRAP on overflow or NaN
                 float a = regs[s1].x;
+                // Check for NaN
+                if (isnan(a)) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);  // Marker for trunc trap
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
+                // Check for overflow: u32 range is [0, 4294967295]
+                // Values >= 4294967296.0f or < 0 overflow
+                if (a >= 4294967296.0f || a < 0.0f) {
+                    gpu_debug_i32(-3, tid, dbg, dbg_data);  // Marker for trunc trap
+                    gpu_debug_newline(tid, dbg, dbg_data);
+                    gpu_debug_flush(tid, dbg, dbg_data);
+                    running = false;
+                    break;
+                }
                 regs[d].x = as_type<float>(uint(a));
+                break;
+            }
+            case OP_F_TO_INT_SAT: {
+                // WASM i32.trunc_sat_f32_s: saturate on overflow, 0 for NaN
+                float a = regs[s1].x;
+                int result;
+                if (isnan(a)) {
+                    result = 0;
+                } else if (a >= 2147483648.0f) {
+                    result = 2147483647;  // INT32_MAX
+                } else if (a < -2147483648.0f) {
+                    result = -2147483648;  // INT32_MIN
+                } else {
+                    result = int(a);
+                }
+                regs[d].x = as_type<float>(result);
+                break;
+            }
+            case OP_F_TO_UINT_SAT: {
+                // WASM i32.trunc_sat_f32_u: saturate on overflow, 0 for NaN
+                float a = regs[s1].x;
+                uint result;
+                if (isnan(a) || a < 0.0f) {
+                    result = 0u;
+                } else if (a >= 4294967296.0f) {
+                    result = 0xFFFFFFFFu;  // UINT32_MAX
+                } else {
+                    result = uint(a);
+                }
+                regs[d].x = as_type<float>(result);
                 break;
             }
 

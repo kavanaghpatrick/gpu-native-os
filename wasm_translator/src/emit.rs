@@ -512,7 +512,7 @@ impl Emitter {
         self.asm.f64_from_i64_u(dst, src);
     }
 
-    // F64 conversion to integers
+    // F64 conversion to integers - trapping versions (per WASM spec)
     pub fn f64_to_i32_s(&mut self, dst: u8, src: u8) {
         self.asm.f64_to_i32_s(dst, src);
     }
@@ -527,6 +527,32 @@ impl Emitter {
 
     pub fn f64_to_i64_u(&mut self, dst: u8, src: u8) {
         self.asm.f64_to_i64_u(dst, src);
+    }
+
+    // F64 conversion to integers - saturating versions (per WASM spec)
+    pub fn f64_to_i32_s_sat(&mut self, dst: u8, src: u8) {
+        self.asm.f64_to_i32_s_sat(dst, src);
+    }
+
+    pub fn f64_to_i32_u_sat(&mut self, dst: u8, src: u8) {
+        self.asm.f64_to_i32_u_sat(dst, src);
+    }
+
+    pub fn f64_to_i64_s_sat(&mut self, dst: u8, src: u8) {
+        self.asm.f64_to_i64_s_sat(dst, src);
+    }
+
+    pub fn f64_to_i64_u_sat(&mut self, dst: u8, src: u8) {
+        self.asm.f64_to_i64_u_sat(dst, src);
+    }
+
+    // F32 conversion - saturating versions (per WASM spec)
+    pub fn f_to_int_sat(&mut self, dst: u8, src: u8) {
+        self.asm.f_to_int_sat(dst, src);
+    }
+
+    pub fn f_to_uint_sat(&mut self, dst: u8, src: u8) {
+        self.asm.f_to_uint_sat(dst, src);
     }
 
     // F64 reinterpret operations (approximations for double-single)
