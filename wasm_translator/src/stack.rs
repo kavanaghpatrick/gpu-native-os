@@ -30,6 +30,10 @@ pub const SPILLED_REG: u8 = 0xFE;
 /// When registers are popped, they're returned to the free pool for reuse.
 ///
 /// SAFEGUARD: When all registers exhausted, spills to GPU memory instead of failing.
+///
+/// STACK OVERFLOW DETECTION (Issue #233):
+/// The stack has a configurable maximum depth. Pushing beyond this limit
+/// returns StackOverflow error to prevent memory corruption from unbounded spills.
 pub struct OperandStack {
     /// Stack of register numbers (or SPILLED_REG for spilled values)
     stack: Vec<u8>,
@@ -45,6 +49,8 @@ pub struct OperandStack {
     spill_base: u32,
     /// SAFEGUARD: Track spill slot addresses for each spilled value
     spill_slots: Vec<u32>,
+    /// Maximum stack depth (Issue #233: Stack overflow detection)
+    max_depth: usize,
 }
 
 impl OperandStack {
@@ -53,8 +59,18 @@ impl OperandStack {
     /// Layout: state[0-7] reserved, state[8-71] globals, state[72+] spill area.
     const DEFAULT_SPILL_BASE: u32 = 72;
 
-    /// Create a new operand stack
+    /// Default maximum stack depth (Issue #233)
+    /// 1024 entries provides reasonable headroom for complex expressions
+    /// while preventing unbounded memory growth from spills.
+    const DEFAULT_MAX_DEPTH: usize = 1024;
+
+    /// Create a new operand stack with default max depth
     pub fn new() -> Self {
+        Self::with_max_depth(Self::DEFAULT_MAX_DEPTH)
+    }
+
+    /// Create a new operand stack with configurable max depth (Issue #233)
+    pub fn with_max_depth(max_depth: usize) -> Self {
         Self {
             stack: Vec::with_capacity(64),
             next_temp: 8,   // Start at r8
@@ -63,6 +79,7 @@ impl OperandStack {
             spill_count: 0,
             spill_base: Self::DEFAULT_SPILL_BASE,
             spill_slots: Vec::new(),
+            max_depth,
         }
     }
 
@@ -76,6 +93,21 @@ impl OperandStack {
             spill_count: 0,
             spill_base,
             spill_slots: Vec::new(),
+            max_depth: Self::DEFAULT_MAX_DEPTH,
+        }
+    }
+
+    /// Create with custom spill base and max depth (Issue #233)
+    pub fn with_spill_base_and_max_depth(spill_base: u32, max_depth: usize) -> Self {
+        Self {
+            stack: Vec::with_capacity(64),
+            next_temp: 8,
+            max_temp: 28,
+            free_pool: Vec::with_capacity(20),
+            spill_count: 0,
+            spill_base,
+            spill_slots: Vec::new(),
+            max_depth,
         }
     }
 
@@ -176,10 +208,26 @@ impl OperandStack {
     }
 
     /// Allocate a temp and push it onto the stack
+    ///
+    /// Issue #233: Stack overflow detection
+    /// Returns StackOverflow error if pushing would exceed max_depth.
+    /// This prevents memory corruption from unbounded spills.
     pub fn alloc_and_push(&mut self) -> Result<u8, TranslateError> {
+        // Check for stack overflow before pushing (Issue #233)
+        if self.stack.len() >= self.max_depth {
+            return Err(TranslateError::StackOverflow {
+                depth: self.stack.len(),
+                max: self.max_depth,
+            });
+        }
         let reg = self.alloc_temp()?;
         self.push(reg);
         Ok(reg)
+    }
+
+    /// Get the maximum stack depth
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
     }
 
     /// Get current stack depth
@@ -246,6 +294,7 @@ impl OperandStack {
             free_pool: self.free_pool.clone(),
             spill_count: self.spill_count,
             spill_slots: self.spill_slots.clone(),
+            max_depth: self.max_depth,
         }
     }
 
@@ -256,6 +305,7 @@ impl OperandStack {
         self.free_pool = state.free_pool;
         self.spill_count = state.spill_count;
         self.spill_slots = state.spill_slots;
+        self.max_depth = state.max_depth;
     }
 }
 
@@ -267,6 +317,7 @@ pub struct StackState {
     free_pool: Vec<u8>,
     spill_count: u32,
     spill_slots: Vec<u32>,
+    max_depth: usize,
 }
 
 impl Default for OperandStack {
@@ -503,5 +554,72 @@ mod tests {
         assert_eq!(stack.scratch(0), 30);
         assert_eq!(stack.scratch(1), 31);
         assert_eq!(stack.scratch(2), 30); // Wraps
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // STACK OVERFLOW TESTS (Issue #233)
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_stack_overflow_detection() {
+        // Create stack with small max depth for testing
+        let mut stack = OperandStack::with_max_depth(5);
+        assert_eq!(stack.max_depth(), 5);
+
+        // Fill up to max depth
+        for i in 0..5 {
+            let result = stack.alloc_and_push();
+            assert!(result.is_ok(), "Push {} should succeed", i);
+        }
+        assert_eq!(stack.depth(), 5);
+
+        // Next push should fail with StackOverflow
+        let result = stack.alloc_and_push();
+        assert!(result.is_err());
+        match result {
+            Err(TranslateError::StackOverflow { depth, max }) => {
+                assert_eq!(depth, 5);
+                assert_eq!(max, 5);
+            }
+            _ => panic!("Expected StackOverflow error"),
+        }
+    }
+
+    #[test]
+    fn test_stack_overflow_after_pop() {
+        // Create stack with small max depth
+        let mut stack = OperandStack::with_max_depth(3);
+
+        // Fill it
+        stack.alloc_and_push().unwrap();
+        stack.alloc_and_push().unwrap();
+        stack.alloc_and_push().unwrap();
+        assert_eq!(stack.depth(), 3);
+
+        // Pop one
+        stack.pop().unwrap();
+        assert_eq!(stack.depth(), 2);
+
+        // Push should succeed now
+        let result = stack.alloc_and_push();
+        assert!(result.is_ok());
+        assert_eq!(stack.depth(), 3);
+
+        // But next push should fail again
+        let result = stack.alloc_and_push();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_default_max_depth() {
+        let stack = OperandStack::new();
+        assert_eq!(stack.max_depth(), 1024);
+    }
+
+    #[test]
+    fn test_with_spill_base_and_max_depth() {
+        let stack = OperandStack::with_spill_base_and_max_depth(0x1000, 512);
+        assert_eq!(stack.max_depth(), 512);
+        assert_eq!(stack.spill_count(), 0);
     }
 }

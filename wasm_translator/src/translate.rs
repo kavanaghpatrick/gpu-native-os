@@ -40,7 +40,8 @@ impl<'a> TranslationContext<'a> {
         let epilogue_label = emit.new_label();
         Self {
             emit,
-            stack: OperandStack::new(),
+            // Issue #233: Use config's max_stack_depth for stack overflow detection
+            stack: OperandStack::with_max_depth(config.max_stack_depth as usize),
             locals: LocalMap::new(param_count, local_count, config.globals_base + 256),
             block_stack: Vec::new(),
             config,

@@ -20,6 +20,8 @@ pub enum TranslateError {
     StackUnderflow,
     /// Out of registers
     OutOfRegisters,
+    /// Stack overflow (Issue #233)
+    StackOverflow { depth: usize, max: usize },
 }
 
 impl std::fmt::Display for TranslateError {
@@ -31,6 +33,9 @@ impl std::fmt::Display for TranslateError {
             TranslateError::Invalid(s) => write!(f, "Invalid WASM: {}", s),
             TranslateError::StackUnderflow => write!(f, "Stack underflow"),
             TranslateError::OutOfRegisters => write!(f, "Out of registers"),
+            TranslateError::StackOverflow { depth, max } => {
+                write!(f, "Stack overflow: depth {} exceeds max {}", depth, max)
+            }
         }
     }
 }
@@ -54,7 +59,10 @@ impl Default for TranslatorConfig {
     fn default() -> Self {
         Self {
             memory_pages: 16,        // 16 pages = 1MB max addressable (but fits in smaller state)
-            max_stack_depth: 64,
+            // Issue #233: Stack overflow detection
+            // 1024 entries provides reasonable headroom for complex expressions
+            // while preventing unbounded memory growth from spills.
+            max_stack_depth: 1024,
             // Memory layout (relative to state data start after bytecode):
             //   state[0] = return value (bytes 0-15)
             //   state[1-4] = params (bytes 16-79)
