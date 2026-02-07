@@ -7277,7 +7277,6 @@ pub struct GpuAppSystem {
     state_alloc_buffer: Buffer,    // Allocator for app state (legacy)
     vertex_alloc_buffer: Buffer,   // Allocator for vertices (legacy)
     unified_state_buffer: Buffer,  // All app state
-    unified_vertex_buffer: Buffer, // All app vertices
 
     // Issue #155: O(1) memory management buffers
     state_pool_buffer: Buffer,        // MemoryPool for state
@@ -7486,13 +7485,9 @@ impl GpuAppSystem {
             };
         }
 
-        // Create unified buffers
+        // Create unified state buffer
         let unified_state_buffer = device.new_buffer(
             state_pool_size as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let unified_vertex_buffer = device.new_buffer(
-            vertex_pool_size as u64,
             MTLResourceOptions::StorageModeShared,
         );
 
@@ -7594,7 +7589,6 @@ impl GpuAppSystem {
             state_alloc_buffer,
             vertex_alloc_buffer,
             unified_state_buffer,
-            unified_vertex_buffer,
             state_pool_buffer,
             state_blocks_buffer,
             vertex_pool_buffer,
@@ -8633,11 +8627,6 @@ impl GpuAppSystem {
     /// Get the unified state buffer
     pub fn state_buffer(&self) -> &Buffer {
         &self.unified_state_buffer
-    }
-
-    /// Get the unified vertex buffer
-    pub fn vertex_buffer(&self) -> &Buffer {
-        &self.unified_vertex_buffer
     }
 
     /// Get the app table buffer
