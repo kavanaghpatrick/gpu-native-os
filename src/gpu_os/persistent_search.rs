@@ -25,6 +25,7 @@ const QUEUE_SIZE: usize = 16;
 const MAX_PATTERN_LEN: usize = 64;
 
 /// Maximum matches per search
+#[allow(dead_code)]
 const MAX_MATCHES: usize = 10000;
 
 /// Default timeout for wait_result (10 seconds)
@@ -472,6 +473,7 @@ pub struct PersistentSearchQueue {
     data_descriptors_buffer: Buffer,
     match_counts_buffer: Buffer,
     queue_size_buffer: Buffer,
+    #[allow(dead_code)]
     max_iterations_buffer: Buffer,
 
     // Configuration

@@ -3,7 +3,6 @@
 //! Parses commands like:
 //!   files ~/code | where ext = "rs" | sort size desc | head 10
 
-use std::str::FromStr;
 
 /// A complete pipeline of commands
 #[derive(Debug, Clone)]
@@ -346,7 +345,7 @@ fn parse_size(s: &str) -> Option<u64> {
 
 /// Parse duration string like "yesterday", "1 hour ago", "today"
 fn parse_duration(s: &str) -> Option<u64> {
-    use std::time::{SystemTime, UNIX_EPOCH, Duration};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

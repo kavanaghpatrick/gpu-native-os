@@ -17,7 +17,6 @@ use metal::*;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Metal shader source for GPU cache operations
@@ -202,7 +201,9 @@ pub struct CacheEntry {
 
 const FLAG_EMPTY: u32 = 0;
 const FLAG_VALID: u32 = 1;
+#[allow(dead_code)]
 const FLAG_LOADING: u32 = 2;
+#[allow(dead_code)]
 const FLAG_EVICTING: u32 = 3;
 
 /// Lookup result from GPU
@@ -248,7 +249,9 @@ pub struct GpuFileCache {
     // Pipelines
     lookup_pipeline: ComputePipelineState,
     find_oldest_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     touch_lru_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     count_valid_pipeline: ComputePipelineState,
 
     // Configuration

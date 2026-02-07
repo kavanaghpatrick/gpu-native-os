@@ -2,7 +2,7 @@
 //!
 //! Executes parsed pipelines, chaining GPU operations.
 
-use super::{GpuShell, FileCache};
+use super::GpuShell;
 use super::value::{Value, FileRow, GroupRow, SearchHit};
 use super::parser::{Pipeline, Command, Predicate, PredicateOp, PredicateValue};
 
@@ -177,7 +177,7 @@ fn execute_command(shell: &mut GpuShell, cmd: &Command, input: Value) -> Result<
             Ok(Value::Text(HELP_TEXT.to_string()))
         }
 
-        Command::Select { fields } => {
+        Command::Select { fields: _ } => {
             // For now, just pass through (projection would filter columns in display)
             Ok(input)
         }
@@ -197,7 +197,7 @@ fn execute_command(shell: &mut GpuShell, cmd: &Command, input: Value) -> Result<
             }
         }
 
-        Command::Dups { path } => {
+        Command::Dups { path: _ } => {
             // TODO: Integrate with duplicate_finder.rs
             Err("dups command not yet implemented".into())
         }

@@ -78,6 +78,7 @@ pub const PATH_FLAG_HAS_EXTENSION: u16 = 4;
 ///
 /// All operations run entirely on GPU - CPU just submits raw bytes.
 pub struct GpuStringProcessor {
+    #[allow(dead_code)]
     device: Device,
     command_queue: CommandQueue,
 
@@ -94,11 +95,15 @@ pub struct GpuStringProcessor {
     parsed_path_buffer: Buffer,     // Output: ParsedPath
 
     // Batch path parsing
+    #[allow(dead_code)]
     paths_batch_buffer: Buffer,     // Multiple paths for batch parsing
+    #[allow(dead_code)]
     parsed_batch_buffer: Buffer,    // Multiple ParsedPath results
 
     // Async support
+    #[allow(dead_code)]
     shared_event: SharedEvent,
+    #[allow(dead_code)]
     next_signal: Arc<AtomicU64>,
 }
 

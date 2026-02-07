@@ -31,7 +31,6 @@
 //! ```
 
 use crate::gpu_os::gpu_index::{GpuResidentIndex, IndexError};
-use crate::gpu_os::batch_io::GpuBatchLoader;
 use chrono::{DateTime, Utc};
 use metal::Device;
 use rayon::prelude::*;
@@ -42,7 +41,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 /// Default patterns to exclude from indexing
 pub const DEFAULT_EXCLUDES: &[&str] = &[
@@ -577,6 +576,7 @@ impl IndexBuildProgress {
 }
 
 /// Recursively collect paths, respecting exclude patterns (with progress)
+#[allow(dead_code)]
 fn collect_paths_recursive(
     dir: &Path,
     paths: &mut Vec<String>,

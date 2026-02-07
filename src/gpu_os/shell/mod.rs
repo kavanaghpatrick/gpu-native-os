@@ -36,6 +36,7 @@ pub struct FileCache {
 
 /// GPU Shell - interactive command line with GPU-accelerated pipelines
 pub struct GpuShell {
+    #[allow(dead_code)]
     device: Device,
 
     // Cached data sources

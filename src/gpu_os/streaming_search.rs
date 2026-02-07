@@ -9,8 +9,6 @@
 // This overlaps I/O and compute for ~30%+ speedup on I/O-bound workloads.
 
 use metal::*;
-use objc::runtime::Object;
-use objc::{msg_send, sel, sel_impl};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,8 +16,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::batch_io::FileDescriptor;
-use super::content_search::{ContentMatch, SearchOptions, SearchProfile};
-use super::gpu_io::{GpuIOCommandBuffer, GpuIOFileHandle, GpuIOQueue, IOPriority, IOQueueType, IOStatus};
+use super::content_search::ContentMatch;
+use super::gpu_io::{GpuIOCommandBuffer, GpuIOFileHandle, GpuIOQueue, IOPriority, IOQueueType};
 
 /// Page size for buffer alignment
 const PAGE_SIZE: u64 = 4096;
@@ -216,7 +214,7 @@ impl StreamingPipeline {
 
         // Limit to available chunks (merge extras into last chunk)
         if partitions.len() > self.chunks.len() {
-            let last_idx = self.chunks.len() - 1;
+            let _last_idx = self.chunks.len() - 1;
             let last_end = partitions.last().map(|(_, e)| *e).unwrap_or(files.len());
             partitions.truncate(self.chunks.len());
             if let Some((_, end)) = partitions.last_mut() {
@@ -242,7 +240,7 @@ impl StreamingPipeline {
         let mut file_handles = Vec::with_capacity(files.len());
         let mut current_offset = 0u64;
 
-        for (i, path) in files.iter().enumerate() {
+        for (_i, path) in files.iter().enumerate() {
             let size = match fs::metadata(path) {
                 Ok(m) => m.len(),
                 Err(_) => continue,
@@ -332,6 +330,7 @@ impl StreamingPipeline {
 /// Streaming search engine - overlaps I/O and GPU compute
 pub struct StreamingSearch {
     /// Device reference
+    #[allow(dead_code)]
     device: Device,
     /// Command queue for search operations
     command_queue: CommandQueue,
@@ -523,15 +522,14 @@ impl StreamingSearch {
         }
 
         let mut all_results = Vec::new();
-        let mut pending_io: Option<GpuIOCommandBuffer> = None;
-        let mut current_chunk_idx = 0usize;
+        let mut _current_chunk_idx = 0usize;
 
         // Start loading first chunk
         let first_partition = &partitions[0];
         let first_files = &files[first_partition.0..first_partition.1];
 
         let io_start = Instant::now();
-        pending_io = self.pipeline.start_load_chunk(0, first_files);
+        let mut pending_io = self.pipeline.start_load_chunk(0, first_files);
         profile.io_queue_us += io_start.elapsed().as_micros() as u64;
 
         // Process chunks with overlap
@@ -566,7 +564,7 @@ impl StreamingSearch {
             profile.files_processed += self.pipeline.chunk(chunk_idx).map(|c| c.file_count).unwrap_or(0);
             profile.bytes_processed += self.pipeline.chunk(chunk_idx).map(|c| c.total_bytes).unwrap_or(0);
 
-            current_chunk_idx = chunk_idx;
+            _current_chunk_idx = chunk_idx;
         }
 
         profile.total_us = total_start.elapsed().as_micros() as u64;
@@ -644,7 +642,7 @@ impl StreamingSearch {
     fn extract_chunk_results(
         &self,
         chunk: &StreamChunk,
-        base_file_index: usize,
+        _base_file_index: usize,
         start_count: u32,
     ) -> Vec<ContentMatch> {
         let mut results = Vec::new();

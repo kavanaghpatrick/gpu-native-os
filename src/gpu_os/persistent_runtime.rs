@@ -207,6 +207,7 @@ const _: () = assert!(std::mem::size_of::<VertexOutputHeader>() == 16);
 /// Uses the all-threads-participate pattern to avoid the ~5M iteration crash
 /// that plagued earlier designs with single-thread patterns.
 pub struct PersistentRuntime {
+    #[allow(dead_code)]
     device: Device,
     command_queue: CommandQueue,
     pipeline: ComputePipelineState,

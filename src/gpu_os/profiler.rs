@@ -68,7 +68,9 @@ pub struct GpuProfiler {
     pipeline: ComputePipelineState,
 
     // CPU-side tracking
+    #[allow(dead_code)]
     dispatch_count: AtomicU64,
+    #[allow(dead_code)]
     is_profiling: AtomicBool,
 }
 

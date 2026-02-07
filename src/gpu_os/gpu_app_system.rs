@@ -7313,7 +7313,9 @@ pub struct GpuAppSystem {
 
     // Configuration
     max_slots: u32,
+    #[allow(dead_code)]
     state_pool_size: usize,
+    #[allow(dead_code)]
     vertex_pool_size: usize,
 
     // Frame tracking

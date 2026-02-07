@@ -12,7 +12,6 @@ use metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::mem;
 use std::sync::atomic::{fence, Ordering};
 
-use crate::gpu_os::gpu_app_loader::INVALID_SLOT;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS

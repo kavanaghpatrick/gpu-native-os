@@ -389,8 +389,10 @@ pub struct GpuVector {
     /// Element size in bytes
     element_size: u32,
     /// Reference to heap
+    #[allow(dead_code)]
     heap: *const GpuHeap,
     /// Compute pipelines
+    #[allow(dead_code)]
     push_pipeline: ComputePipelineState,
     init_pipeline: ComputePipelineState,
     /// Reusable command queue (prevents resource leaks)
@@ -496,11 +498,13 @@ pub struct GpuHashMap {
     /// Capacity (power of 2)
     capacity: u32,
     /// Reference to heap
+    #[allow(dead_code)]
     heap: *const GpuHeap,
     /// Compute pipelines
     init_pipeline: ComputePipelineState,
     insert_pipeline: ComputePipelineState,
     get_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     remove_pipeline: ComputePipelineState,
     /// Reusable command queue (prevents resource leaks)
     command_queue: CommandQueue,

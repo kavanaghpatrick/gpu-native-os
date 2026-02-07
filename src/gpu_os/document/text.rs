@@ -158,27 +158,41 @@ pub struct GpuTextEngine {
     command_queue: CommandQueue,
 
     // Legacy pipelines (Issue #60)
+    #[allow(dead_code)]
     measure_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     find_breaks_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     compute_lines_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     position_lines_pipeline: ComputePipelineState,
 
     // New GPU-native pipelines (Issue #90)
     char_to_glyph_pipeline: ComputePipelineState,
     prefix_sum_pipeline: ComputePipelineState,
     find_breaks_parallel_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     assign_lines_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     position_glyphs_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     generate_vertices_pipeline: ComputePipelineState,
 
     // Legacy buffers
+    #[allow(dead_code)]
     element_buffer: Buffer,
+    #[allow(dead_code)]
     style_buffer: Buffer,
+    #[allow(dead_code)]
     layout_buffer: Buffer,
     text_buffer: Buffer,
+    #[allow(dead_code)]
     break_buffer: Buffer,
+    #[allow(dead_code)]
     line_buffer: Buffer,
+    #[allow(dead_code)]
     line_count_buffer: Buffer,
+    #[allow(dead_code)]
     element_count_buffer: Buffer,
 
     // New GPU-native buffers (Issue #90)
@@ -188,8 +202,11 @@ pub struct GpuTextEngine {
     glyph_ids_buffer: Buffer,       // uint per char
     is_break_buffer: Buffer,        // uint per char
     break_type_buffer: Buffer,      // uint per char
+    #[allow(dead_code)]
     line_indices_buffer: Buffer,    // uint per char
+    #[allow(dead_code)]
     positioned_glyphs_buffer: Buffer, // PositionedGlyph per char
+    #[allow(dead_code)]
     text_vertices_buffer: Buffer,   // 6 vertices × 8 floats per char
 }
 
