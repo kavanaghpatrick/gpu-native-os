@@ -55,3 +55,4 @@ pub mod desktop;           // #128-#133 - GPU Desktop Environment
 
 // Demo modules (legacy - standalone implementations)
 pub mod ball_physics;   // 1024-Ball Physics demo
+pub mod gpu_app_system;  // GPU App System with BytecodeAssembler

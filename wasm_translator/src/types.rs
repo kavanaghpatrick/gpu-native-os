@@ -94,7 +94,7 @@ pub struct BlockContext {
 }
 
 /// Function type signature
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncType {
     pub params: Vec<ValType>,
     pub results: Vec<ValType>,
@@ -432,6 +432,16 @@ impl WasmModule {
     pub fn get_defined_func_type_idx(&self, func_idx: u32) -> Option<u32> {
         let adjusted = func_idx as usize - self.imports.len();
         self.functions.get(adjusted).copied()
+    }
+
+    /// Get type index for any function (import or defined)
+    /// Used for runtime type checking in call_indirect
+    pub fn get_func_type_idx(&self, func_idx: u32) -> Option<u32> {
+        if self.is_import(func_idx) {
+            Some(self.imports[func_idx as usize].type_idx)
+        } else {
+            self.get_defined_func_type_idx(func_idx)
+        }
     }
 
     /// Get function type by function index (works for both imports and defined)
