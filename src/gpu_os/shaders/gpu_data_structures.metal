@@ -433,6 +433,8 @@ kernel void hashmap_init(
 }
 
 // Batch insert - each thread inserts one key-value pair
+// Issue #293 fix: Write key/value BEFORE setting state to OCCUPIED to prevent
+// race condition where concurrent lookups see OCCUPIED but read garbage data.
 kernel void hashmap_insert_batch(
     device uchar* heap_data [[buffer(0)]],
     constant uint& map_offset [[buffer(1)]],
@@ -456,17 +458,23 @@ kernel void hashmap_insert_batch(
     uint slot2 = hash2(key) & mask;
 
     // Try table1 first
+    // Issue #293 fix: Use INSERTING state to prevent race conditions.
+    // CAS from EMPTY to INSERTING first, then write data, then set OCCUPIED.
     uint expected = CUCKOO_EMPTY;
     if (atomic_compare_exchange_weak_explicit(
-        &table1[slot1].state, &expected, CUCKOO_OCCUPIED,
+        &table1[slot1].state, &expected, CUCKOO_INSERTING,
         memory_order_relaxed, memory_order_relaxed
     )) {
+        // Success - we own the slot exclusively during INSERTING state
         table1[slot1].key = key;
         table1[slot1].value = value;
+        threadgroup_barrier(mem_flags::mem_device);  // Ensure writes visible
+        atomic_store_explicit(&table1[slot1].state, CUCKOO_OCCUPIED, memory_order_relaxed);
         atomic_fetch_add_explicit(&header->count, 1, memory_order_relaxed);
-        results[tid] = 1; // Success
+        results[tid] = 1;
         return;
     }
+    // CAS failed - slot is not empty
 
     // Check if key already exists in table1
     // Issue #252 fix: Use CAS to acquire slot for atomic update
@@ -478,6 +486,7 @@ kernel void hashmap_insert_batch(
         if (table1[slot1].key == key) {
             // Update existing - we own the slot
             table1[slot1].value = value;
+            threadgroup_barrier(mem_flags::mem_device);  // Ensure value visible before state
             atomic_store_explicit(&table1[slot1].state, CUCKOO_OCCUPIED, memory_order_relaxed);
             results[tid] = 1;
             return;
@@ -487,17 +496,22 @@ kernel void hashmap_insert_batch(
     }
 
     // Try table2
+    // Issue #293 fix: Same pattern - CAS to INSERTING, write data, then set OCCUPIED
     expected = CUCKOO_EMPTY;
     if (atomic_compare_exchange_weak_explicit(
-        &table2[slot2].state, &expected, CUCKOO_OCCUPIED,
+        &table2[slot2].state, &expected, CUCKOO_INSERTING,
         memory_order_relaxed, memory_order_relaxed
     )) {
+        // Success - we own the slot exclusively during INSERTING state
         table2[slot2].key = key;
         table2[slot2].value = value;
+        threadgroup_barrier(mem_flags::mem_device);  // Ensure writes visible
+        atomic_store_explicit(&table2[slot2].state, CUCKOO_OCCUPIED, memory_order_relaxed);
         atomic_fetch_add_explicit(&header->count, 1, memory_order_relaxed);
         results[tid] = 1;
         return;
     }
+    // CAS failed - slot is not empty
 
     // Check if key already exists in table2
     // Issue #252 fix: Use CAS to acquire slot for atomic update
@@ -509,6 +523,7 @@ kernel void hashmap_insert_batch(
         if (table2[slot2].key == key) {
             // Update existing - we own the slot
             table2[slot2].value = value;
+            threadgroup_barrier(mem_flags::mem_device);  // Ensure value visible before state
             atomic_store_explicit(&table2[slot2].state, CUCKOO_OCCUPIED, memory_order_relaxed);
             results[tid] = 1;
             return;
