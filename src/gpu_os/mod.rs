@@ -24,6 +24,7 @@ pub mod profiler;       // GPU profiling and persistence boundary measurement
 pub mod work_queue;     // GPU work queue for persistent kernel execution
 pub mod persistent_search; // #133 - Persistent Search Kernel
 pub mod persistent_runtime; // #279 - Persistent Runtime (All-Threads-Participate Execution Model)
+pub mod wasm_adapter;       // #281 - WASM Adapter (connects translator to persistent runtime)
 pub mod kernel;      // #11 - Unified Worker Model
 pub mod memory;      // #12 - Memory Architecture
 pub mod input;       // #13 - Input Pipeline
