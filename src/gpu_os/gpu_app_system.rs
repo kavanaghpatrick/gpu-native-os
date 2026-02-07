@@ -867,6 +867,15 @@ pub mod bytecode_op {
     pub const F64_MIN: u8 = 0x2F;      // dst.xy = min(s1.xy, s2.xy) as double-single
     pub const F64_MAX: u8 = 0x30;      // dst.xy = max(s1.xy, s2.xy) as double-single
 
+    // F64 unary operations (0x3B-0x41) - double-single aware (Issue #294)
+    pub const F64_NEG: u8 = 0x3B;       // dst.xy = -s1.xy (negate both hi and lo)
+    pub const F64_ABS: u8 = 0x3C;       // dst.xy = abs(s1.xy) (absolute value)
+    pub const F64_CEIL: u8 = 0x3D;      // dst.xy = ceil(s1.xy), lo = 0
+    pub const F64_FLOOR: u8 = 0x3E;     // dst.xy = floor(s1.xy), lo = 0
+    pub const F64_TRUNC: u8 = 0x3F;     // dst.xy = trunc(s1.xy), lo = 0
+    pub const F64_NEAREST: u8 = 0x41;   // dst.xy = rint(s1.xy), lo = 0
+    pub const F64_COPYSIGN: u8 = 0x43;  // dst.xy = copysign(s1.xy, s2.xy)
+
     // F64 conversion (0x0F-0x12)
     pub const F64_FROM_I32_S: u8 = 0x0F;  // dst.xy = ds_from_i32(s1.x signed)
     pub const F64_FROM_I32_U: u8 = 0x10;  // dst.xy = ds_from_u32(s1.x unsigned)
@@ -1256,6 +1265,15 @@ impl BytecodeAssembler {
     // F64 min/max (double-single aware)
     pub fn f64_min(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::F64_MIN, dst, a, b, 0.0) }
     pub fn f64_max(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::F64_MAX, dst, a, b, 0.0) }
+
+    // F64 unary operations (double-single aware, Issue #294)
+    pub fn f64_neg(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_NEG, dst, src, 0, 0.0) }
+    pub fn f64_abs(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_ABS, dst, src, 0, 0.0) }
+    pub fn f64_ceil(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_CEIL, dst, src, 0, 0.0) }
+    pub fn f64_floor(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_FLOOR, dst, src, 0, 0.0) }
+    pub fn f64_trunc(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_TRUNC, dst, src, 0, 0.0) }
+    pub fn f64_nearest(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_NEAREST, dst, src, 0, 0.0) }
+    pub fn f64_copysign(&mut self, dst: u8, mag: u8, sign: u8) -> usize { self.emit(bytecode_op::F64_COPYSIGN, dst, mag, sign, 0.0) }
 
     // F64 conversion from integers
     pub fn f64_from_i32_s(&mut self, dst: u8, src: u8) -> usize { self.emit(bytecode_op::F64_FROM_I32_S, dst, src, 0, 0.0) }
@@ -3609,6 +3627,15 @@ constant uint OP_F64_GE = 0x2E;       // dst.x = (s1.xy >= s2.xy) ? 1.0 : 0.0
 constant uint OP_F64_MIN = 0x2F;      // dst.xy = min(s1.xy, s2.xy) as double-single
 constant uint OP_F64_MAX = 0x30;      // dst.xy = max(s1.xy, s2.xy) as double-single
 
+// F64 unary operations (0x3B-0x43) - double-single aware (Issue #294)
+constant uint OP_F64_NEG = 0x3B;       // dst.xy = -s1.xy (negate both hi and lo)
+constant uint OP_F64_ABS = 0x3C;       // dst.xy = abs(s1.xy) (absolute value)
+constant uint OP_F64_CEIL = 0x3D;      // dst.xy = ceil(s1.xy), lo = 0
+constant uint OP_F64_FLOOR = 0x3E;     // dst.xy = floor(s1.xy), lo = 0
+constant uint OP_F64_TRUNC = 0x3F;     // dst.xy = trunc(s1.xy), lo = 0
+constant uint OP_F64_NEAREST = 0x41;   // dst.xy = rint(s1.xy), lo = 0
+constant uint OP_F64_COPYSIGN = 0x43;  // dst.xy = copysign(s1.xy, s2.xy)
+
 // F64 conversion (0x0F-0x12)
 constant uint OP_F64_FROM_I32_S = 0x0F;  // dst.xy = ds_from_i32(s1.x signed)
 constant uint OP_F64_FROM_I32_U = 0x10;  // dst.xy = ds_from_u32(s1.x unsigned)
@@ -4508,6 +4535,68 @@ inline float2 ds_max(float2 a, float2 b) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+// F64 UNARY OPERATIONS (Issue #294)
+// These operate on the double-single representation properly
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Double-single negation: -(hi + lo) = (-hi) + (-lo)
+inline float2 ds_neg(float2 a) {
+    return float2(-a.x, -a.y);
+}
+
+// Double-single absolute value: |hi + lo|
+// If hi < 0, negate both components; otherwise keep as-is
+// If hi == 0, check lo sign (rare edge case)
+inline float2 ds_abs(float2 a) {
+    if (a.x < 0.0f || (a.x == 0.0f && a.y < 0.0f)) {
+        return float2(-a.x, -a.y);
+    }
+    return a;
+}
+
+// Double-single ceiling: ceil(hi + lo)
+// For integer results, lo should be 0
+inline float2 ds_ceil(float2 a) {
+    float sum = a.x + a.y;
+    return float2(ceil(sum), 0.0f);
+}
+
+// Double-single floor: floor(hi + lo)
+// For integer results, lo should be 0
+inline float2 ds_floor(float2 a) {
+    float sum = a.x + a.y;
+    return float2(floor(sum), 0.0f);
+}
+
+// Double-single truncate: trunc(hi + lo) = sign(x) * floor(|x|)
+// For integer results, lo should be 0
+inline float2 ds_trunc(float2 a) {
+    float sum = a.x + a.y;
+    return float2(trunc(sum), 0.0f);
+}
+
+// Double-single nearest: round to nearest, ties to even
+// For integer results, lo should be 0
+inline float2 ds_nearest(float2 a) {
+    float sum = a.x + a.y;
+    return float2(rint(sum), 0.0f);
+}
+
+// Double-single copysign: copysign(mag, sign)
+// Copy sign from sign.xy to magnitude.xy
+// Sign is determined by hi component; both hi and lo get the same sign treatment
+inline float2 ds_copysign(float2 mag, float2 sign) {
+    bool mag_negative = mag.x < 0.0f || (mag.x == 0.0f && mag.y < 0.0f);
+    bool sign_negative = sign.x < 0.0f || (sign.x == 0.0f && sign.y < 0.0f);
+
+    if (mag_negative != sign_negative) {
+        // Need to flip sign
+        return float2(-mag.x, -mag.y);
+    }
+    return mag;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 
 // Debug entry format:
 // [thread_id:4][type:1][length:1][data:length]
@@ -4895,6 +4984,15 @@ inline void bytecode_update(
             // F64 min/max - double-single aware
             case OP_F64_MIN: regs[d].xy = ds_min(regs[s1].xy, regs[s2].xy); break;
             case OP_F64_MAX: regs[d].xy = ds_max(regs[s1].xy, regs[s2].xy); break;
+
+            // F64 unary operations - double-single aware (Issue #294)
+            case OP_F64_NEG: regs[d].xy = ds_neg(regs[s1].xy); break;
+            case OP_F64_ABS: regs[d].xy = ds_abs(regs[s1].xy); break;
+            case OP_F64_CEIL: regs[d].xy = ds_ceil(regs[s1].xy); break;
+            case OP_F64_FLOOR: regs[d].xy = ds_floor(regs[s1].xy); break;
+            case OP_F64_TRUNC: regs[d].xy = ds_trunc(regs[s1].xy); break;
+            case OP_F64_NEAREST: regs[d].xy = ds_nearest(regs[s1].xy); break;
+            case OP_F64_COPYSIGN: regs[d].xy = ds_copysign(regs[s1].xy, regs[s2].xy); break;
 
             // F64 conversions using double-single representation
             // Note: i32 values are stored as float VALUES (1.0f for 1), not bits
