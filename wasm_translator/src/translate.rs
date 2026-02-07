@@ -1823,7 +1823,8 @@ impl<'a> TranslationContext<'a> {
         // Halt execution
         self.emit.halt();
 
-        self.emit.finish(10000)
+        // Issue #286: vertex_budget must be <= 1024 (VERTS_PER_SLOT in gpu_app_loader.metal)
+        self.emit.finish(1024)
     }
 
     // ═══════════════════════════════════════════════════════════════════════════

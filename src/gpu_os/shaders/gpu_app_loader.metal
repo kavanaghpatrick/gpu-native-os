@@ -18,7 +18,10 @@ constant uint GPUAPP_VERSION = 1;
 
 constant uint MAX_BYTECODE_SIZE = 65536;
 constant uint MAX_APP_STATE = 1024 * 1024;
-constant uint MAX_APP_VERTICES = 65536;
+// Issue #286 fix: MAX_APP_VERTICES must match VERTS_PER_SLOT (defined at line 125)
+// to prevent memory bounds overflow. Apps cannot request more vertices than
+// are allocated per slot (1024 vertices × 48 bytes = 49,152 bytes per slot).
+constant uint MAX_APP_VERTICES = 1024;
 
 constant uint INVALID_SLOT = 0xFFFFFFFF;
 
@@ -125,6 +128,11 @@ struct GpuAppDescriptor {
 constant uint VERTS_PER_SLOT = 1024;
 constant uint VERTEX_SIZE = 48;  // sizeof(RenderVertex)
 
+// Issue #286: Static assertion - MAX_APP_VERTICES must equal VERTS_PER_SLOT
+// to prevent memory bounds overflow. If this fails, update MAX_APP_VERTICES above.
+static_assert(MAX_APP_VERTICES == VERTS_PER_SLOT,
+    "MAX_APP_VERTICES must equal VERTS_PER_SLOT to prevent buffer overflow");
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // HEADER VALIDATION (O(1))
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -146,6 +154,7 @@ inline bool validate_header(device const GpuAppFileHeader* header, uint file_siz
     // Check sizes are reasonable
     if (header->code_size > MAX_BYTECODE_SIZE) return false;
     if (header->state_size > MAX_APP_STATE) return false;
+    // Issue #286: Reject apps requesting more vertices than allocated per slot
     if (header->vertex_budget > MAX_APP_VERTICES) return false;
 
     // Check code_offset is valid
