@@ -460,6 +460,7 @@ impl Drop for HashCache {
 
 /// GPU-accelerated duplicate file finder
 pub struct GpuDuplicateFinder {
+    #[allow(dead_code)]
     device: Device,
     command_queue: CommandQueue,
     hash_pipeline: ComputePipelineState,

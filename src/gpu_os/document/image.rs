@@ -60,6 +60,7 @@ pub const OBJECT_FIT_SCALE_DOWN: u32 = 4;
 
 /// Rectangle for atlas packing
 #[derive(Clone, Copy, Debug)]
+#[allow(dead_code)]
 struct AtlasRect {
     x: u32,
     y: u32,

@@ -12,7 +12,6 @@
 // Total: O(N) work, O(log N) depth - optimal for GPU!
 
 use metal::*;
-use std::sync::Arc;
 
 /// Metal shader source for parallel compaction
 const SHADER_SOURCE: &str = r#"
@@ -219,7 +218,9 @@ pub struct GpuParallelCompactor {
     downsweep_pipeline: ComputePipelineState,
     clear_last_pipeline: ComputePipelineState,
     scatter_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     copy_sizes_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     compute_total_pipeline: ComputePipelineState,
 }
 

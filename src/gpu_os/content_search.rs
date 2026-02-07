@@ -650,10 +650,12 @@ impl Default for SearchOptions {
 /// VECTORIZED: Each GPU thread processes 64 bytes using uchar4 loads.
 /// Achieves 79-110 GB/s on M4 Pro - BEATS ripgrep!
 pub struct GpuContentSearch {
+    #[allow(dead_code)]
     device: Device,
     command_queue: CommandQueue,
     search_pipeline: ComputePipelineState,
     turbo_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     single_byte_pipeline: ComputePipelineState,
     direct_pipeline: ComputePipelineState,  // For packed mega-buffer search
 

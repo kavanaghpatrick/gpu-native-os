@@ -182,7 +182,9 @@ pub struct GpuTextBuffer {
     line_offsets_buffer: Buffer,
     match_results_buffer: Buffer,
     match_count_buffer: Buffer,
+    #[allow(dead_code)]
     compaction_temp_buffer: Buffer,
+    #[allow(dead_code)]
     chunk_line_counts_buffer: Buffer,
 
     // Compute pipelines
@@ -191,20 +193,32 @@ pub struct GpuTextBuffer {
     batch_delete_pipeline: ComputePipelineState,
     parallel_find_pipeline: ComputePipelineState,
     undo_last_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     undo_to_version_pipeline: ComputePipelineState,
     redo_last_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     redo_to_version_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     build_line_index_phase1_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     build_line_index_phase2_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     calculate_logical_size_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     write_compacted_content_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     finalize_compaction_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     read_content_range_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     set_cursor_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     set_selection_pipeline: ComputePipelineState,
 
     // Configuration
+    #[allow(dead_code)]
     capacity_bytes: u32,
+    #[allow(dead_code)]
     staging_size: u32,
 }
 

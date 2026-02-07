@@ -100,6 +100,7 @@ pub struct FileHandle {
 /// This structure manages file handles in a GPU buffer with strict
 /// bounds validation to prevent out-of-bounds memory access.
 pub struct ContentPipeline {
+    #[allow(dead_code)]
     device: Device,
     /// GPU buffer containing FileHandle array
     handles_buffer: Buffer,

@@ -21,7 +21,7 @@ impl Default for TableRenderer {
 
 impl TableRenderer {
     /// Render a value to a string
-    pub fn render(&self, value: &Value, path_buffer: Option<&[u8]>) -> String {
+    pub fn render(&self, value: &Value, _path_buffer: Option<&[u8]>) -> String {
         match value {
             Value::Files { rows, path_buffer, source_path } => {
                 self.render_files(rows, path_buffer, source_path)
@@ -309,7 +309,7 @@ impl TableRenderer {
         if let Some(pos) = path.rfind('/') {
             let filename = &path[pos + 1..];
             if filename.len() < max_len - 4 {
-                let available = max_len - filename.len() - 4; // ".../"
+                let _available = max_len - filename.len() - 4; // ".../"
                 return format!("...{}", &path[path.len() - max_len + 3..]);
             }
         }

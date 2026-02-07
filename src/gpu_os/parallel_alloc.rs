@@ -347,6 +347,7 @@ kernel void get_allocator_stats(
 /// // All 1024 allocations complete in ~2 microseconds
 /// ```
 pub struct GpuParallelAllocator {
+    #[allow(dead_code)]
     device: Device,
     command_queue: CommandQueue,
 

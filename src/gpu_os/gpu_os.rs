@@ -11,7 +11,7 @@
 // 5. CPU: Just submits command buffers, handles external I/O
 
 use metal::*;
-use crate::gpu_os::gpu_app_system::{GpuAppSystem, app_type, priority, flags, InputEvent};
+use crate::gpu_os::gpu_app_system::{GpuAppSystem, app_type, priority, InputEvent};
 use crate::gpu_os::input::InputHandler;
 use crate::gpu_os::shared_index::GpuFilesystemIndex;
 use crate::gpu_os::gpu_io::{GpuIOQueue, IOPriority, IOQueueType};
@@ -28,6 +28,7 @@ pub struct GpuOs {
     pub io_queue: Option<GpuIOQueue>,
 
     /// Input handler (bridges external HID to GPU)
+    #[allow(dead_code)]
     input_handler: InputHandler,
 
     /// System app slots (for quick access)
@@ -113,8 +114,8 @@ impl GpuOs {
     /// Initialize system app states with screen dimensions
     fn initialize_system_app_states(&mut self, width: f32, height: f32) {
         use crate::gpu_os::gpu_app_system::{
-            CompositorState, MenuBarState, DockState,
-            MENUBAR_DEFAULT_HEIGHT, DOCK_DEFAULT_HEIGHT,
+            CompositorState, MenuBarState,
+            MENUBAR_DEFAULT_HEIGHT,
         };
 
         // Initialize Compositor state

@@ -1310,6 +1310,7 @@ pub struct PathCacheStats {
 }
 
 const CACHE_SIZE: usize = 1024;
+#[allow(dead_code)]
 const CACHE_MASK: u64 = 1023; // CACHE_SIZE - 1
 
 // ============================================================================
@@ -2456,6 +2457,7 @@ pub struct GpuPathSearch {
 
     // Async search support (Issue #76)
     shared_event: SharedEvent,
+    #[allow(dead_code)]
     shared_event_listener: SharedEventListener,
     next_signal_value: Arc<AtomicU64>,
     _callback_queue: Queue,
@@ -3204,6 +3206,7 @@ pub struct StreamSearchResult {
 /// Parameters for streaming search kernel
 #[repr(C)]
 #[derive(Copy, Clone)]
+#[allow(dead_code)]
 struct StreamSearchParams {
     chunk_size: u32,        // Number of paths in this chunk
     chunk_offset: u32,      // Global offset for path indices
@@ -3214,10 +3217,13 @@ struct StreamSearchParams {
 /// GPU-accelerated streaming filesystem search
 ///
 /// Uses chunked processing to search unlimited filesystems with fixed memory.
+#[allow(dead_code)]
 pub struct GpuStreamingSearch {
+    #[allow(dead_code)]
     device: Device,
     command_queue: CommandQueue,
     search_pipeline: ComputePipelineState,
+    #[allow(dead_code)]
     sort_pipeline: ComputePipelineState,
 
     // Double-buffered chunk storage (for potential async loading)
@@ -3422,6 +3428,7 @@ impl GpuStreamingSearch {
     }
 
     /// Sort global results by score (descending)
+    #[allow(dead_code)]
     fn sort_results(&self) {
         let count = unsafe { *(self.global_result_count.contents() as *const u32) as usize };
         if count <= 1 {

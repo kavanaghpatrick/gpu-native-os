@@ -17,7 +17,7 @@
 
 use metal::*;
 use std::fs::File;
-use std::io::{Write, BufWriter, Read, BufReader};
+use std::io::{Write, BufWriter, Read};
 use std::path::Path;
 
 /// Screenshot capture from GPU textures

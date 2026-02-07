@@ -14,13 +14,21 @@ use metal::*;
 // Buffer Slots (starting from SLOT_APP_START = 3)
 // ============================================================================
 
+#[allow(dead_code)]
 const SLOT_HTML: u64 = SLOT_APP_START;           // Raw HTML bytes
+#[allow(dead_code)]
 const SLOT_TOKENS: u64 = SLOT_APP_START + 1;     // Tokenizer output
+#[allow(dead_code)]
 const SLOT_ELEMENTS: u64 = SLOT_APP_START + 2;   // Parser output (DOM tree)
+#[allow(dead_code)]
 const SLOT_STYLES: u64 = SLOT_APP_START + 3;     // Computed styles
+#[allow(dead_code)]
 const SLOT_LAYOUT: u64 = SLOT_APP_START + 4;     // Layout boxes
+#[allow(dead_code)]
 const SLOT_VERTICES: u64 = SLOT_APP_START + 5;   // Paint output (render vertices)
+#[allow(dead_code)]
 const SLOT_COUNTS: u64 = SLOT_APP_START + 6;     // Counts: token_count, element_count, vertex_count
+#[allow(dead_code)]
 const SLOT_STYLESHEET: u64 = SLOT_APP_START + 7; // CSS rules (selectors + style defs)
 
 // ============================================================================

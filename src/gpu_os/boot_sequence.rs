@@ -10,7 +10,6 @@
 
 use metal::{Buffer, ComputePipelineState, Device, MTLResourceOptions, MTLSize};
 use std::mem;
-use std::time::Duration;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // CONSTANTS
