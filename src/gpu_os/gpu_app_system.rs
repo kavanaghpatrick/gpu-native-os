@@ -898,12 +898,13 @@ pub mod bytecode_op {
     pub const F64_REINTERPRET_I64: u8 = 0x1D;  // dst.xy = ds_from_f64_bits(s1.xy)
     pub const I64_REINTERPRET_F64: u8 = 0x1E;  // dst.xy = ds_to_f64_bits(s1.xy)
 
-    // F64 to integer SATURATING conversions (0x3B-0x3E)
+    // F64 to integer SATURATING conversions (0x45-0x48)
     // Per WASM spec: these saturate on overflow and return 0 for NaN
-    pub const F64_TO_I32_S_SAT: u8 = 0x3B;    // dst.x = ds_to_i32_sat(s1.xy), saturates to [-2^31, 2^31-1], NaN->0
-    pub const F64_TO_I32_U_SAT: u8 = 0x3C;    // dst.x = ds_to_u32_sat(s1.xy), saturates to [0, 2^32-1], NaN->0
-    pub const F64_TO_I64_S_SAT: u8 = 0x3D;    // dst.xy = ds_to_i64_sat(s1.xy), saturates to [-2^63, 2^63-1], NaN->0
-    pub const F64_TO_I64_U_SAT: u8 = 0x3E;    // dst.xy = ds_to_u64_sat(s1.xy), saturates to [0, 2^64-1], NaN->0
+    // NOTE: Moved from 0x3B-0x3E to avoid collision with F64 unary ops (Issue #296)
+    pub const F64_TO_I32_S_SAT: u8 = 0x45;    // dst.x = ds_to_i32_sat(s1.xy), saturates to [-2^31, 2^31-1], NaN->0
+    pub const F64_TO_I32_U_SAT: u8 = 0x46;    // dst.x = ds_to_u32_sat(s1.xy), saturates to [0, 2^32-1], NaN->0
+    pub const F64_TO_I64_S_SAT: u8 = 0x47;    // dst.xy = ds_to_i64_sat(s1.xy), saturates to [-2^63, 2^63-1], NaN->0
+    pub const F64_TO_I64_U_SAT: u8 = 0x48;    // dst.xy = ds_to_u64_sat(s1.xy), saturates to [0, 2^64-1], NaN->0
 
     pub const LOADI: u8 = 0x13;
     pub const SETX: u8 = 0x14;
@@ -1014,10 +1015,11 @@ pub mod bytecode_op {
     pub const F_TO_INT: u8 = 0xDC;     // f32 -> i32, TRAPS on overflow/NaN
     pub const F_TO_UINT: u8 = 0xDD;    // f32 -> u32, TRAPS on overflow/NaN
 
-    // Conversion - SATURATING versions (0x3F, 0x1F)
+    // Conversion - SATURATING versions (0x49-0x4A)
     // Per WASM spec: saturate on overflow, return 0 for NaN
-    pub const F_TO_INT_SAT: u8 = 0x3F;   // f32 -> i32 with saturation, NaN->0
-    pub const F_TO_UINT_SAT: u8 = 0x1F;  // f32 -> u32 with saturation, NaN->0
+    // NOTE: Moved from 0x3F, 0x1F to avoid collision with F64 unary ops (Issue #296)
+    pub const F_TO_INT_SAT: u8 = 0x49;   // f32 -> i32 with saturation, NaN->0
+    pub const F_TO_UINT_SAT: u8 = 0x4A;  // f32 -> u32 with saturation, NaN->0
 
     // Load immediate integer (0xDE-0xDF)
     pub const LOADI_INT: u8 = 0xDE;
@@ -3671,12 +3673,13 @@ constant uint OP_F64_TO_I32_U = 0x19;    // dst.x = ds_to_u32(s1.xy), TRAPS on o
 constant uint OP_F64_TO_I64_S = 0x1A;    // dst.xy = ds_to_i64(s1.xy), TRAPS on overflow/NaN
 constant uint OP_F64_TO_I64_U = 0x1B;    // dst.xy = ds_to_u64(s1.xy), TRAPS on overflow/NaN
 
-// F64 to integer conversion - SATURATING versions (0x3B-0x3E)
+// F64 to integer conversion - SATURATING versions (0x45-0x48)
 // Per WASM spec: saturate on overflow, return 0 for NaN
-constant uint OP_F64_TO_I32_S_SAT = 0x3B;  // dst.x = ds_to_i32_sat(s1.xy), saturates, NaN->0
-constant uint OP_F64_TO_I32_U_SAT = 0x3C;  // dst.x = ds_to_u32_sat(s1.xy), saturates, NaN->0
-constant uint OP_F64_TO_I64_S_SAT = 0x3D;  // dst.xy = ds_to_i64_sat(s1.xy), saturates, NaN->0
-constant uint OP_F64_TO_I64_U_SAT = 0x3E;  // dst.xy = ds_to_u64_sat(s1.xy), saturates, NaN->0
+// NOTE: Moved from 0x3B-0x3E to avoid collision with F64 unary ops (Issue #296)
+constant uint OP_F64_TO_I32_S_SAT = 0x45;  // dst.x = ds_to_i32_sat(s1.xy), saturates, NaN->0
+constant uint OP_F64_TO_I32_U_SAT = 0x46;  // dst.x = ds_to_u32_sat(s1.xy), saturates, NaN->0
+constant uint OP_F64_TO_I64_S_SAT = 0x47;  // dst.xy = ds_to_i64_sat(s1.xy), saturates, NaN->0
+constant uint OP_F64_TO_I64_U_SAT = 0x48;  // dst.xy = ds_to_u64_sat(s1.xy), saturates, NaN->0
 
 // F64 reinterpret operations (0x1D-0x1E)
 // NOTE: These are approximations since double-single doesn't preserve IEEE 754 bits
@@ -3826,10 +3829,11 @@ constant uint OP_UINT_TO_F = 0xDB;  // Unsigned int to float
 constant uint OP_F_TO_INT = 0xDC;   // Float to signed int, TRAPS on overflow/NaN
 constant uint OP_F_TO_UINT = 0xDD;  // Float to unsigned int, TRAPS on overflow/NaN
 
-// Conversion - SATURATING versions (0x3F, 0x1F)
+// Conversion - SATURATING versions (0x49-0x4A)
 // Per WASM spec: saturate on overflow, return 0 for NaN
-constant uint OP_F_TO_INT_SAT = 0x3F;   // f32 -> i32 with saturation, NaN->0
-constant uint OP_F_TO_UINT_SAT = 0x1F;  // f32 -> u32 with saturation, NaN->0
+// NOTE: Moved from 0x3F, 0x1F to avoid collision with F64 unary ops (Issue #296)
+constant uint OP_F_TO_INT_SAT = 0x49;   // f32 -> i32 with saturation, NaN->0
+constant uint OP_F_TO_UINT_SAT = 0x4A;  // f32 -> u32 with saturation, NaN->0
 
 // Load immediate integer (0xDE-0xDF)
 constant uint OP_LOADI_INT = 0xDE;  // Load immediate as signed int bits
