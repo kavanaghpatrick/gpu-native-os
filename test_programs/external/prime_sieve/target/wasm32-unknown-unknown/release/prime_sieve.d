@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/external/prime_sieve/target/wasm32-unknown-unknown/release/prime_sieve.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/external/prime_sieve/src/lib.rs

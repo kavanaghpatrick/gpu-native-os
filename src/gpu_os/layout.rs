@@ -293,12 +293,19 @@ impl WidgetTreeBuilder {
             self.widgets[parent].first_child = idx as u16;
         } else {
             // Find last sibling and set next_sibling
+            // Issue #264 fix: Add cycle detection to prevent infinite loop
             let mut sibling = self.widgets[parent].first_child as usize;
             if sibling != 0 {
-                while self.widgets[sibling].next_sibling != 0 {
+                const MAX_SIBLINGS: usize = 10000;  // Reasonable limit
+                let mut count = 0;
+                while self.widgets[sibling].next_sibling != 0 && count < MAX_SIBLINGS {
                     sibling = self.widgets[sibling].next_sibling as usize;
+                    count += 1;
                 }
-                self.widgets[sibling].next_sibling = idx as u16;
+                if count < MAX_SIBLINGS {
+                    self.widgets[sibling].next_sibling = idx as u16;
+                }
+                // If count >= MAX_SIBLINGS, silently don't add (cycle detected)
             }
         }
 

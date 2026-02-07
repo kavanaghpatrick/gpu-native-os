@@ -447,9 +447,13 @@ impl InputQueue {
     }
 
     /// Push an event to the queue (called from CPU/IOKit)
+    /// Issue #262: Now logs overflow when queue is full
     pub fn push(&mut self, event: InputEvent) -> bool {
         let count = self.pending_count();
         if count >= Self::CAPACITY {
+            // Issue #262: Log overflow instead of silent drop
+            eprintln!("WARNING: Input queue overflow - event dropped (type={}, queue_size={})",
+                event.event_type, count);
             return false; // Queue full
         }
         let slot = (self.head as usize) % Self::CAPACITY;

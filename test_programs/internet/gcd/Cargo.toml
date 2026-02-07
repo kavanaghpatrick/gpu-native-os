@@ -1,0 +1,16 @@
+[package]
+name = "gcd"
+version = "0.1.0"
+edition = "2021"
+
+# Empty workspace makes this a standalone package
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[profile.release]
+opt-level = "z"
+lto = true

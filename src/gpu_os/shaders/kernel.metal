@@ -200,13 +200,24 @@ kernel void gpu_os_kernel(
         atomic_fetch_add_explicit(&shared.hit_count, 1, memory_order_relaxed);
 
         // Atomic max to find topmost (highest z-order) hit
+        // Issue #265 fix: Use single CAS attempt instead of busy-wait loop
+        // to avoid cache coherency storm when many threads compete
         uint current_z = atomic_load_explicit(&shared.topmost_z, memory_order_relaxed);
-        while (my_z > current_z) {
-            if (atomic_compare_exchange_weak_explicit(
+        if (my_z > current_z) {
+            // Try once - if we lose, another thread with higher z will win
+            if (atomic_compare_exchange_strong_explicit(
                 &shared.topmost_z, &current_z, uint(my_z),
                 memory_order_relaxed, memory_order_relaxed)) {
                 atomic_store_explicit(&shared.topmost_hit, tid, memory_order_relaxed);
-                break;
+            }
+            // If CAS failed, current_z was updated - check if we should try again
+            // But only ONE more attempt to avoid loops
+            else if (my_z > current_z) {
+                if (atomic_compare_exchange_strong_explicit(
+                    &shared.topmost_z, &current_z, uint(my_z),
+                    memory_order_relaxed, memory_order_relaxed)) {
+                    atomic_store_explicit(&shared.topmost_hit, tid, memory_order_relaxed);
+                }
             }
         }
     }

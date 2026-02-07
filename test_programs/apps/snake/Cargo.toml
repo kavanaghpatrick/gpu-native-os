@@ -1,0 +1,15 @@
+[package]
+name = "snake"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[profile.release]
+opt-level = "z"
+lto = true

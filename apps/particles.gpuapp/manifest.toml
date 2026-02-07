@@ -1,0 +1,21 @@
+[app]
+name = "Particles"
+version = "1.0"
+
+[shaders]
+compute = "particle_kernel"
+vertex = "particle_vertex"
+fragment = "particle_fragment"
+
+[config]
+thread_count = 1024
+vertex_count = { dynamic = true, offset = 0 }
+clear_color = [0.02, 0.02, 0.05, 1.0]
+preferred_size = [1024.0, 768.0]
+
+[buffers]
+# slot 3 = vertices (automatic)
+# slot 4 = particle state (16384 particles * 48 bytes)
+particles = { size = 786432, slot = 4 }
+# slot 5 = vertex count atomic
+vertex_count = { size = 16, slot = 5 }

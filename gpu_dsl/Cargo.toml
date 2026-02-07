@@ -1,0 +1,9 @@
+[package]
+name = "gpu_dsl"
+version = "0.1.0"
+edition = "2021"
+description = "GPU bytecode DSL - THE GPU IS THE COMPUTER"
+
+[dependencies]
+gpu_dsl_macro = { path = "../gpu_dsl_macro" }
+rust-experiment = { path = ".." }

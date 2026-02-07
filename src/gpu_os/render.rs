@@ -407,6 +407,18 @@ impl FrameRenderer {
         color_attachment.set_clear_color(MTLClearColor::new(0.1, 0.1, 0.1, 1.0));
 
         let render_encoder = command_buffer.new_render_command_encoder(&render_desc);
+
+        // Issue #240 fix: Explicitly set viewport using drawable texture dimensions
+        let texture = drawable.texture();
+        render_encoder.set_viewport(metal::MTLViewport {
+            originX: 0.0,
+            originY: 0.0,
+            width: texture.width() as f64,
+            height: texture.height() as f64,
+            znear: 0.0,
+            zfar: 1.0,
+        });
+
         self.hybrid.render_widgets(&render_encoder, &self.vertex_buffer, &memory.draw_args_buffer);
         render_encoder.end_encoding();
 

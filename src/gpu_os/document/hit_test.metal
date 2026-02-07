@@ -145,16 +145,18 @@ kernel void hit_test(
         }
 
         // Atomic compare to find deepest element (innermost wins)
-        int old_depth;
-        do {
-            old_depth = atomic_load_explicit(hit_depth, memory_order_relaxed);
-            if (depth <= old_depth) return;  // Shallower depth, skip
-        } while (!atomic_compare_exchange_weak_explicit(
-            hit_depth, &old_depth, depth,
-            memory_order_relaxed, memory_order_relaxed));
-
-        // Won the race - store our element ID
-        atomic_store_explicit(hit_element_id, gid, memory_order_relaxed);
+        // Issue #265 fix: Limit retries to avoid cache coherency storm
+        int old_depth = atomic_load_explicit(hit_depth, memory_order_relaxed);
+        for (int retry = 0; retry < 3 && depth > old_depth; retry++) {
+            if (atomic_compare_exchange_weak_explicit(
+                hit_depth, &old_depth, depth,
+                memory_order_relaxed, memory_order_relaxed)) {
+                // Won the race - store our element ID
+                atomic_store_explicit(hit_element_id, gid, memory_order_relaxed);
+                break;
+            }
+            // CAS failed, old_depth was updated. Loop will check depth > old_depth again.
+        }
     }
 }
 

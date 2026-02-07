@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/external/siphasher/target/wasm32-unknown-unknown/release/siphasher_test.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/external/siphasher/src/lib.rs

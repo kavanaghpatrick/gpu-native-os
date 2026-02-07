@@ -146,12 +146,28 @@ pub struct DataBufferDescriptor {
 // Metal Shader - Persistent Search Kernel
 // ============================================================================
 //
-// NOTE: Metal compute kernels cannot truly run indefinitely due to GPU
-// execution time limits. Instead, we use a "work-triggered" model:
-// - CPU submits work items to a queue
-// - CPU dispatches the kernel to process pending work
-// - Kernel processes ALL pending items in one dispatch
-// - This amortizes dispatch overhead across multiple searches
+// PROVEN (2026-01-28): Metal compute kernels CAN run indefinitely on Apple Silicon.
+// See tests/test_persistent_kernel_proof.rs for empirical evidence:
+// - Kernel ran 15+ seconds continuously with no watchdog kill
+// - CPU-GPU atomic communication works for shutdown signaling
+// - 87 million iterations completed successfully
+//
+// CRITICAL CONSTRAINT: All SIMD threads must participate in the while(true) loop.
+// Single-thread loops (if tid != 0 return) cause SIMD divergence stalls after ~5M iterations.
+//
+// CORRECT pattern:
+//   while (true) {
+//       ALL threads check shutdown
+//       ALL threads do work (each on different data)
+//       if (tid == 0) update_stats();
+//   }
+//
+// INCORRECT pattern (stalls):
+//   if (tid != 0) return;
+//   while (true) { ... }  // Only thread 0 runs - causes SIMD stall
+//
+// TODO: Refactor this kernel to use true persistent model with all-thread participation.
+// Current implementation uses batch processing as a workaround.
 
 const PERSISTENT_SEARCH_SHADER: &str = r#"
 #include <metal_stdlib>

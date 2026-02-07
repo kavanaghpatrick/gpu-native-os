@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/external/fastrand/target/wasm32-unknown-unknown/release/fastrand_test.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/external/fastrand/src/lib.rs

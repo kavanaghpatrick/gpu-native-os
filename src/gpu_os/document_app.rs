@@ -776,12 +776,14 @@ kernel void parse(
                 if (elements[parent].first_child < 0) {
                     elements[parent].first_child = new_idx;
                 } else {
-                    // Find last sibling
+                    // Find last sibling (Issue #264: add cycle detection)
                     int sib = elements[parent].first_child;
-                    while (elements[sib].next_sibling >= 0) {
+                    int max_iter = 10000;  // Prevent infinite loop
+                    while (elements[sib].next_sibling >= 0 && max_iter > 0) {
                         sib = elements[sib].next_sibling;
+                        max_iter--;
                     }
-                    elements[sib].next_sibling = new_idx;
+                    if (max_iter > 0) elements[sib].next_sibling = new_idx;
                 }
             }
 
@@ -807,11 +809,14 @@ kernel void parse(
                 if (elements[parent].first_child < 0) {
                     elements[parent].first_child = new_idx;
                 } else {
+                    // Issue #264: add cycle detection
                     int sib = elements[parent].first_child;
-                    while (elements[sib].next_sibling >= 0) {
+                    int max_iter = 10000;
+                    while (elements[sib].next_sibling >= 0 && max_iter > 0) {
                         sib = elements[sib].next_sibling;
+                        max_iter--;
                     }
-                    elements[sib].next_sibling = new_idx;
+                    if (max_iter > 0) elements[sib].next_sibling = new_idx;
                 }
             }
         }
@@ -1234,9 +1239,11 @@ kernel void document_compute(
                     if (elements[parent].first_child < 0) {
                         elements[parent].first_child = new_idx;
                     } else {
+                        // Issue #264: add cycle detection
                         int sib = elements[parent].first_child;
-                        while (elements[sib].next_sibling >= 0) sib = elements[sib].next_sibling;
-                        elements[sib].next_sibling = new_idx;
+                        int max_iter = 10000;
+                        while (elements[sib].next_sibling >= 0 && max_iter > 0) { sib = elements[sib].next_sibling; max_iter--; }
+                        if (max_iter > 0) elements[sib].next_sibling = new_idx;
                     }
                 }
 
@@ -1258,9 +1265,11 @@ kernel void document_compute(
                     if (elements[parent].first_child < 0) {
                         elements[parent].first_child = new_idx;
                     } else {
+                        // Issue #264: add cycle detection
                         int sib = elements[parent].first_child;
-                        while (elements[sib].next_sibling >= 0) sib = elements[sib].next_sibling;
-                        elements[sib].next_sibling = new_idx;
+                        int max_iter = 10000;
+                        while (elements[sib].next_sibling >= 0 && max_iter > 0) { sib = elements[sib].next_sibling; max_iter--; }
+                        if (max_iter > 0) elements[sib].next_sibling = new_idx;
                     }
                 }
             }

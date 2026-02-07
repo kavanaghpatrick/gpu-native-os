@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/internet/sum_digits/target/wasm32-unknown-unknown/release/sum_digits.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/internet/sum_digits/src/lib.rs /Users/patrickkavanagh/rust-experiment/test_programs/internet/sum_digits/src/original.rs

@@ -1,0 +1,14 @@
+[app]
+name = "Plasma"
+version = "1.0"
+
+[shaders]
+compute = "plasma_compute"
+vertex = "plasma_vertex"
+fragment = "plasma_fragment"
+
+[config]
+thread_count = 6
+vertex_count = 6
+clear_color = [0.0, 0.0, 0.0, 1.0]
+preferred_size = [800.0, 600.0]

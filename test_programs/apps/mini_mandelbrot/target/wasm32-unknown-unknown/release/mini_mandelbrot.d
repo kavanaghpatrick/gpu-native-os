@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/apps/mini_mandelbrot/target/wasm32-unknown-unknown/release/mini_mandelbrot.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/apps/mini_mandelbrot/src/lib.rs

@@ -1,0 +1,21 @@
+[app]
+name = "Boids"
+version = "1.0"
+
+[shaders]
+compute = "boids_kernel"
+vertex = "boid_vertex"
+fragment = "boid_fragment"
+
+[config]
+thread_count = 1024
+vertex_count = 3072
+clear_color = [0.02, 0.02, 0.06, 1.0]
+preferred_size = [1024.0, 768.0]
+
+[buffers]
+# slot 3 = vertices (automatic)
+# slot 4 = boids state
+boids = { size = 16384, slot = 4 }
+# slot 5 = vertex count atomic
+vertex_count = { size = 16, slot = 5 }

@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/apps/particles/target/wasm32-unknown-unknown/release/particles.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/apps/particles/src/lib.rs

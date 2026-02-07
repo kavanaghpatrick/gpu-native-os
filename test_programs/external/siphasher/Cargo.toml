@@ -1,0 +1,16 @@
+[package]
+name = "siphasher_test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+siphasher = { version = "1.0", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true

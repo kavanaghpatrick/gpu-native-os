@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/external/fibonacci_real/target/wasm32-unknown-unknown/release/fibonacci_real.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/external/fibonacci_real/src/lib.rs

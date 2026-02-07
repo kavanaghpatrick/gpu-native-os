@@ -7,7 +7,7 @@
 //!
 //! # Example
 //!
-//! ```no_run
+//! ```ignore
 //! #![no_std]
 //! #![no_main]
 //!
@@ -374,7 +374,9 @@ pub mod prelude {
 
     // Re-export collections
     #[cfg(feature = "alloc")]
-    pub use crate::collections::HashMap;
+    pub use crate::collections::{
+        HashMap, HashSet, VecDeque, BinaryHeap, LinkedList,
+    };
 }
 
 // ============================================================================

@@ -3342,13 +3342,20 @@ impl GpuStreamingSearch {
         }
 
         // Upload query words
+        // Issue #268 fix: Add bounds checking for word length and count
         unsafe {
             let word_ptr = self.words_buffer.contents() as *mut SearchWord;
-            for (i, (word, len)) in query_words.iter().enumerate() {
+            for (i, (word, len)) in query_words.iter().take(GPU_MAX_QUERY_WORDS).enumerate() {
                 let w = word_ptr.add(i);
                 let bytes = word.as_bytes();
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*w).chars.as_mut_ptr() as *mut u8, *len as usize);
-                (*w).len = *len;
+                // Clamp length to SearchWord.chars size (32 bytes)
+                let safe_len = (*len as usize).min(32).min(bytes.len());
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), (*w).chars.as_mut_ptr() as *mut u8, safe_len);
+                // Zero the rest of chars
+                if safe_len < 32 {
+                    std::ptr::write_bytes((*w).chars.as_mut_ptr().add(safe_len) as *mut u8, 0, 32 - safe_len);
+                }
+                (*w).len = safe_len as u16;
             }
         }
 

@@ -732,12 +732,15 @@ bool check_pseudo_class(
         case PSEUDO_LAST_CHILD: {
             if (elem.parent < 0) return true;
             // Check if no non-text sibling after
+            // Issue #264: add cycle detection
             int sibling = elem.next_sibling;
-            while (sibling >= 0) {
+            int max_iter = 10000;
+            while (sibling >= 0 && max_iter > 0) {
                 if (elements[sibling].element_type != ELEM_TEXT) {
                     return false;
                 }
                 sibling = elements[sibling].next_sibling;
+                max_iter--;
             }
             return true;
         }
@@ -756,23 +759,29 @@ bool check_pseudo_class(
         case PSEUDO_FIRST_OF_TYPE: {
             if (elem.parent < 0) return true;
             Element parent = elements[elem.parent];
+            // Issue #264: add cycle detection
             int child = parent.first_child;
-            while (child >= 0) {
+            int max_iter = 10000;
+            while (child >= 0 && max_iter > 0) {
                 if (elements[child].element_type == elem.element_type) {
                     return uint(child) == elem_idx;
                 }
                 child = elements[child].next_sibling;
+                max_iter--;
             }
             return true;
         }
 
         case PSEUDO_LAST_OF_TYPE: {
+            // Issue #264: add cycle detection
             int sibling = elem.next_sibling;
-            while (sibling >= 0) {
+            int max_iter = 10000;
+            while (sibling >= 0 && max_iter > 0) {
                 if (elements[sibling].element_type == elem.element_type) {
                     return false;
                 }
                 sibling = elements[sibling].next_sibling;
+                max_iter--;
             }
             return true;
         }

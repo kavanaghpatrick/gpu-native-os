@@ -11,7 +11,7 @@
 // CPU's only job: push input events to the existing InputQueue via InputHandler.
 
 use metal::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{fence, AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Invalid window index sentinel
@@ -30,6 +30,7 @@ pub mod dispatch {
     pub const RENDER: u32 = 8;
     pub const BRING_TO_FRONT: u32 = 9;
     pub const HOVER_TEST: u32 = 10;
+    pub const WINDOW_CLOSE: u32 = 11;
 }
 
 /// Hit regions for windows
@@ -220,13 +221,18 @@ impl EventLoopHandle {
     }
 
     /// Read the current event loop state
+    /// Issue #256: Add memory fence to ensure we see GPU writes
     pub fn read_state(&self) -> GpuEventLoopState {
-        unsafe { *(self.state_buffer.contents() as *const GpuEventLoopState) }
+        // Acquire fence ensures we see all GPU writes before this read
+        fence(Ordering::Acquire);
+        unsafe { std::ptr::read_volatile(self.state_buffer.contents() as *const GpuEventLoopState) }
     }
 
     /// Read hit test result
+    /// Issue #256: Add memory fence to ensure we see GPU writes
     pub fn read_hit_result(&self) -> HitTestResult {
-        unsafe { *(self.hit_result_buffer.contents() as *const HitTestResult) }
+        fence(Ordering::Acquire);
+        unsafe { std::ptr::read_volatile(self.hit_result_buffer.contents() as *const HitTestResult) }
     }
 }
 
@@ -274,6 +280,7 @@ using namespace metal;
 #define DISPATCH_RENDER         8
 #define DISPATCH_BRING_TO_FRONT 9
 #define DISPATCH_HOVER_TEST     10
+#define DISPATCH_WINDOW_CLOSE   11
 
 // Hit regions
 #define REGION_NONE     0
@@ -588,8 +595,9 @@ kernel void handle_hit_result(
             break;
 
         case REGION_CLOSE:
-            windows[window_index].flags &= ~WINDOW_VISIBLE;
-            atomic_store_explicit(&state->frame_dirty, 1, memory_order_relaxed);
+            // Dispatch to CPU to properly close window and clean up app
+            atomic_store_explicit(&state->next_dispatch, DISPATCH_WINDOW_CLOSE, memory_order_relaxed);
+            state->dispatch_param = window_index;
             break;
 
         case REGION_MINIMIZE:

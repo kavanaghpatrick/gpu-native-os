@@ -40,6 +40,15 @@ impl std::fmt::Display for ContentPipelineError {
 
 impl std::error::Error for ContentPipelineError {}
 
+// Status constants (matching HandleStatus.state values)
+pub const STATUS_FREE: u32 = 0;
+pub const STATUS_LOADING: u32 = 1;
+pub const STATUS_READY: u32 = 2;
+pub const STATUS_ERROR: u32 = 3;
+
+// Invalid handle sentinel value
+pub const INVALID_HANDLE: u32 = u32::MAX;
+
 /// Status of a file handle in the content pipeline
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]

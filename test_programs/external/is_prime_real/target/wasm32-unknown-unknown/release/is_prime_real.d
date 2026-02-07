@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/external/is_prime_real/target/wasm32-unknown-unknown/release/is_prime_real.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/external/is_prime_real/src/lib.rs

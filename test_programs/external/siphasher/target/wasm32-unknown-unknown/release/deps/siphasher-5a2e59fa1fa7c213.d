@@ -1,0 +1,10 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/external/siphasher/target/wasm32-unknown-unknown/release/deps/siphasher-5a2e59fa1fa7c213.d: /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/lib.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip128.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/../README.md
+
+/Users/patrickkavanagh/rust-experiment/test_programs/external/siphasher/target/wasm32-unknown-unknown/release/deps/libsiphasher-5a2e59fa1fa7c213.rlib: /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/lib.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip128.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/../README.md
+
+/Users/patrickkavanagh/rust-experiment/test_programs/external/siphasher/target/wasm32-unknown-unknown/release/deps/libsiphasher-5a2e59fa1fa7c213.rmeta: /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/lib.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip128.rs /Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/../README.md
+
+/Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/lib.rs:
+/Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip.rs:
+/Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/sip128.rs:
+/Users/patrickkavanagh/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/siphasher-1.0.1/src/../README.md:

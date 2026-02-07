@@ -1,0 +1,16 @@
+[package]
+name = "fastrand_test"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fastrand = { version = "2.0", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true

@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/external/xxhash/target/wasm32-unknown-unknown/release/xxhash_test.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/external/xxhash/src/lib.rs

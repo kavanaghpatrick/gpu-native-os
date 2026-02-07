@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/internet/fizzbuzz/target/wasm32-unknown-unknown/release/fizzbuzz.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/internet/fizzbuzz/src/lib.rs /Users/patrickkavanagh/rust-experiment/test_programs/internet/fizzbuzz/src/original.rs

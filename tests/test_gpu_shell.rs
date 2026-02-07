@@ -195,7 +195,7 @@ fn test_cache_warm_queries() {
     let warm_time = start.elapsed();
 
     // Warm query should be faster (cache hit)
-    let (hits, misses, _) = shell.cache_stats();
+    let (hits, misses, _, _) = shell.cache_stats();
     assert_eq!(hits, 1);
     assert_eq!(misses, 1);
 
@@ -209,11 +209,11 @@ fn test_cache_clear() {
     let mut shell = GpuShell::new().expect("Failed to create shell");
 
     shell.execute("files /tmp").expect("Execution failed");
-    let (_, _, cached_before) = shell.cache_stats();
+    let (_, _, cached_before, _) = shell.cache_stats();
     assert!(cached_before > 0);
 
     shell.clear_cache();
-    let (_, _, cached_after) = shell.cache_stats();
+    let (_, _, cached_after, _) = shell.cache_stats();
     assert_eq!(cached_after, 0);
 }
 

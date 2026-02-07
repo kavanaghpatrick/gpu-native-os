@@ -1,0 +1,18 @@
+[package]
+name = "bouncing_balls"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+gpu_std = { path = "../../../gpu_std", default-features = false }
+
+[profile.release]
+opt-level = "z"
+lto = true

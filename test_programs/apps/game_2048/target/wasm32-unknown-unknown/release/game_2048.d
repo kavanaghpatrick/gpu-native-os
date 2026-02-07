@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/apps/game_2048/target/wasm32-unknown-unknown/release/game_2048.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/apps/game_2048/src/lib.rs

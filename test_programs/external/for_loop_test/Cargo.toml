@@ -1,0 +1,17 @@
+[package]
+name = "for_loop_test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.dev]
+opt-level = 0
+
+[profile.release]
+opt-level = "z"
+lto = true
+panic = "abort"
+
+[workspace]

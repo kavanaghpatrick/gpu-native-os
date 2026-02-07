@@ -1,0 +1,17 @@
+[package]
+name = "gpu_wasm_app"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# No dependencies - pure no_std
+
+[profile.release]
+opt-level = "z"       # Optimize for size
+lto = true            # Link-time optimization
+panic = "abort"       # No unwinding

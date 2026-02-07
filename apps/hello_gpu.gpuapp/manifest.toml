@@ -1,0 +1,14 @@
+[app]
+name = "Hello GPU"
+version = "1.0"
+
+[shaders]
+compute = "hello_compute"
+vertex = "hello_vertex"
+fragment = "hello_fragment"
+
+[config]
+thread_count = 6
+vertex_count = 6
+clear_color = [0.1, 0.1, 0.2, 1.0]
+preferred_size = [640.0, 480.0]

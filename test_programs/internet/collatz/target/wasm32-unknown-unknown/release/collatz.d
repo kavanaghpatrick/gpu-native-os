@@ -1,0 +1,1 @@
+/Users/patrickkavanagh/rust-experiment/test_programs/internet/collatz/target/wasm32-unknown-unknown/release/collatz.wasm: /Users/patrickkavanagh/rust-experiment/test_programs/internet/collatz/src/lib.rs /Users/patrickkavanagh/rust-experiment/test_programs/internet/collatz/src/original.rs
