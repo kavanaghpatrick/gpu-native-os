@@ -1163,42 +1163,42 @@ impl<'a> TranslationContext<'a> {
                 self.emit.f_to_uint(dst, a);
             }
 
-            // Saturating truncation - same as regular truncation for our GPU model
-            // (GPU hardware handles saturation automatically)
+            // Saturating truncation - per WASM spec: saturate on overflow, 0 for NaN
+            // These use dedicated SAT opcodes that implement proper saturation semantics
             Operator::I32TruncSatF32S => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                self.emit.f_to_int(dst, a);
+                self.emit.f_to_int_sat(dst, a);
             }
 
             Operator::I32TruncSatF32U => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                self.emit.f_to_uint(dst, a);
+                self.emit.f_to_uint_sat(dst, a);
             }
 
             Operator::I32TruncSatF64S => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                self.emit.f64_to_i32_s(dst, a);
+                self.emit.f64_to_i32_s_sat(dst, a);
             }
 
             Operator::I32TruncSatF64U => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                self.emit.f64_to_i32_u(dst, a);
+                self.emit.f64_to_i32_u_sat(dst, a);
             }
 
             Operator::I64TruncSatF32S | Operator::I64TruncSatF64S => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                self.emit.f64_to_i64_s(dst, a);  // Use f64 path for i64 result
+                self.emit.f64_to_i64_s_sat(dst, a);  // Use f64 path for i64 result
             }
 
             Operator::I64TruncSatF32U | Operator::I64TruncSatF64U => {
                 let a = self.stack.pop()?;
                 let dst = self.stack.alloc_and_push()?;
-                self.emit.f64_to_i64_u(dst, a);  // Use f64 path for i64 result
+                self.emit.f64_to_i64_u_sat(dst, a);  // Use f64 path for i64 result
             }
 
             Operator::F32ConvertI32S => {
