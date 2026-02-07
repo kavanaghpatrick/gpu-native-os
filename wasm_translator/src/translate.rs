@@ -86,7 +86,12 @@ impl<'a> TranslationContext<'a> {
             // ═══════════════════════════════════════════════════════════════
 
             Operator::Unreachable => {
-                self.emit.halt();
+                // WASM spec: unreachable is a trap, not just a clean halt.
+                // Use the dedicated UNREACHABLE opcode which:
+                // 1. Writes a debug marker (-2) to the debug buffer
+                // 2. Halts execution
+                // This allows distinguishing panic/unreachable from clean exit.
+                self.emit.unreachable();
             }
 
             Operator::Nop => {
