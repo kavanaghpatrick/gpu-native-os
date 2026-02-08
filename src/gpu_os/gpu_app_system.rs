@@ -897,6 +897,8 @@ pub mod bytecode_op {
     // They reconstruct the value and convert, which gives correct results for most cases
     pub const F64_REINTERPRET_I64: u8 = 0x1D;  // dst.xy = ds_from_f64_bits(s1.xy)
     pub const I64_REINTERPRET_F64: u8 = 0x1E;  // dst.xy = ds_to_f64_bits(s1.xy)
+    pub const LOADI_RGBA: u8 = 0x1F;              // dst = float4(R/255, G/255, B/255, A/255) from packed 0xRRGGBBAA in imm bits
+    pub const LD_RGBA: u8 = 0x4B;                 // dst = float4(R/255, G/255, B/255, A/255) from 4 bytes at mem[s1+imm]
 
     // F64 to integer SATURATING conversions (0x45-0x48)
     // Per WASM spec: these saturate on overflow and return 0 for NaN
@@ -1346,6 +1348,16 @@ impl BytecodeAssembler {
     pub fn setw(&mut self, dst: u8, val: f32) -> usize { self.emit(bytecode_op::SETW, dst, 0, 0, val) }
     /// Pack two scalar .x values into dst.xy: dst.xy = (s1.x, s2.x)
     pub fn pack2(&mut self, dst: u8, s1: u8, s2: u8) -> usize { self.emit(bytecode_op::PACK2, dst, s1, s2, 0.0) }
+    /// Load packed RGBA color (0xRRGGBBAA) and decompose to float4(R/255, G/255, B/255, A/255)
+    /// Bits are preserved in the immediate field, so all 32 bits are exact.
+    pub fn loadi_rgba(&mut self, dst: u8, packed_color: u32) -> usize {
+        self.emit(bytecode_op::LOADI_RGBA, dst, 0, 0, f32::from_bits(packed_color))
+    }
+    /// Load 4 bytes from memory as RGBA color: dst = float4(R/255, G/255, B/255, A/255)
+    /// addr = regs[s1].x + offset (byte address)
+    pub fn ld_rgba(&mut self, dst: u8, addr_reg: u8, offset: f32) -> usize {
+        self.emit(bytecode_op::LD_RGBA, dst, addr_reg, 0, offset)
+    }
     pub fn eq(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::EQ, dst, a, b, 0.0) }
     pub fn lt(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::LT, dst, a, b, 0.0) }
     pub fn gt(&mut self, dst: u8, a: u8, b: u8) -> usize { self.emit(bytecode_op::GT, dst, a, b, 0.0) }
@@ -3685,6 +3697,8 @@ constant uint OP_F64_TO_I64_U_SAT = 0x48;  // dst.xy = ds_to_u64_sat(s1.xy), sat
 // NOTE: These are approximations since double-single doesn't preserve IEEE 754 bits
 constant uint OP_F64_REINTERPRET_I64 = 0x1D;  // dst.xy = ds_from_f64_bits(s1.xy)
 constant uint OP_I64_REINTERPRET_F64 = 0x1E;  // dst.xy = ds_to_f64_bits(s1.xy)
+constant uint OP_LOADI_RGBA = 0x1F;            // dst = float4(R/255, G/255, B/255, A/255) from packed 0xRRGGBBAA in imm bits
+constant uint OP_LD_RGBA = 0x4B;              // dst = float4(R/255, G/255, B/255, A/255) from 4 bytes at mem[s1+imm]
 
 constant uint OP_LOADI = 0x13;    // Load immediate (broadcast to all components)
 constant uint OP_SETX = 0x14;     // Set .x component
@@ -4928,6 +4942,10 @@ inline void bytecode_update(
     // Vertex output
     device RenderVertex* verts = unified_vertices + app->vertex_offset / sizeof(RenderVertex);
     uint vert_idx = 0;
+    uint debug_quad_count = 0;
+    uint debug_halt_pc = 0;
+    uint debug_halt_op = 0;
+    uint debug_halt_addr = 0;
 
     // Execute
     // ═══════════════════════════════════════════════════════════════════════════
@@ -5233,6 +5251,20 @@ inline void bytecode_update(
                 break;
             }
 
+            // Load packed RGBA color and decompose to float4
+            // imm_bits contains raw 0xRRGGBBAA — bits are preserved in the instruction word
+            // Each byte is 0-255, perfectly representable as float32
+            case OP_LOADI_RGBA: {
+                uint packed = imm_bits;  // Raw bits from instruction, no float conversion
+                regs[d] = float4(
+                    float((packed >> 24) & 0xFFu) / 255.0,  // R
+                    float((packed >> 16) & 0xFFu) / 255.0,  // G
+                    float((packed >> 8)  & 0xFFu) / 255.0,  // B
+                    float( packed        & 0xFFu) / 255.0   // A
+                );
+                break;
+            }
+
             // Issue #227 fix: Float comparisons return i32 (0 or 1), must store integer bits
             // as_type<float> is a bitcast, not arithmetic - FTZ doesn't apply to bitcasts
             // JZ/JNZ compare against 0.0f (bits 0x0), which works: 0x00000000 == 0.0f, 0x00000001 != 0.0f
@@ -5256,6 +5288,9 @@ inline void bytecode_update(
                 // as_type<uint>(3.0f) = 0x40400000 (wrong!), uint(3.0f) = 3 (correct!)
                 uint idx = uint(regs[s1].x) + uint(imm);
                 if (idx >= state_size_float4) {
+                    debug_halt_pc = pc;
+                    debug_halt_op = op;
+                    debug_halt_addr = idx;
                     gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
                     running = false;
                     break;
@@ -5269,6 +5304,9 @@ inline void bytecode_update(
                 // as_type<uint>(3.0f) = 0x40400000 (wrong!), uint(3.0f) = 3 (correct!)
                 uint idx = uint(regs[s1].x) + uint(imm);
                 if (idx >= state_size_float4) {
+                    debug_halt_pc = pc;
+                    debug_halt_op = op;
+                    debug_halt_addr = idx;
                     gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
                     running = false;
                     break;
@@ -5277,12 +5315,11 @@ inline void bytecode_update(
                 break;
             }
             case OP_LD1: {
-                // Load 8-bit from byte address
-                // CRITICAL FIX: Clear entire register to avoid garbage in .y/.z/.w
+                // Load 8-bit from byte address (float-value convention)
                 device uchar* bytes = (device uchar*)state;
-                uint idx = as_type<uint>(regs[s1].x) + uint(imm);
+                uint idx = uint(regs[s1].x) + uint(imm);  // Float-value address
                 if (idx >= state_size_bytes) {
-                    gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
+                    gpu_debug_i32(-5, tid, dbg, dbg_data);
                     running = false;
                     break;
                 }
@@ -5291,9 +5328,12 @@ inline void bytecode_update(
             }
             case OP_ST1: {
                 device uchar* bytes = (device uchar*)state;
-                uint idx = as_type<uint>(regs[s1].x) + uint(imm);
+                uint idx = uint(regs[s1].x) + uint(imm);  // Float-value address
                 if (idx >= state_size_bytes) {
-                    gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
+                    debug_halt_pc = pc;
+                    debug_halt_op = op;
+                    debug_halt_addr = idx;
+                    gpu_debug_i32(-5, tid, dbg, dbg_data);
                     running = false;
                     break;
                 }
@@ -5301,73 +5341,96 @@ inline void bytecode_update(
                 break;
             }
             case OP_LD2: {
-                // Load 16-bit (halfword) from byte address
-                // CRITICAL FIX: Clear entire register to avoid garbage in .y/.z/.w
+                // Load 16-bit (halfword) from byte address (float-value convention)
                 device ushort* halfwords = (device ushort*)state;
-                uint byte_addr = as_type<uint>(regs[s1].x) + uint(imm);
+                uint byte_addr = uint(regs[s1].x) + uint(imm);  // Float-value address
                 if (byte_addr + 1 >= state_size_bytes) {
-                    gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
+                    gpu_debug_i32(-5, tid, dbg, dbg_data);
                     running = false;
                     break;
                 }
-                uint hw_idx = byte_addr / 2;  // Convert to halfword index
-                regs[d] = float4(as_type<float>(uint(halfwords[hw_idx])), 0.0, 0.0, 0.0);
+                uint hw_idx = byte_addr / 2;
+                regs[d] = float4(float(halfwords[hw_idx]), 0.0, 0.0, 0.0);
                 break;
             }
             case OP_ST2: {
-                // Store 16-bit (halfword) to byte address
+                // Store 16-bit (halfword) to byte address (float-value convention)
                 device ushort* halfwords = (device ushort*)state;
-                uint byte_addr = as_type<uint>(regs[s1].x) + uint(imm);
+                uint byte_addr = uint(regs[s1].x) + uint(imm);  // Float-value address
                 if (byte_addr + 1 >= state_size_bytes) {
-                    gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
+                    gpu_debug_i32(-5, tid, dbg, dbg_data);
                     running = false;
                     break;
                 }
-                uint hw_idx = byte_addr / 2;  // Convert to halfword index
-                halfwords[hw_idx] = ushort(as_type<uint>(regs[s2].x));
+                uint hw_idx = byte_addr / 2;
+                halfwords[hw_idx] = ushort(uint(regs[s2].x));
                 break;
             }
             case OP_LD4: {
                 // Load 32-bit (word) from byte address
-                // CRITICAL FIX: Clear entire register to avoid garbage in .y/.z/.w
-                // This bug caused array access corruption - registers reused with stale values
+                // Use float-value convention: float(int_val) for the loaded value
+                // This preserves values with |magnitude| < 2^24 (most addresses, counters)
+                // For values > 2^24, precision loss of ±1 in LSB
                 device uint* words = (device uint*)state;
-                uint byte_addr = as_type<uint>(regs[s1].x) + uint(imm);
+                uint byte_addr = uint(regs[s1].x) + uint(imm);  // Float-value address
                 if (byte_addr + 3 >= state_size_bytes) {
-                    gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
+                    gpu_debug_i32(-5, tid, dbg, dbg_data);
                     running = false;
                     break;
                 }
-                uint word_idx = byte_addr / 4;  // Convert to word index
-                regs[d] = float4(as_type<float>(words[word_idx]), 0.0, 0.0, 0.0);
+                uint word_idx = byte_addr / 4;
+                // Store as signed int→float to preserve sign and maximize exact range
+                // int→float is exact for |val| < 2^24 (handles negative values correctly)
+                regs[d] = float4(float(as_type<int>(words[word_idx])), 0.0, 0.0, 0.0);
                 break;
             }
             case OP_ST4: {
                 // Store 32-bit (word) to byte address
+                // Reverse of LD4: float→int→uint to recover original bits
                 device uint* words = (device uint*)state;
-                uint byte_addr = as_type<uint>(regs[s1].x) + uint(imm);
+                uint byte_addr = uint(regs[s1].x) + uint(imm);  // Float-value address
                 if (byte_addr + 3 >= state_size_bytes) {
-                    gpu_debug_i32(-5, tid, dbg, dbg_data);  // Memory access violation
+                    gpu_debug_i32(-5, tid, dbg, dbg_data);
                     running = false;
                     break;
                 }
-                uint word_idx = byte_addr / 4;  // Convert to word index
-                words[word_idx] = as_type<uint>(regs[s2].x);
+                uint word_idx = byte_addr / 4;
+                words[word_idx] = as_type<uint>(int(regs[s2].x));
+                break;
+            }
+
+            // Load 4 bytes from memory as RGBA color (0.0-1.0)
+            // Each byte is 0-255, perfectly representable as float32
+            // Used by emit_quad for runtime colors loaded from memory
+            case OP_LD_RGBA: {
+                device uchar* bytes = (device uchar*)state;
+                uint base_addr = uint(regs[s1].x) + uint(imm);
+                if (base_addr + 3 < state_size_bytes) {
+                    regs[d] = float4(
+                        float(bytes[base_addr])     / 255.0,
+                        float(bytes[base_addr + 1]) / 255.0,
+                        float(bytes[base_addr + 2]) / 255.0,
+                        float(bytes[base_addr + 3]) / 255.0
+                    );
+                } else {
+                    regs[d] = float4(1.0, 0.0, 1.0, 1.0);  // Magenta = error color
+                }
                 break;
             }
 
             // Graphics
             case OP_QUAD: {
+                debug_quad_count++;
                 // s1 = position register (xy), s2 = size register (xy)
-                // dst register = color (u32 packed as 0xRRGGBBAA in .x bits), imm = depth
+                // d = color register (u32 packed 0xRRGGBBAA stored as float via float-value)
+                // imm = depth
                 if (vert_idx + 6 <= header->vertex_budget) {
                     float2 pos = regs[s1].xy;
                     float2 size = regs[s2].xy;
 
                     // Scale from app coordinate space (800x600) to actual screen space
-                    // Apps emit coordinates assuming 800x600, shader divides by actual screen
-                    float app_width = regs[20].x;   // What app thinks screen width is (800)
-                    float app_height = regs[21].x;  // What app thinks screen height is (600)
+                    float app_width = regs[20].x;
+                    float app_height = regs[21].x;
                     if (app_width > 0 && app_height > 0) {
                         float scale_x = actual_screen_width / app_width;
                         float scale_y = actual_screen_height / app_height;
@@ -5377,16 +5440,31 @@ inline void bytecode_update(
                         size.y *= scale_y;
                     }
 
-                    // Unpack u32 color (0xRRGGBBAA) to float4 RGBA
-                    uint packed = as_type<uint>(regs[d].x);
-                    float4 color = float4(
-                        float((packed >> 24) & 0xFF) / 255.0,  // R
-                        float((packed >> 16) & 0xFF) / 255.0,  // G
-                        float((packed >> 8) & 0xFF) / 255.0,   // B
-                        float(packed & 0xFF) / 255.0           // A
-                    );
+                    // Color: two formats signaled by imm (depth) field
+                    // imm=1.0: pre-decomposed float4(R, G, B, A) in 0.0-1.0 (from OP_LOADI_RGBA)
+                    // imm=0.0: packed u32 in .x via float-value convention (legacy/runtime path)
+                    float4 color;
+                    float depth = 0.0;  // Default depth
+                    if (imm_bits == as_type<uint>(1.0f)) {
+                        // Pre-decomposed: read directly (depth is always 0.0 for this format)
+                        color = regs[d];
+                    } else {
+                        // Legacy packed u32 path (for runtime-loaded colors)
+                        // Float-value convention can lose ±1 LSB for values > 2^24
+                        // This typically corrupts the alpha byte (lowest 8 bits)
+                        uint packed = as_type<uint>(int(regs[d].x));
+                        float a_raw = float(packed & 0xFFu) / 255.0;
+                        float r = float((packed >> 24) & 0xFFu) / 255.0;
+                        float g = float((packed >> 16) & 0xFFu) / 255.0;
+                        float b = float((packed >> 8)  & 0xFFu) / 255.0;
+                        // Heuristic: if alpha is 0 but any RGB > 0, the color is likely
+                        // fully opaque (0xFF) with precision loss. Force alpha to 1.0.
+                        float a = (a_raw == 0.0 && (r > 0.0 || g > 0.0 || b > 0.0)) ? 1.0 : a_raw;
+                        color = float4(r, g, b, a);
+                        depth = imm;  // Use imm as depth in legacy mode
+                    }
 
-                    write_quad(verts + vert_idx, pos, size, imm, color);
+                    write_quad(verts + vert_idx, pos, size, depth, color);
                     vert_idx += 6;
                 }
                 break;
@@ -6774,6 +6852,9 @@ inline void bytecode_update(
     // Note: Result is stored by bytecode explicitly (st instruction to state[3])
     // State layout: SlabAllocator[0-2] (48 bytes) | result[3] (16 bytes) | params[4-7] (64 bytes) | heap[8+]
 
+    // DEBUG: Write execution stats to state[0] for CPU readback
+    state[0] = float4(float(pc), float(vert_idx), float(debug_quad_count), float(running ? 1 : 0));
+
     app->vertex_count = vert_idx;
 }
 
@@ -7316,7 +7397,7 @@ pub struct GpuAppSystem {
     use_parallel_megakernel: bool,        // Use threadgroup-parallel megakernel
 
     // Configuration
-    max_slots: u32,
+    pub max_slots: u32,
     #[allow(dead_code)]
     state_pool_size: usize,
     #[allow(dead_code)]
@@ -8729,6 +8810,71 @@ impl GpuAppSystem {
                 .add(byte_offset) as *const i32;
             Some(*state_ptr)
         }
+    }
+
+    /// Read the bytecode header from a slot (code_size, entry_point, vertex_budget, flags)
+    pub fn read_bytecode_header(&self, slot: u32) -> Option<(u32, u32, u32, u32)> {
+        let app = self.get_app(slot)?;
+        let header: BytecodeHeader = unsafe {
+            let header_ptr = self.unified_state_buffer.contents()
+                .add(app.state_offset as usize) as *const BytecodeHeader;
+            *header_ptr
+        };
+        Some((header.code_size, header.entry_point, header.vertex_budget, header.flags))
+    }
+
+    /// Read bytecode debug info from a slot
+    /// Returns (instr_count, quad_count, vert_idx, final_pc, gpu_code_size, gpu_vertex_budget,
+    ///          running, state_size_float4, state_offset_bytes, total_state_size,
+    ///          failing_idx, failing_pc, failing_reg)
+    pub fn read_bytecode_debug(&self, slot: u32) -> Option<(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32)> {
+        let app = self.get_app(slot)?;
+        let header: BytecodeHeader = unsafe {
+            let header_ptr = self.unified_state_buffer.contents()
+                .add(app.state_offset as usize) as *const BytecodeHeader;
+            *header_ptr
+        };
+        let state_size_bytes = app.state_size as u32;
+        let state_size_float4 = state_size_bytes / 16;
+
+        // Read debug values from state[0] and state[1] (written by shader)
+        let header_size = std::mem::size_of::<BytecodeHeader>();
+        let inst_size = std::mem::size_of::<BytecodeInst>();
+        let state_offset = header_size + (header.code_size as usize) * inst_size;
+        let (final_pc, gpu_vert_idx, quad_count, running, halt_pc, halt_op, halt_addr, gpu_state_size) = unsafe {
+            let state_ptr = self.unified_state_buffer.contents()
+                .add(app.state_offset as usize)
+                .add(state_offset) as *const f32;
+            (
+                (*state_ptr) as u32,
+                (*state_ptr.add(1)) as u32,
+                (*state_ptr.add(2)) as u32,
+                (*state_ptr.add(3)) as u32,
+                (*state_ptr.add(4)) as u32,  // state[1].x = halt_pc
+                (*state_ptr.add(5)) as u32,  // state[1].y = halt_op
+                (*state_ptr.add(6)) as u32,  // state[1].z = halt_addr
+                (*state_ptr.add(7)) as u32,  // state[1].w = state_size_bytes
+            )
+        };
+        if halt_pc != 0 {
+            println!("  HALT DETAIL: at pc={}, opcode=0x{:02x}, addr={}, state_size_bytes={}",
+                     halt_pc, halt_op, halt_addr, gpu_state_size);
+        }
+        Some((
+            0,                        // instr_count
+            quad_count,               // quad_count (from GPU debug)
+            app.vertex_count,         // vert_idx (from app descriptor)
+            final_pc,                 // final_pc (from GPU debug)
+            header.code_size,
+            header.vertex_budget,
+            running,                  // running (from GPU debug)
+            state_size_float4,
+            app.state_offset,
+            state_size_bytes,
+            gpu_vert_idx,             // GPU's vert_idx (from debug)
+            halt_pc,
+            halt_addr,
+        ))
     }
 
     /// Read the return value from a bytecode app

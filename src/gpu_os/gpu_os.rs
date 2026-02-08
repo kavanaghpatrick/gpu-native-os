@@ -335,6 +335,14 @@ impl GpuOs {
         // Copy bytecode into the app's state buffer
         self.system.write_app_state(slot, bytecode);
 
+        // DEBUG: Read back and verify bytecode was written
+        if let Some(app) = self.system.get_app(slot) {
+            if let Some((code_size, entry_point, vertex_budget, flags)) = self.system.read_bytecode_header(slot) {
+                println!("GPU STATE VERIFICATION: state_offset={}, code_size={}, entry_point={}, vertex_budget={}, flags={}",
+                         app.state_offset, code_size, entry_point, vertex_budget, flags);
+            }
+        }
+
         // Create window for it (cascaded)
         let x = 100.0 + (slot as f32 * 30.0);
         let y = 100.0 + (slot as f32 * 30.0);
@@ -427,18 +435,61 @@ impl GpuOs {
     /// Returns a list of (start_vertex_index, vertex_count) pairs for rendering
     /// Each pair represents one app's vertex range in the unified buffer
     pub fn get_draw_calls(&self) -> Vec<(u64, u64)> {
+        static DEBUG_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let frame = DEBUG_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
         let mut calls = Vec::new();
 
-        // Get max_slots from system
-        let stats = self.system.stats();
+        // Issue #297: Use cached max_slots instead of blocking stats() call
+        // stats() was allocating a buffer AND blocking every frame!
+        let max_slots = self.system.max_slots;
 
-        for slot in 0..stats.max_slots {
+        for slot in 0..max_slots {
             if let Some(app) = self.system.get_app(slot) {
+                let is_active = app.is_active();
+                let is_visible = app.is_visible();
+                let vertex_count = app.vertex_count;
+
+                // Debug slot 5 specifically (where bytecode apps go)
+                if slot >= 4 && slot <= 6 && frame % 60 == 0 {
+                    println!("SLOT {}: active={}, visible={}, vertex_count={}, type={}, frame_num={}, state_offset={}, state_size={}, vertex_offset={}",
+                             slot, is_active, is_visible, vertex_count, app.app_type,
+                             app.frame_number, app.state_offset, app.state_size, app.vertex_offset);
+                    // Read bytecode debug info if this is a bytecode app
+                    if app.app_type == 101 {
+                        if let Some((instr_count, quad_count, vert_idx, final_pc, gpu_code_size, gpu_vertex_budget, running, state_size_float4, state_offset_bytes, total_state_size, gpu_vert_idx, _failing_pc, _failing_reg)) = self.system.read_bytecode_debug(slot) {
+                            println!("  BYTECODE DEBUG: quads={}, verts={}, gpu_verts={}, final_pc={}, GPU_code_size={}, GPU_vert_budget={}, running={}",
+                                     quad_count, vert_idx, gpu_vert_idx, final_pc, gpu_code_size, gpu_vertex_budget, running);
+                            println!("  STATE DEBUG: state_size_float4={}, state_offset_bytes={}, total_state_size={}",
+                                     state_size_float4, state_offset_bytes, total_state_size);
+                            // Dump first few vertex colors for verification
+                            if vertex_count > 0 {
+                                let vbuf = self.system.render_vertices_buffer();
+                                let start_vertex = (app.vertex_offset as usize) / 48;
+                                let num_to_dump = std::cmp::min(vertex_count as usize, 48);
+                                unsafe {
+                                    let verts = vbuf.contents() as *const super::gpu_app_system::RenderVertex;
+                                    for vi in 0..num_to_dump {
+                                        let v = &*verts.add(start_vertex + vi);
+                                        let r = (v.color[0] * 255.0) as u8;
+                                        let g = (v.color[1] * 255.0) as u8;
+                                        let b = (v.color[2] * 255.0) as u8;
+                                        let a = (v.color[3] * 255.0) as u8;
+                                        println!("  VERTEX[{}]: pos=({:.1},{:.1},{:.1}) color=#{:02X}{:02X}{:02X}{:02X} rgba=({:.3},{:.3},{:.3},{:.3})",
+                                                 vi, v.position[0], v.position[1], v.position[2],
+                                                 r, g, b, a, v.color[0], v.color[1], v.color[2], v.color[3]);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Only render active and visible apps with vertices
-                if app.is_active() && app.is_visible() && app.vertex_count > 0 {
+                if is_active && is_visible && vertex_count > 0 {
                     // vertex_offset is in bytes, divide by 48 (sizeof RenderVertex) to get index
                     let start_vertex = (app.vertex_offset as u64) / 48;
-                    let count = app.vertex_count as u64;
+                    let count = vertex_count as u64;
 
                     // Only include complete triangles
                     let triangle_verts = (count / 3) * 3;

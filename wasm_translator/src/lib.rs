@@ -400,30 +400,47 @@ impl WasmTranslator {
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
+        // WASM ADDRESS REMAPPING (Issue #255)
+        // Rust/WASM puts data at 1MB (0x100000) but our GPU buffer is only 128KB.
+        // Auto-detect the data base offset and remap addresses to fit.
+        // ═══════════════════════════════════════════════════════════════════════════
+        // Auto-detect WASM data offset for address remapping
+        let wasm_data_offset = if !module.data_segments.is_empty() && self.config.wasm_data_offset == 0 {
+            let min_offset = module.data_segments.iter()
+                .map(|s| s.offset)
+                .min()
+                .unwrap_or(0);
+            if min_offset >= 65536 {
+                eprintln!("[TRANSLATOR] WASM data at offset {} (0x{:x}), remapping to compact_data_start={}",
+                         min_offset, min_offset, self.config.compact_data_start);
+                min_offset
+            } else {
+                self.config.wasm_data_offset
+            }
+        } else {
+            self.config.wasm_data_offset
+        };
+
+        // ═══════════════════════════════════════════════════════════════════════════
         // DATA SEGMENT INITIALIZATION (Issue #255)
         // Copy static data from WASM data sections into linear memory
-        // This handles string literals, initialized arrays, etc.
+        // CRITICAL: Use byte-level stores (ST1) to avoid float32 precision loss.
         // ═══════════════════════════════════════════════════════════════════════════
         for segment in &module.data_segments {
-            // Generate bytecode to initialize data at segment.offset
-            // For each 4-byte chunk, generate: loadi_uint + st
             let memory_base = self.config.memory_base;
-            for (i, chunk) in segment.data.chunks(4).enumerate() {
-                let addr = segment.offset + (i as u32 * 4);
-                let value = match chunk.len() {
-                    1 => chunk[0] as u32,
-                    2 => u16::from_le_bytes([chunk[0], chunk[1]]) as u32,
-                    3 => chunk[0] as u32 | (chunk[1] as u32) << 8 | (chunk[2] as u32) << 16,
-                    4 => u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]),
-                    _ => 0,
-                };
-                // Store value at memory_base + addr
-                ctx.emit.loadi_uint(29, value);  // r29 = value (preserve integer bits!)
-                // Calculate absolute address: (memory_base + addr) / 16 for float4 index
-                let float4_idx = (memory_base + addr) / 16;
-                // Issue #213 fix: Use loadi (float VALUE) for addresses, not loadi_uint (integer BITS)
-                ctx.emit.loadi(30, float4_idx as f32);  // r30 = index as float
-                ctx.emit.st(30, 29, 0.0);  // state[index] = value
+            let remapped_offset = if wasm_data_offset > 0 {
+                segment.offset - wasm_data_offset + self.config.compact_data_start
+            } else {
+                segment.offset
+            };
+            for (byte_idx, &byte_val) in segment.data.iter().enumerate() {
+                if byte_val == 0 {
+                    continue;  // Skip zero bytes (memory is zero-initialized)
+                }
+                let byte_addr = memory_base + remapped_offset + (byte_idx as u32);
+                ctx.emit.loadi_uint(29, byte_val as u32);  // r29 = byte value (0-255, exact in float)
+                ctx.emit.loadi_uint(30, byte_addr);         // r30 = byte address
+                ctx.emit.st1(30, 29, 0.0);                  // memory[byte_addr] = byte
             }
         }
 

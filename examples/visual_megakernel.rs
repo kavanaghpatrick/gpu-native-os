@@ -17,7 +17,7 @@
 use cocoa::{appkit::NSView, base::id as cocoa_id};
 use core_graphics_types::geometry::CGSize;
 use metal::*;
-use objc::{rc::autoreleasepool, runtime::YES};
+use objc::{msg_send, rc::autoreleasepool, runtime::YES, sel, sel_impl};
 use rust_experiment::gpu_os::gpu_os::GpuOs;
 use rust_experiment::gpu_os::gpu_app_system::{app_type, BytecodeAssembler};
 use std::time::Instant;
@@ -29,6 +29,9 @@ use winit::{
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Window, WindowId},
 };
+// macOS-specific: Required for keyboard focus to work properly when launched from terminal
+#[cfg(target_os = "macos")]
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
 
 /// Visual demo app state
 struct VisualMegakernelDemo {
@@ -568,6 +571,14 @@ impl ApplicationHandler for VisualMegakernelDemo {
             .with_title("GPU OS - Visual Megakernel Demo (Issue #162)");
         let window = event_loop.create_window(attrs).unwrap();
         self.initialize(window);
+
+        // macOS: Force app to become active foreground app, stealing focus from terminal
+        #[cfg(target_os = "macos")]
+        unsafe {
+            use objc::runtime::{Class, Object, BOOL};
+            let ns_app: *mut Object = msg_send![Class::get("NSApplication").unwrap(), sharedApplication];
+            let _: () = msg_send![ns_app, activateIgnoringOtherApps: YES as BOOL];
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -608,7 +619,18 @@ impl ApplicationHandler for VisualMegakernelDemo {
 }
 
 fn main() {
+    // macOS: Use Regular activation policy so app appears in Dock and can receive keyboard focus.
+    // Without this, the app is an "accessory" app that doesn't appear in Dock and keyboard
+    // events may not be delivered properly when launched from terminal.
+    #[cfg(target_os = "macos")]
+    let event_loop = EventLoop::builder()
+        .with_activation_policy(ActivationPolicy::Regular)
+        .build()
+        .unwrap();
+
+    #[cfg(not(target_os = "macos"))]
     let event_loop = EventLoop::new().unwrap();
+
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = VisualMegakernelDemo::new();
     event_loop.run_app(&mut app).unwrap();

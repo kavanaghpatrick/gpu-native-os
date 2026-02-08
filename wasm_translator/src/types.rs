@@ -53,12 +53,20 @@ pub struct TranslatorConfig {
     pub globals_base: u32,
     /// Base address for linear memory in state memory
     pub memory_base: u32,
+    /// WASM data segment base offset to subtract when remapping addresses.
+    /// Rust/WASM puts data at 1MB (0x100000), but our GPU buffer is only 128KB.
+    /// Auto-detected from data segments. All WASM addresses >= this value get remapped:
+    ///   gpu_addr = memory_base + (wasm_addr - wasm_data_offset + compact_data_start)
+    pub wasm_data_offset: u32,
+    /// Where compacted data lives in our GPU state (byte offset relative to state).
+    /// Default: 8192 (right after the 8KB stack area).
+    pub compact_data_start: u32,
 }
 
 impl Default for TranslatorConfig {
     fn default() -> Self {
         Self {
-            memory_pages: 16,        // 16 pages = 1MB max addressable (but fits in smaller state)
+            memory_pages: 16,        // 16 pages = 1MB max addressable (state buffer is 1.25MB to fit this)
             // Issue #233: Stack overflow detection
             // 1024 entries provides reasonable headroom for complex expressions
             // while preventing unbounded memory growth from spills.
@@ -68,12 +76,14 @@ impl Default for TranslatorConfig {
             //   state[1-4] = params (bytes 16-79)
             //   state[8-71] = globals (bytes 128-1151, 1KB)
             //   state[72-327] = spill area (bytes 1152-5247, 4KB)
-            //   state[328+] = linear memory (bytes 5248+, ~54KB)
+            //   state[328+] = linear memory (bytes 5248+, up to ~120KB)
             //
             // IMPORTANT: globals_base is a FLOAT4 INDEX (for LD/ST opcodes)
             // IMPORTANT: memory_base is a BYTE OFFSET (for LD4/ST4 opcodes)
             globals_base: 8,         // Globals at state[8] = byte 128 (FLOAT4 INDEX)
             memory_base: 5248,       // Linear memory at byte 5248 (BYTE OFFSET)
+            wasm_data_offset: 0,     // Auto-detected from data segments (0 = no remapping)
+            compact_data_start: 8192, // Data goes right after 8KB stack area
         }
     }
 }

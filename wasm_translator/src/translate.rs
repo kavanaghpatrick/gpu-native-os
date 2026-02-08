@@ -28,6 +28,12 @@ pub struct TranslationContext<'a> {
     pub call_stack: HashSet<u32>,
     /// Counter for unique spill bases when inlining functions
     inline_spill_counter: u32,
+    /// Track the most recent i32 constant loaded, for color decomposition in EmitQuad
+    /// Cleared after any non-I32Const instruction that writes to a register
+    last_const: Option<(u8, i32)>,  // (register, value)
+    /// Track the most recent i32.load (for LD_RGBA color loads in EmitQuad)
+    /// Stores: (result_register, address_register, offset)
+    last_i32_load: Option<(u8, u8, u32)>,
 }
 
 impl<'a> TranslationContext<'a> {
@@ -51,6 +57,8 @@ impl<'a> TranslationContext<'a> {
             function_local_counts: None,
             call_stack: HashSet::new(),
             inline_spill_counter: 1,  // Start at 1, entry function uses 0
+            last_const: None,
+            last_i32_load: None,
         }
     }
 
@@ -77,6 +85,24 @@ impl<'a> TranslationContext<'a> {
         } else {
             block.end_label
         }
+    }
+
+    /// Remap a WASM memory address to fit within our compact GPU state buffer.
+    /// WASM data segments start at high offsets (e.g., 1MB), but our GPU buffer is only 128KB.
+    /// This remaps: wasm_addr >= data_offset → compact_data_start + (wasm_addr - data_offset)
+    fn remap_wasm_addr(&self, wasm_addr: u32) -> u32 {
+        if self.config.wasm_data_offset > 0 && wasm_addr >= self.config.wasm_data_offset {
+            self.config.compact_data_start + (wasm_addr - self.config.wasm_data_offset)
+        } else {
+            wasm_addr
+        }
+    }
+
+    /// Remap a memarg offset for memory operations.
+    /// Returns: memory_base + remapped_offset
+    fn remap_memarg_base(&self, offset: u64) -> u32 {
+        let offset32 = offset as u32;
+        self.config.memory_base + self.remap_wasm_addr(offset32)
     }
 
     /// Translate a single WASM operator
@@ -276,6 +302,7 @@ impl<'a> TranslationContext<'a> {
                 self.emit.loadi_uint(30, base);
                 self.emit.int_add(addr, addr, 30);
                 self.emit.ld4(dst, addr, 0.0);
+                self.last_const = None;  // Clear const tracking
             }
 
             Operator::I32Store { memarg } => {
@@ -790,6 +817,8 @@ impl<'a> TranslationContext<'a> {
             Operator::I32Const { value } => {
                 let dst = self.stack.alloc_and_push()?;
                 self.emit.loadi_int(dst, *value);
+                // Track constant value for color decomposition in EmitQuad
+                self.last_const = Some((dst, *value));
             }
 
             // ═══════════════════════════════════════════════════════════════
@@ -1261,10 +1290,12 @@ impl<'a> TranslationContext<'a> {
                 let dst = self.stack.alloc_and_push()?;
                 // Load 64-bit constant using the xy components of the register
                 // Low 32 bits go in .x, high 32 bits go in .y
+                // MUST use bit-cast (setx/sety) not float-value (loadi_uint)
+                // because INT64_WRAP reads back with as_type<ulong>(regs.xy)
                 let low = (*value as u64 & 0xFFFFFFFF) as u32;
                 let high = ((*value as u64) >> 32) as u32;
-                // Use LOADI_INT for low, SETY for high
-                self.emit.loadi_uint(dst, low);
+                self.emit.loadi(dst, 0.0);  // Zero the register first
+                self.emit.setx(dst, f32::from_bits(low));
                 self.emit.sety(dst, f32::from_bits(high));
             }
 
@@ -2266,7 +2297,7 @@ impl<'a> TranslationContext<'a> {
                 // QUAD opcode format:
                 //   s1 = position register (xy = x, y)
                 //   s2 = size register (xy = w, h)
-                //   d = color register (float4 RGBA)
+                //   d = color register (float4 R,G,B,A in 0.0-1.0)
                 //   imm = depth (default 0.0)
 
                 let color_reg = self.stack.pop()?;  // u32 packed RGBA (0xRRGGBBAA)
@@ -2275,22 +2306,38 @@ impl<'a> TranslationContext<'a> {
                 let y_reg = self.stack.pop()?;
                 let x_reg = self.stack.pop()?;
 
-                // Use PACK2 to combine scalar values into float2:
-                // CRITICAL FIX: Use scratch registers r30/r31 instead of r28/r29
-                // r28/r29 are used for local variable spill area and would collide
-                // with locals 4 and 5 in functions with more than 4 locals!
-                // r30.xy = (x_reg.x, y_reg.x) for position
-                // r31.xy = (w_reg.x, h_reg.x) for size
+                // PACK position and size into float2 registers
                 self.emit.pack2(30, x_reg, y_reg);  // r30.xy = (x, y)
                 self.emit.pack2(31, w_reg, h_reg);  // r31.xy = (w, h)
 
-                // Color: color_reg contains u32 packed as 0xRRGGBBAA
-                // The GPU shader reads this as float4 where the bits represent RGBA
-                // For proper rendering, we'd need to unpack to normalized floats
-                // For now, pass the raw bits - the write_quad function handles it
-
-                // Emit QUAD: pos_reg=r30, size_reg=r31, color_reg, depth=0.0
-                self.emit.quad(30, 31, color_reg, 0.0);
+                // Decompose color: convert packed u32 to float4 RGBA (0.0-1.0)
+                // Check if the color register was set by the most recent I32Const
+                let const_color = self.last_const.take()
+                    .filter(|&(reg, _)| reg == color_reg)
+                    .map(|(_, val)| val);
+                if let Some(const_val) = const_color {
+                    // Known constant: use LOADI_RGBA which preserves all 32 bits
+                    // and decomposes to float4(R/255, G/255, B/255, A/255) on GPU
+                    self.emit.loadi_rgba(color_reg, const_val as u32);
+                    // imm=1.0 signals pre-decomposed float4 color to OP_QUAD
+                    self.emit.quad(30, 31, color_reg, 1.0);
+                } else if let Some((load_dst, load_addr, _load_offset)) = self.last_i32_load.take() {
+                    if load_dst == color_reg {
+                        // Color was loaded from memory via I32Load → LD4
+                        // Re-load using LD_RGBA which reads 4 individual bytes (exact for all colors)
+                        // load_addr still holds the computed byte address from the LD4
+                        self.emit.ld_rgba(color_reg, load_addr, 0.0);
+                        // imm=1.0 signals pre-decomposed float4 color
+                        self.emit.quad(30, 31, color_reg, 1.0);
+                    } else {
+                        // Load was for a different register, fall back to legacy path
+                        self.emit.quad(30, 31, color_reg, 0.0);
+                    }
+                } else {
+                    // Unknown origin: use legacy packed u32 path
+                    // imm=0.0 signals packed u32 format to OP_QUAD
+                    self.emit.quad(30, 31, color_reg, 0.0);
+                }
             }
 
             GpuIntrinsic::GetCursorX => {

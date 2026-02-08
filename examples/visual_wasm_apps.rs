@@ -21,7 +21,7 @@
 use cocoa::{appkit::NSView, base::id as cocoa_id};
 use core_graphics_types::geometry::CGSize;
 use metal::*;
-use objc::{rc::autoreleasepool, runtime::YES};
+use objc::{msg_send, rc::autoreleasepool, runtime::YES, sel, sel_impl};
 use rust_experiment::gpu_os::gpu_os::GpuOs;
 use rust_experiment::gpu_os::gpu_app_system::{app_type, BytecodeAssembler};
 use std::fs;
@@ -36,6 +36,8 @@ use winit::{
     raw_window_handle::{HasWindowHandle, RawWindowHandle},
     window::{Window, WindowId},
 };
+// Note: Previously used ActivationPolicy::Regular but switched to simple EventLoop::new()
+// to match visual_megakernel.rs which has working keyboard input
 
 /// Visual demo app state
 struct VisualWasmDemo {
@@ -213,9 +215,32 @@ impl VisualWasmDemo {
         println!("  Bytecode size: {} bytes", bytecode.len());
 
         // Extract instruction count from header
-        if bytecode.len() >= 4 {
+        if bytecode.len() >= 16 {
             let instr_count = u32::from_le_bytes([bytecode[0], bytecode[1], bytecode[2], bytecode[3]]);
+            let entry_point = u32::from_le_bytes([bytecode[4], bytecode[5], bytecode[6], bytecode[7]]);
+            let vertex_budget = u32::from_le_bytes([bytecode[8], bytecode[9], bytecode[10], bytecode[11]]);
+            let flags = u32::from_le_bytes([bytecode[12], bytecode[13], bytecode[14], bytecode[15]]);
             println!("  Instructions: {}", instr_count);
+            println!("  BYTECODE HEADER: code_size={}, entry_point={}, vertex_budget={}, flags={}",
+                     instr_count, entry_point, vertex_budget, flags);
+
+            // Dump first 20 instructions
+            let header_size = 16;
+            let inst_size = 8;
+            println!("  FIRST 20 INSTRUCTIONS:");
+            for i in 0..20.min(instr_count as usize) {
+                let offset = header_size + i * inst_size;
+                if offset + inst_size <= bytecode.len() {
+                    let opcode = bytecode[offset];
+                    let dst = bytecode[offset + 1];
+                    let src1 = bytecode[offset + 2];
+                    let src2 = bytecode[offset + 3];
+                    let imm_bytes = [bytecode[offset + 4], bytecode[offset + 5], bytecode[offset + 6], bytecode[offset + 7]];
+                    let imm = f32::from_le_bytes(imm_bytes);
+                    println!("    PC {:3}: opcode={:#04x} dst={} src1={} src2={} imm={:.4}",
+                             i, opcode, dst, src1, src2, imm);
+                }
+            }
         }
 
         // Launch on GPU
@@ -239,23 +264,32 @@ impl VisualWasmDemo {
     }
 
     fn render(&mut self) {
-        let Some(os) = &mut self.os else { return };
-        let Some(layer) = &self.layer else { return };
-        let Some(command_queue) = &self.command_queue else { return };
-        let Some(render_pipeline) = &self.render_pipeline else { return };
-        let Some(depth_stencil_state) = &self.depth_stencil_state else { return };
-        let Some(depth_texture) = &self.depth_texture else { return };
-        let Some(screen_size_buffer) = &self.screen_size_buffer else { return };
+        println!("RENDER CALLED");
+        let render_start = Instant::now();
 
-        // Run GPU OS frame (includes finalize_render which resets vertex count)
+        let Some(os) = &mut self.os else { println!("RENDER: No OS"); return };
+        let Some(layer) = &self.layer else { println!("RENDER: No layer"); return };
+        let Some(command_queue) = &self.command_queue else { println!("RENDER: No command_queue"); return };
+        let Some(render_pipeline) = &self.render_pipeline else { println!("RENDER: No render_pipeline"); return };
+        let Some(depth_stencil_state) = &self.depth_stencil_state else { println!("RENDER: No depth_stencil_state"); return };
+        let Some(depth_texture) = &self.depth_texture else { println!("RENDER: No depth_texture"); return };
+        let Some(screen_size_buffer) = &self.screen_size_buffer else { println!("RENDER: No screen_size_buffer"); return };
+
+        // TIMING: Measure run_frame() which includes finalize_render() with wait_until_completed()
+        let run_frame_start = Instant::now();
         os.run_frame();
+        let run_frame_time = run_frame_start.elapsed();
+
         let vertex_count = os.total_vertex_count();
 
-        // Get drawable
+        // TIMING: Measure drawable acquisition
+        let drawable_start = Instant::now();
         let drawable = match layer.next_drawable() {
             Some(d) => d,
-            None => return,
+            None => { println!("RENDER: No drawable!"); return },
         };
+        println!("GOT DRAWABLE");
+        let drawable_time = drawable_start.elapsed();
 
         // Update screen size
         let size_data: [f32; 2] = [self.window_size.0 as f32, self.window_size.1 as f32];
@@ -300,19 +334,33 @@ impl VisualWasmDemo {
 
         // Draw each active app's actual vertices (not the full slot)
         // This avoids rendering garbage/uninitialized vertices
+        let get_draw_calls_start = Instant::now();
         let draw_calls = os.get_draw_calls();
-        for (start_vertex, count) in draw_calls {
-            if count > 0 {
-                encoder.draw_primitives(MTLPrimitiveType::Triangle, start_vertex, count);
+        let get_draw_calls_time = get_draw_calls_start.elapsed();
+
+        // DEBUG: Print draw calls to diagnose rendering issue
+        if self.frame_count % 60 == 0 || self.frame_count < 5 {
+            println!("DRAW CALLS: {:?} (count={})", draw_calls, draw_calls.len());
+        }
+
+        for (start_vertex, count) in &draw_calls {
+            if *count > 0 {
+                encoder.draw_primitives(MTLPrimitiveType::Triangle, *start_vertex, *count);
             }
         }
 
         encoder.end_encoding();
         command_buffer.present_drawable(drawable);
         command_buffer.commit();
+        println!("COMMITTED");
 
-        // FPS tracking
+        let total_render_time = render_start.elapsed();
+
+        // FPS tracking and TIMING output
         self.frame_count += 1;
+        if self.frame_count % 10 == 0 {
+            println!("FRAME {}", self.frame_count);
+        }
         if self.frame_count % 60 == 0 {
             let elapsed = self.last_frame.elapsed().as_secs_f32();
             let fps = 60.0 / elapsed;
@@ -322,6 +370,14 @@ impl VisualWasmDemo {
                 vertex_count,
                 fps,
                 self.apps_loaded.len()
+            );
+            // TIMING: Print detailed timing breakdown
+            println!(
+                "[TIMING] render()={:.2}ms | run_frame()={:.2}ms | drawable={:.2}ms | get_draw_calls={:.2}ms",
+                total_render_time.as_secs_f64() * 1000.0,
+                run_frame_time.as_secs_f64() * 1000.0,
+                drawable_time.as_secs_f64() * 1000.0,
+                get_draw_calls_time.as_secs_f64() * 1000.0
             );
             self.last_frame = Instant::now();
         }
@@ -494,12 +550,48 @@ impl VisualWasmDemo {
 
 impl ApplicationHandler for VisualWasmDemo {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        println!("RESUMED CALLED");
         if self.window.is_none() {
             let attrs = Window::default_attributes()
                 .with_title("Visual WASM Apps - THE GPU IS THE COMPUTER")
-                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720));
+                .with_inner_size(winit::dpi::LogicalSize::new(1280, 720))
+                .with_visible(true)   // Ensure window is visible from creation
+                .with_active(true);   // Request focus when window is created
             let window = event_loop.create_window(attrs).unwrap();
+            println!("WINDOW CREATED");
             self.initialize(window);
+
+            // macOS: Force app to become active foreground app, stealing focus from terminal
+            // This is necessary because cargo run keeps the terminal as the active app
+            #[cfg(target_os = "macos")]
+            unsafe {
+                use objc::runtime::{Class, Object, BOOL};
+                let ns_app: *mut Object = objc::msg_send![Class::get("NSApplication").unwrap(), sharedApplication];
+                let _: () = objc::msg_send![ns_app, activateIgnoringOtherApps: YES as BOOL];
+            }
+
+            // macOS: Explicitly make window key and front to receive keyboard events
+            // Windows need makeKeyAndOrderFront called to properly receive keyboard input
+            #[cfg(target_os = "macos")]
+            unsafe {
+                use objc::runtime::Object;
+                if let Some(ref window) = self.window {
+                    if let Ok(handle) = window.window_handle() {
+                        if let RawWindowHandle::AppKit(appkit_handle) = handle.as_raw() {
+                            let ns_window: *mut Object = objc::msg_send![appkit_handle.ns_view.as_ptr() as *mut Object, window];
+                            let _: () = objc::msg_send![ns_window, makeKeyAndOrderFront: std::ptr::null::<Object>()];
+                        }
+                    }
+                }
+            }
+
+            // Ensure window is visible and focused using winit's cross-platform API
+            if let Some(ref window) = self.window {
+                window.set_visible(true);
+                window.focus_window();
+                println!("Window set_visible(true) and focus_window() called");
+            }
+            println!("ACTIVATION REQUESTED");
         }
     }
 
@@ -540,6 +632,12 @@ impl ApplicationHandler for VisualWasmDemo {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                // LOUD DEBUG - print every keyboard event
+                println!("########################################");
+                println!("# KEYBOARD EVENT: {:?}", event.logical_key);
+                println!("# state={:?} repeat={}", event.state, event.repeat);
+                println!("########################################");
+
                 let pressed = event.state == ElementState::Pressed;
 
                 // Issue #253: Forward ALL keyboard events to GPU
@@ -628,10 +726,11 @@ impl ApplicationHandler for VisualWasmDemo {
                 }
             }
             WindowEvent::RedrawRequested => {
+                println!(">>> REDRAW REQUESTED <<<");
                 if self.frame_count == 0 {
                     println!("First RedrawRequested received");
                 }
-                // Auto-load bouncing balls on frame 60 for testing
+                // Auto-load apps for testing - cycle through multiple
                 if self.frame_count == 60 && self.current_app_slot.is_none() {
                     println!("\n*** AUTO-LOADING BOUNCING BALLS FOR TESTING ***");
                     self.load_wasm_app(
@@ -644,11 +743,17 @@ impl ApplicationHandler for VisualWasmDemo {
                     window.request_redraw();
                 }
             }
+            WindowEvent::Focused(focused) => {
+                println!("########################################");
+                println!("# FOCUS CHANGED: {}", if focused { "GAINED" } else { "LOST" });
+                println!("########################################");
+            }
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        println!("about_to_wait called");
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -656,7 +761,14 @@ impl ApplicationHandler for VisualWasmDemo {
 }
 
 fn main() {
+    println!("APP STARTING...");
+
+    // Use simple EventLoop::new() like visual_megakernel.rs (which has working keyboard)
+    // Previously used ActivationPolicy::Regular which may have caused issues
     let event_loop = EventLoop::new().unwrap();
+
+    println!("EVENT LOOP CREATED");
+
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = VisualWasmDemo::new();
     event_loop.run_app(&mut app).unwrap();

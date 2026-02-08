@@ -71,6 +71,17 @@ impl Emitter {
         self.asm.loadi_uint(dst, val);
     }
 
+    /// Load packed RGBA color (0xRRGGBBAA) and decompose to float4(R/255, G/255, B/255, A/255)
+    /// Bits are preserved in the immediate field, avoiding float precision loss.
+    pub fn loadi_rgba(&mut self, dst: u8, packed_color: u32) {
+        self.asm.loadi_rgba(dst, packed_color);
+    }
+
+    /// Load 4 bytes from memory as RGBA color: dst = float4(R/255, G/255, B/255, A/255)
+    pub fn ld_rgba(&mut self, dst: u8, addr_reg: u8, offset: f32) {
+        self.asm.ld_rgba(dst, addr_reg, offset);
+    }
+
     pub fn int_add(&mut self, dst: u8, a: u8, b: u8) {
         self.asm.int_add(dst, a, b);
     }
